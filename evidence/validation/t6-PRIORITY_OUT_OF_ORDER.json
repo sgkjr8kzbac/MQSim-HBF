@@ -1,0 +1,12 @@
+{
+  "False": {
+    "read_ns": 99897,
+    "write_ns": 100426,
+    "suspend_commands": 0
+  },
+  "True": {
+    "read_ns": 9566,
+    "write_ns": 109991,
+    "suspend_commands": 1
+  }
+}

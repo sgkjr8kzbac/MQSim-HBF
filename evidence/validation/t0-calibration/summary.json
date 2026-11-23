@@ -1,0 +1,20 @@
+{
+  "cmd_ns": 290,
+  "rb_ns": 20,
+  "xfer_ns": 64,
+  "host_ns": 1,
+  "cycle_ns": 4470,
+  "single_ns": 4471,
+  "same_chip_ns": 17881,
+  "same_channel_ns": 5341,
+  "different_channels_ns": 4474,
+  "two_dies_ns": 8941,
+  "die_issue_gap_ns": 4470,
+  "same_channel_issue_gaps_ns": [
+    290,
+    290,
+    290
+  ],
+  "different_channel_issue_span_ns": 0,
+  "interleaved_reads": 0
+}

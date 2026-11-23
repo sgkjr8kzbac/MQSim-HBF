@@ -1,0 +1,10 @@
+{
+  "False": {
+    "status": 0,
+    "channel": 42
+  },
+  "True": {
+    "status": 0,
+    "channel": 319
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "runs/checks/t0-calibration": {
+    "mqsim_commit": "51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16",
+    "repository_commit": "071341476e4221b57b20d61fe7fb866ee7fecf2d",
+    "working_tree_modified": false,
+    "patches_enabled": [
+      "I1",
+      "I2",
+      "I3",
+      "I4"
+    ],
+    "binary_sha256": "77c0c4fac3d4ecf2b4e0921b15baa0e4ec06badf4c45268ca5760b79cf38432d",
+    "patch_sha256": {
+      "I1-completions.patch": "840d425105773a7538b79b2eaa8f33d41f59ff76c0d50f9b92ab04f86bee2bba",
+      "I2-physical.patch": "0b55b42d9fda5817de061e633fe98abf6a91eab05bce59a1af99caf6742121d9",
+      "I3-id-lists.patch": "b6e4a925ee3262ffa3e14e94611ead42a8be0665b509b38c52abf350ec667c93",
+      "I4-batch.patch": "aac53f4815230c85704ad95c32bd8eb7f2f2b1b741ee9d97f68b6db7f4b858da",
+      "T-ONFI.patch": "6ed059d29700959ff6e5d3ea49f162a0c7490c7b4cdfb4d3d301174f780141e1",
+      "T-SUSP.patch": "1eaad8c89ba2dca05e8a1d81af36554c9daab35651e8b2d924665c482e48e276"
+    }
+  },
+  "runs/final-t9-16x64/t9-16x64-layer_contiguous": {
+    "mqsim_commit": "51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16",
+    "repository_commit": "071341476e4221b57b20d61fe7fb866ee7fecf2d",
+    "working_tree_modified": false,
+    "patches_enabled": [
+      "I1",
+      "I3",
+      "I4"
+    ],
+    "binary_sha256": "77c0c4fac3d4ecf2b4e0921b15baa0e4ec06badf4c45268ca5760b79cf38432d",
+    "patch_sha256": {
+      "I1-completions.patch": "840d425105773a7538b79b2eaa8f33d41f59ff76c0d50f9b92ab04f86bee2bba",
+      "I2-physical.patch": "0b55b42d9fda5817de061e633fe98abf6a91eab05bce59a1af99caf6742121d9",
+      "I3-id-lists.patch": "b6e4a925ee3262ffa3e14e94611ead42a8be0665b509b38c52abf350ec667c93",
+      "I4-batch.patch": "aac53f4815230c85704ad95c32bd8eb7f2f2b1b741ee9d97f68b6db7f4b858da",
+      "T-ONFI.patch": "6ed059d29700959ff6e5d3ea49f162a0c7490c7b4cdfb4d3d301174f780141e1",
+      "T-SUSP.patch": "1eaad8c89ba2dca05e8a1d81af36554c9daab35651e8b2d924665c482e48e276"
+    }
+  },
+  "runs/final-t9-16x64/t9-16x64-vllm_interleaved": {
+    "mqsim_commit": "51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16",
+    "repository_commit": "071341476e4221b57b20d61fe7fb866ee7fecf2d",
+    "working_tree_modified": false,
+    "patches_enabled": [
+      "I1",
+      "I3",
+      "I4"
+    ],
+    "binary_sha256": "77c0c4fac3d4ecf2b4e0921b15baa0e4ec06badf4c45268ca5760b79cf38432d",
+    "patch_sha256": {
+      "I1-completions.patch": "840d425105773a7538b79b2eaa8f33d41f59ff76c0d50f9b92ab04f86bee2bba",
+      "I2-physical.patch": "0b55b42d9fda5817de061e633fe98abf6a91eab05bce59a1af99caf6742121d9",
+      "I3-id-lists.patch": "b6e4a925ee3262ffa3e14e94611ead42a8be0665b509b38c52abf350ec667c93",
+      "I4-batch.patch": "aac53f4815230c85704ad95c32bd8eb7f2f2b1b741ee9d97f68b6db7f4b858da",
+      "T-ONFI.patch": "6ed059d29700959ff6e5d3ea49f162a0c7490c7b4cdfb4d3d301174f780141e1",
+      "T-SUSP.patch": "1eaad8c89ba2dca05e8a1d81af36554c9daab35651e8b2d924665c482e48e276"
+    }
+  },
+  "runs/final-t9-256x4/t9-256x4-layer_contiguous": {
+    "mqsim_commit": "51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16",
+    "repository_commit": "071341476e4221b57b20d61fe7fb866ee7fecf2d",
+    "working_tree_modified": false,
+    "patches_enabled": [
+      "I1",
+      "I3",
+      "I4"
+    ],
+    "binary_sha256": "77c0c4fac3d4ecf2b4e0921b15baa0e4ec06badf4c45268ca5760b79cf38432d",
+    "patch_sha256": {
+      "I1-completions.patch": "840d425105773a7538b79b2eaa8f33d41f59ff76c0d50f9b92ab04f86bee2bba",
+      "I2-physical.patch": "0b55b42d9fda5817de061e633fe98abf6a91eab05bce59a1af99caf6742121d9",
+      "I3-id-lists.patch": "b6e4a925ee3262ffa3e14e94611ead42a8be0665b509b38c52abf350ec667c93",
+      "I4-batch.patch": "aac53f4815230c85704ad95c32bd8eb7f2f2b1b741ee9d97f68b6db7f4b858da",
+      "T-ONFI.patch": "6ed059d29700959ff6e5d3ea49f162a0c7490c7b4cdfb4d3d301174f780141e1",
+      "T-SUSP.patch": "1eaad8c89ba2dca05e8a1d81af36554c9daab35651e8b2d924665c482e48e276"
+    }
+  },
+  "runs/final-t9-256x4/t9-256x4-vllm_interleaved": {
+    "mqsim_commit": "51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16",
+    "repository_commit": "071341476e4221b57b20d61fe7fb866ee7fecf2d",
+    "working_tree_modified": false,
+    "patches_enabled": [
+      "I1",
+      "I3",
+      "I4"
+    ],
+    "binary_sha256": "77c0c4fac3d4ecf2b4e0921b15baa0e4ec06badf4c45268ca5760b79cf38432d",
+    "patch_sha256": {
+      "I1-completions.patch": "840d425105773a7538b79b2eaa8f33d41f59ff76c0d50f9b92ab04f86bee2bba",
+      "I2-physical.patch": "0b55b42d9fda5817de061e633fe98abf6a91eab05bce59a1af99caf6742121d9",
+      "I3-id-lists.patch": "b6e4a925ee3262ffa3e14e94611ead42a8be0665b509b38c52abf350ec667c93",
+      "I4-batch.patch": "aac53f4815230c85704ad95c32bd8eb7f2f2b1b741ee9d97f68b6db7f4b858da",
+      "T-ONFI.patch": "6ed059d29700959ff6e5d3ea49f162a0c7490c7b4cdfb4d3d301174f780141e1",
+      "T-SUSP.patch": "1eaad8c89ba2dca05e8a1d81af36554c9daab35651e8b2d924665c482e48e276"
+    }
+  },
+  "runs/final-t9-64x16/t9-64x16-layer_contiguous": {
+    "mqsim_commit": "51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16",
+    "repository_commit": "071341476e4221b57b20d61fe7fb866ee7fecf2d",
+    "working_tree_modified": false,
+    "patches_enabled": [
+      "I1",
+      "I3",
+      "I4"
+    ],
+    "binary_sha256": "77c0c4fac3d4ecf2b4e0921b15baa0e4ec06badf4c45268ca5760b79cf38432d",
+    "patch_sha256": {
+      "I1-completions.patch": "840d425105773a7538b79b2eaa8f33d41f59ff76c0d50f9b92ab04f86bee2bba",
+      "I2-physical.patch": "0b55b42d9fda5817de061e633fe98abf6a91eab05bce59a1af99caf6742121d9",
+      "I3-id-lists.patch": "b6e4a925ee3262ffa3e14e94611ead42a8be0665b509b38c52abf350ec667c93",
+      "I4-batch.patch": "aac53f4815230c85704ad95c32bd8eb7f2f2b1b741ee9d97f68b6db7f4b858da",
+      "T-ONFI.patch": "6ed059d29700959ff6e5d3ea49f162a0c7490c7b4cdfb4d3d301174f780141e1",
+      "T-SUSP.patch": "1eaad8c89ba2dca05e8a1d81af36554c9daab35651e8b2d924665c482e48e276"
+    }
+  },
+  "runs/final-t9-64x16/t9-64x16-vllm_interleaved": {
+    "mqsim_commit": "51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16",
+    "repository_commit": "071341476e4221b57b20d61fe7fb866ee7fecf2d",
+    "working_tree_modified": false,
+    "patches_enabled": [
+      "I1",
+      "I3",
+      "I4"
+    ],
+    "binary_sha256": "77c0c4fac3d4ecf2b4e0921b15baa0e4ec06badf4c45268ca5760b79cf38432d",
+    "patch_sha256": {
+      "I1-completions.patch": "840d425105773a7538b79b2eaa8f33d41f59ff76c0d50f9b92ab04f86bee2bba",
+      "I2-physical.patch": "0b55b42d9fda5817de061e633fe98abf6a91eab05bce59a1af99caf6742121d9",
+      "I3-id-lists.patch": "b6e4a925ee3262ffa3e14e94611ead42a8be0665b509b38c52abf350ec667c93",
+      "I4-batch.patch": "aac53f4815230c85704ad95c32bd8eb7f2f2b1b741ee9d97f68b6db7f4b858da",
+      "T-ONFI.patch": "6ed059d29700959ff6e5d3ea49f162a0c7490c7b4cdfb4d3d301174f780141e1",
+      "T-SUSP.patch": "1eaad8c89ba2dca05e8a1d81af36554c9daab35651e8b2d924665c482e48e276"
+    }
+  },
+  "runs/performance-final/t10-8192": {
+    "mqsim_commit": "51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16",
+    "repository_commit": "efa163fec56d1d622eb5183519847c2134028ee3",
+    "working_tree_modified": false,
+    "patches_enabled": [
+      "I1",
+      "I3",
+      "I4"
+    ],
+    "binary_sha256": "77c0c4fac3d4ecf2b4e0921b15baa0e4ec06badf4c45268ca5760b79cf38432d",
+    "patch_sha256": {
+      "I1-completions.patch": "840d425105773a7538b79b2eaa8f33d41f59ff76c0d50f9b92ab04f86bee2bba",
+      "I2-physical.patch": "0b55b42d9fda5817de061e633fe98abf6a91eab05bce59a1af99caf6742121d9",
+      "I3-id-lists.patch": "b6e4a925ee3262ffa3e14e94611ead42a8be0665b509b38c52abf350ec667c93",
+      "I4-batch.patch": "aac53f4815230c85704ad95c32bd8eb7f2f2b1b741ee9d97f68b6db7f4b858da",
+      "T-ONFI.patch": "6ed059d29700959ff6e5d3ea49f162a0c7490c7b4cdfb4d3d301174f780141e1",
+      "T-SUSP.patch": "1eaad8c89ba2dca05e8a1d81af36554c9daab35651e8b2d924665c482e48e276"
+    }
+  }
+}

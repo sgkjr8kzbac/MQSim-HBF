@@ -1,0 +1,12 @@
+{
+  "64k-open-burst": {
+    "wall_seconds": 16.793937232000644,
+    "peak_rss_kib": 609936,
+    "reconstructed_service_ns": 561492
+  },
+  "8x8k": {
+    "wall_seconds": 1.5158045830003175,
+    "peak_rss_kib": 573684,
+    "reconstructed_service_ns": 576160
+  }
+}

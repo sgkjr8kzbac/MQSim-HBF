@@ -1,0 +1,10 @@
+{
+  "fraction": 0.5,
+  "pages": 16384,
+  "observed_max": 24,
+  "binomial_max_scale": 25,
+  "ratios": [
+    1.1427272377976152,
+    1.0893301151042487
+  ]
+}

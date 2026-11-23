@@ -1,0 +1,8 @@
+{
+  "requests_channel0": 32,
+  "wait_count": 24,
+  "mean_ready_wait_ns": 1101,
+  "max_ready_wait_ns": 2202,
+  "mqsim_ns": 68272,
+  "estimate_ns": 43441
+}
