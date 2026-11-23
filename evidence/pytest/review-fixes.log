@@ -1,0 +1,19 @@
+t10
+......                                                                   [100%]
+6 passed, 3 deselected in 28.71s
+
+t9-16x64
+.                                                                        [100%]
+1 passed, 8 deselected in 87.54s (0:01:27)
+
+t9-256x4
+.                                                                        [100%]
+1 passed, 8 deselected in 181.89s (0:03:01)
+
+t9-64x16
+.                                                                        [100%]
+1 passed, 8 deselected in 141.05s (0:02:21)
+
+validation
+..............x............                                              [100%]
+26 passed, 9 deselected, 1 xfailed in 33.36s

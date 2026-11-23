@@ -29,6 +29,8 @@ python3 -m pytest -q -m scale --evidence-dir runs/scale
 
 运行目录保存输入、形状、种子、参数和版本，MQSim 轨迹、设备和 workload XML、原始 XML 和 stdout、逐请求完成日志，以及子批、层、步指标 CSV 和简报。`--physical` 另外保存物理事件 CSV。层、步的时延是子批服务时间之和，结果表同时保留拆分和未拆分估算。
 
+`--batch-pages` 接受 1–8,192。T10 的大批性能探针通过底层接口提交显式批次。
+
 ## 补丁开关
 
 I1 和 I2 的环境变量 `HBF_I1`、`HBF_I2` 指定 CSV 路径。I3 和 I4 由 `HBF_I3`、`HBF_I4` 的存在启用。主链路设置 I1、I3、I4，按需设置 I2。T6 和 ONFI 对照用 Python 接口设置 `simulate(..., suspension=True)` 或 `onfi=True`，分别对应 `HBF_T_SUSP`、`HBF_T_ONFI`。T-ONFI 可通过 XML 覆盖 `ONFI_t_CS`、`ONFI_t_WC`、`ONFI_t_WB`、`ONFI_t_RR`。关闭环境开关时应取消设置变量。
