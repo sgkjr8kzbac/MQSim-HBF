@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import time
 from collections import defaultdict
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -155,9 +157,21 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
         "binary_sha256": sha256(binary), "mqsim_command": command, "mqsim_env": flags,
     })
     start = time.perf_counter()
-    with (directory / "stdout.log").open("w") as log:
-        subprocess.run(["/usr/bin/time", "-f", "%M", "-o", "rss_kib.txt", *command], cwd=directory,
-                       env=env, check=True, stdin=subprocess.DEVNULL, stdout=log, stderr=log, timeout=timeout)
+    timed_command = ["/usr/bin/time", "-f", "%M", "-o", "rss_kib.txt", *command]
+    with (directory / "stdout.log").open("w") as log, subprocess.Popen(
+        timed_command, cwd=directory, env=env, stdin=subprocess.DEVNULL,
+        stdout=log, stderr=log, start_new_session=True,
+    ) as process:
+        try:
+            returncode = process.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            # GNU time starts MQSim as a child. Stop the whole group and reap the wrapper.
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, timed_command)
     elapsed = time.perf_counter() - start
     stats = flash_stats(directory / "workload_scenario_1.xml")
     stats.update(wall_seconds=elapsed, peak_rss_kib=int((directory / "rss_kib.txt").read_text()))

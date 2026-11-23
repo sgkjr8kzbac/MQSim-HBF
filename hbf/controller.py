@@ -75,8 +75,9 @@ def metrics(cfg, requests):
     unit_max = max(units.values(), default=0)
     channel_max = max(channels.values(), default=0)
     byte_count = reads * cfg.page_bytes
-    cycle = cfg.cmd_ns + cfg.read_ns + cfg.rb_ns + cfg.transfer_ns
-    mq = max(unit_max * cycle, channel_max * (cfg.cmd_ns + cfg.transfer_ns)) + cfg.host_ns if reads else 0
+    bus_ns = cfg.read_command_ns + cfg.transfer_ns
+    cycle = bus_ns + cfg.read_ns + cfg.rb_ns
+    mq = max(unit_max * cycle, channel_max * bus_ns) + cfg.host_ns if reads else 0
     ideal = max(unit_max * cfg.read_ns, byte_count / cfg.aggregate_gb_s)
     return {
         "read_pages": reads, "useful_bytes": useful, "read_amplification": byte_count / useful if useful else None,

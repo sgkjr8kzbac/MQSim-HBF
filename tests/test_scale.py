@@ -10,10 +10,7 @@ from hbf.controller import Batch, Request
 from hbf.simulator import dump, simulate
 
 
-@pytest.mark.scale
-@pytest.mark.parametrize("topology", ["16x64", "64x16", "256x4"])
-@pytest.mark.parametrize("layout", ["layer_contiguous", "vllm_interleaved"])
-def test_t9_dense_matrix(binary, evidence, topology, layout):
+def run_dense_case(binary, evidence, topology, layout):
     cfg = load(topology)
     shape = Shape(32, 8, 128, 32768)
     directory = evidence / f"t9-{topology}-{layout}"
@@ -33,6 +30,7 @@ def test_t9_dense_matrix(binary, evidence, topology, layout):
     }
     dump(directory / "summary.json", summary)
     assert len(layers) == 32 and len(batches) == 128 and len(steps) == 1
+    assert all(row["read_pages"] == 8192 for row in batches)
     assert all(row["read_pages"] == 32768 for row in layers)
     assert steps[0]["read_pages"] == 1048576
     assert stats["gc_enqueued"] == stats["Issued_Flash_Erase_CMD"] == 0
@@ -42,12 +40,30 @@ def test_t9_dense_matrix(binary, evidence, topology, layout):
     else:
         assert all(row["active_units"] == 32 and row["max_unit_pages"] == 1024 for row in layers)
         assert all(row["ideal_unsplit_ns"] == 4194304 for row in layers)
+    return summary
+
+
+@pytest.mark.scale
+@pytest.mark.parametrize(
+    ("topology", "contiguous_ns", "interleaved_ns"),
+    [("16x64", 738448, 4578760), ("64x16", 288080, 4776136), ("256x4", 273088, 6608960)],
+    ids=["16x64", "64x16", "256x4"],
+)
+def test_t9_dense_matrix(binary, evidence, topology, contiguous_ns, interleaved_ns):
+    contiguous = run_dense_case(binary, evidence, topology, "layer_contiguous")
+    interleaved = run_dense_case(binary, evidence, topology, "vllm_interleaved")
+    # The pinned baseline reproduced these service times. Use tolerance for regressions.
+    for summary, expected_ns in ((contiguous, contiguous_ns), (interleaved, interleaved_ns)):
+        assert summary["min_layer_ns"] == pytest.approx(expected_ns, rel=.05)
+        assert summary["max_layer_ns"] == pytest.approx(expected_ns, rel=.05)
+    measured_ratio = interleaved["mqsim_ns_per_layer"] / contiguous["mqsim_ns_per_layer"]
+    assert measured_ratio == pytest.approx(interleaved_ns / contiguous_ns, rel=.10)
 
 
 @pytest.mark.scale
 @pytest.mark.parametrize("size", [1024, 4096, 8192, 16384, 32768])
 def test_t10_performance(binary, evidence, size):
-    cfg = load(batch_pages=size)
+    cfg = load()
     directory = evidence / f"t10-{size}"
     _, _, _, stats = simulate(cfg, [Batch(0, 0, 0, 0, tuple(Request(i) for i in range(size)))],
                               directory, binary)

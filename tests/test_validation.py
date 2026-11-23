@@ -1,12 +1,19 @@
 import csv
 import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections import Counter
 from dataclasses import asdict, replace
 from math import comb
+from pathlib import Path
 
 import pytest
 
 from hbf.access import Access, LAYOUTS, Shape, generate, read_access, write_access
-from hbf.cli import pipeline
+from hbf.cli import main, pipeline
 from hbf.config import CONFIG, PARAMETERS, check_xml, load, workload_fields, xml_settings
 from hbf.controller import Batch, Request, metrics, schedule
 from hbf.simulator import completions, dump, simulate
@@ -211,8 +218,8 @@ def test_t6_program_suspend(binary, evidence, scheduler):
     assert result["True"]["write_ns"] > result["False"]["write_ns"]
 
 
-@pytest.mark.parametrize("fraction", [.01, .10, .50])
-def test_t8_uniform(binary, evidence, fraction):
+@pytest.mark.parametrize(("fraction", "pages_per_tensor"), [(.01, 21), (.10, 205), (.50, 1024)])
+def test_t8_uniform(binary, evidence, fraction, pages_per_tensor):
     cfg = load()
     layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 8, 128, 32768))
     path = evidence / f"t8-{fraction}"
@@ -221,9 +228,14 @@ def test_t8_uniform(binary, evidence, fraction):
         {"mode": "uniform_pages", "seed": 234, "fraction": fraction})
     rows, layers, _, stats = simulate(cfg, batches, path, binary)
     layer = layers[0]
-    assert_read_only(stats, layer["read_pages"])
+    counts = Counter((access.kv_head, access.kind) for access in read_access(path / "access.csv"))
+    expected_counts = {(head, kind): pages_per_tensor for head in range(layout.shape.kv_heads) for kind in "KV"}
+    expected_pages = sum(expected_counts.values())
+    assert counts == expected_counts
+    assert layer["read_pages"] == expected_pages
+    assert_read_only(stats, expected_pages)
     n = 32  # Each unit has 32 candidate pages, two per independently sampled (head, K/V).
-    p = layer["read_pages"] / (n * cfg.units)
+    p = expected_pages / (n * cfg.units)
     expected_tail = [
         cfg.units * sum(comb(n, j) * p**j * (1-p)**(n-j) for j in range(k, n+1))
         for k in range(n+1)
@@ -237,11 +249,66 @@ def test_t8_uniform(binary, evidence, fraction):
 
 
 def test_onfi_switch(binary, evidence):
-    cfg = micro(onfi=(10, 10, 10, 10), cmd_ns=90)
+    cfg = micro(onfi=(10, 10, 10, 10))
     path = evidence / "onfi-enabled"
     rows, _, _, _ = simulate(cfg, cases(cfg, [[0]]), path, binary, physical=True, onfi=True)
     assert rows[0]["mqsim_ns"] == rows[0]["mq_est_ns"] == 4271
     assert phy(path)[1][0] - phy(path)[0][0] == 90
+
+
+def test_last_page_uses_mqsim_capacity(binary, evidence):
+    cfg = micro(channels=16, chips=1, blocks_per_plane=125)
+    assert cfg.capacity_sectors == 3_809_264
+    last_lpa = 476_157
+    path = evidence / "t1-custom-capacity"
+    _, _, _, stats = simulate(cfg, cases(cfg, [[last_lpa]]), path, binary)
+    assert_read_only(stats, 1)
+    assert next(completions(path / "completions.csv")).start_lba == 3_809_256
+    with pytest.raises(ValueError, match="exceeds logical capacity"):
+        cfg.lba(last_lpa + 1)
+
+
+def test_timeout_stops_mqsim_child(evidence):
+    path = evidence / "timeout-cleanup"
+    path.mkdir()
+    child = path / "mock-mqsim"
+    child.write_text(f"#!{sys.executable}\n"
+                     "import os, signal\n"
+                     "from pathlib import Path\n"
+                     "Path('child.pid').write_text(str(os.getpid()))\n"
+                     "signal.pause()\n")
+    child.chmod(0o755)
+    pid_file = path / "child.pid"
+    cfg = micro()
+
+    def running(pid):
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+        except FileNotFoundError:
+            return False
+
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            simulate(cfg, cases(cfg, [[0]]), path, child, timeout=1)
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 2
+        while running(pid) and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert not running(pid), "MQSim child still running after timeout"
+    finally:
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            if running(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_batch_limit_at_cli_and_config(monkeypatch, capsys):
+    with pytest.raises(ValueError, match="8192"):
+        load(batch_pages=8193)
+    monkeypatch.setattr(sys, "argv", ["hbf-stage0", "--batch-pages", "16384"])
+    with pytest.raises(SystemExit, match="2"):
+        main()
+    assert "8192" in capsys.readouterr().err
 
 
 def test_schema_and_partial_page_union():

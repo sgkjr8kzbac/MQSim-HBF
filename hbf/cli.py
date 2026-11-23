@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .access import LAYOUTS, MODES, Shape, read_access, write_access, generate
-from .config import load
+from .config import MAX_BATCH_PAGES, load
 from .controller import schedule
 from .simulator import build, dump, simulate
 
@@ -59,7 +59,8 @@ def main():
     parser.add_argument("--unit", type=int, default=0)
     parser.add_argument("--hot-fraction", type=float, default=.5)
     parser.add_argument("--hot-units", type=int, default=1)
-    parser.add_argument("--batch-pages", type=int, default=8192)
+    parser.add_argument("--batch-pages", type=int, default=MAX_BATCH_PAGES,
+                        help=f"maximum pages per sub-batch (1–{MAX_BATCH_PAGES})")
     parser.add_argument("--physical", action="store_true")
     parser.add_argument("--access-csv", type=Path)
     parser.add_argument("--output", type=Path)
@@ -69,7 +70,10 @@ def main():
     generation = {key: getattr(args, key) for key in (
         "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units"
     )}
-    cfg = load(args.topology, batch_pages=args.batch_pages)
+    try:
+        cfg = load(args.topology, batch_pages=args.batch_pages)
+    except ValueError as error:
+        parser.error(str(error))
     shape = Shape(args.layers, args.heads, args.head_dim, args.context)
     pipeline(cfg, shape, args.layout, directory, build(), mode=args.mode, generation=generation,
              input_csv=args.access_csv, physical=args.physical)

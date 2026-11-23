@@ -1,7 +1,6 @@
 """MQSim geometry, address conversion and XML validation."""
 import json
 from dataclasses import dataclass, replace
-from decimal import Decimal
 from math import prod
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -10,6 +9,7 @@ PACKAGE = Path(__file__).resolve().parent
 ROOT = PACKAGE.parent
 CONFIG = PACKAGE / "configs"
 PARAMETERS = CONFIG / "parameters.json"
+MAX_BATCH_PAGES = 8192
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class Config:
     pcie_lanes: int = 16
     queue_depth: int = 65535
     queue_fetch: int = 65535
-    batch_pages: int = 8192
+    batch_pages: int = MAX_BATCH_PAGES
     interval_ns: int = 100_000_000
     cmd_ns: int = 290
     rb_ns: int = 20
@@ -54,14 +54,18 @@ class Config:
             raise ValueError("Require rate=1000 and page divisible by 2*channel width")
         if not 1 <= self.queue_depth <= 65535 or not 1 <= self.queue_fetch <= 65535:
             raise ValueError("Queue parameters must be nonzero uint16")
-        if self.interval_ns <= 0 or not 1 <= self.batch_pages < self.queue_depth:
-            raise ValueError("Invalid batch interval or size")
+        if self.interval_ns <= 0:
+            raise ValueError("Batch interval must be positive")
+        if (type(self.batch_pages) is not int or not 1 <= self.batch_pages <= MAX_BATCH_PAGES
+                or self.batch_pages >= self.queue_depth):
+            raise ValueError(f"Batch size must be between 1 and {MAX_BATCH_PAGES} pages and below queue depth")
         if (min(self.pages_per_block, self.blocks_per_plane, self.read_ns, self.program_ns,
                 self.erase_ns, self.pcie_lanes, self.pcie_lane_gb_s) <= 0
                 or not 0 <= self.op_ratio < 1 or not 0 < self.gc_threshold < 1
                 or self.suspend not in {"NONE", "PROGRAM"}
                 or self.scheduler not in {"PRIORITY_OUT_OF_ORDER", "OUT_OF_ORDER"}
-                or self.onfi is not None and (len(self.onfi) != 4 or min(self.onfi) < 0)):
+                or self.onfi is not None and (len(self.onfi) != 4 or
+                    any(type(ns) is not int or not 0 <= ns < 2**32 for ns in self.onfi))):
             raise ValueError("Invalid flash timing, capacity, or controller settings")
         if not 0 < self.capacity_sectors * self.sector_bytes < 2**41:
             raise ValueError("Logical capacity must be positive and below 2 TiB")
@@ -87,9 +91,19 @@ class Config:
         return self.page_bytes // self.width
 
     @property
+    def read_command_ns(self):
+        if self.onfi is None:
+            return self.cmd_ns
+        cs, wc, wb, rr = self.onfi
+        return cs + 6 * wc + wb + rr
+
+    @property
     def capacity_sectors(self):
         plane = self.blocks_per_plane * self.pages_per_block * self.spp
-        return self.units * int(plane * (1 - Decimal(str(self.op_ratio))))
+        if plane >= 2**32:
+            raise ValueError("Physical sectors per plane exceed MQSim's unsigned 32-bit range")
+        # MQSim multiplies in double precision and truncates each plane before summing.
+        return self.units * int(plane * (1.0 - self.op_ratio))
 
     def lba(self, lpa):
         if not 0 <= lpa < self.capacity_sectors // self.spp:
