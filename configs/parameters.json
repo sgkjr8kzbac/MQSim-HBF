@@ -1,0 +1,21 @@
+{
+  "page_bytes": 4096,
+  "sector_bytes": 512,
+  "pages_per_block": 256,
+  "blocks_per_plane": 64,
+  "read_ns": 4096,
+  "program_ns": 100000,
+  "erase_ns": 1000000,
+  "op_ratio": 0.07,
+  "gc_threshold": 0.05,
+  "aggregate_gb_s": 1024,
+  "transfer_rate": 1000,
+  "pcie_lane_gb_s": 256,
+  "pcie_lanes": 16,
+  "queue_depth": 65535,
+  "queue_fetch": 65535,
+  "batch_pages": 8192,
+  "interval_ns": 100000000,
+  "topologies": {"16x64": [16, 64], "64x16": [64, 16], "256x4": [256, 4]},
+  "calibration": {"cmd_ns": 290, "rb_ns": 20, "host_ns": 1}
+}

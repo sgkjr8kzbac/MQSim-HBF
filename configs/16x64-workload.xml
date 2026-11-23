@@ -1,0 +1,18 @@
+<?xml version='1.0' encoding='utf-8'?>
+<MQSim_IO_Scenarios>
+  <IO_Scenario>
+    <IO_Flow_Parameter_Set_Trace_Based>
+      <Priority_Class>HIGH</Priority_Class>
+      <Device_Level_Data_Caching_Mode>TURNED_OFF</Device_Level_Data_Caching_Mode>
+      <Initial_Occupancy_Percentage>0</Initial_Occupancy_Percentage>
+      <File_Path>trace.txt</File_Path>
+      <Percentage_To_Be_Executed>100</Percentage_To_Be_Executed>
+      <Relay_Count>1</Relay_Count>
+      <Time_Unit>NANOSECOND</Time_Unit>
+      <Channel_IDs>0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15</Channel_IDs>
+      <Chip_IDs>0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63</Chip_IDs>
+      <Die_IDs>0</Die_IDs>
+      <Plane_IDs>0</Plane_IDs>
+    </IO_Flow_Parameter_Set_Trace_Based>
+  </IO_Scenario>
+</MQSim_IO_Scenarios>

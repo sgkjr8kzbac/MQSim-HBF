@@ -1,0 +1,85 @@
+--- a/src/exec/IO_Flow_Parameter_Set.cpp
++++ b/src/exec/IO_Flow_Parameter_Set.cpp
+@@ -1,3 +1,6 @@
++#include <cstdlib>
++#include <vector>
++
+ #include "IO_Flow_Parameter_Set.h"
+ #include <string>
+ #include <set>
+@@ -127,8 +130,16 @@
+ 			} else if (strcmp(param->name(), "Channel_IDs") == 0) {
+ 				std::set<int> ids;
+ 				char tmp[1000], *tmp2;
+-				strncpy(tmp, param->value(), 1000);
+-				std::string id = strtok(tmp, ",");
++				std::vector<char> full;
++				char* buffer = tmp;
++				if (std::getenv("HBF_I3")) {
++					const char* value = param->value();
++					full.assign(value, value + std::strlen(value) + 1);
++					buffer = full.data();
++				} else {
++					strncpy(tmp, param->value(), 1000);
++				}
++				std::string id = strtok(buffer, ",");
+ 				while (1) {
+ 					std::string::size_type sz;
+ 					ids.insert(std::stoi(id, &sz));
+@@ -148,8 +159,16 @@
+ 			} else if (strcmp(param->name(), "Chip_IDs") == 0) {
+ 				std::set<int> ids;
+ 				char tmp[1000], *tmp2;
+-				strncpy(tmp, param->value(), 1000);
+-				std::string id = strtok(tmp, ",");
++				std::vector<char> full;
++				char* buffer = tmp;
++				if (std::getenv("HBF_I3")) {
++					const char* value = param->value();
++					full.assign(value, value + std::strlen(value) + 1);
++					buffer = full.data();
++				} else {
++					strncpy(tmp, param->value(), 1000);
++				}
++				std::string id = strtok(buffer, ",");
+ 				while (1) {
+ 					std::string::size_type sz;
+ 					ids.insert(std::stoi(id, &sz));
+@@ -169,8 +188,16 @@
+ 			} else if (strcmp(param->name(), "Die_IDs") == 0) {
+ 				std::set<int> ids;
+ 				char tmp[1000], *tmp2;
+-				strncpy(tmp, param->value(), 1000);
+-				std::string id = strtok(tmp, ",");
++				std::vector<char> full;
++				char* buffer = tmp;
++				if (std::getenv("HBF_I3")) {
++					const char* value = param->value();
++					full.assign(value, value + std::strlen(value) + 1);
++					buffer = full.data();
++				} else {
++					strncpy(tmp, param->value(), 1000);
++				}
++				std::string id = strtok(buffer, ",");
+ 				while (1) {
+ 					std::string::size_type sz;
+ 					ids.insert(std::stoi(id, &sz));
+@@ -190,8 +217,16 @@
+ 			} else if (strcmp(param->name(), "Plane_IDs") == 0) {
+ 				std::set<int> ids;
+ 				char tmp[1000], *tmp2;
+-				strncpy(tmp, param->value(), 1000);
+-				std::string id = strtok(tmp, ",");
++				std::vector<char> full;
++				char* buffer = tmp;
++				if (std::getenv("HBF_I3")) {
++					const char* value = param->value();
++					full.assign(value, value + std::strlen(value) + 1);
++					buffer = full.data();
++				} else {
++					strncpy(tmp, param->value(), 1000);
++				}
++				std::string id = strtok(buffer, ",");
+ 				while (1) {
+ 					std::string::size_type sz;
+ 					ids.insert(std::stoi(id, &sz));

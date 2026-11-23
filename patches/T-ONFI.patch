@@ -1,0 +1,57 @@
+--- a/src/exec/Device_Parameter_Set.h
++++ b/src/exec/Device_Parameter_Set.h
+@@ -51,6 +51,7 @@
+ 	static sim_time_type Preferred_suspend_write_time_for_read;//in nano-seconds, if the remaining time of the ongoing write is smaller than Prefered_suspend_write_time_for_read, then the ongoing erase operation will be suspended
+ 	static unsigned int Flash_Channel_Count;
+ 	static unsigned int Flash_Channel_Width;//Channel width in byte
++	static unsigned int ONFI_t_CS, ONFI_t_WC, ONFI_t_WB, ONFI_t_RR;
+ 	static unsigned int Channel_Transfer_Rate;//MT/s
+ 	static unsigned int Chip_No_Per_Channel;
+ 	static SSD_Components::ONFI_Protocol Flash_Comm_Protocol;
+--- a/src/exec/Device_Parameter_Set.cpp
++++ b/src/exec/Device_Parameter_Set.cpp
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++
+ #include "Device_Parameter_Set.h"
+ #include <algorithm>
+ 
+@@ -38,6 +40,10 @@
+ sim_time_type Device_Parameter_Set::Preferred_suspend_write_time_for_read = 100000;//in nano-seconds
+ unsigned int Device_Parameter_Set::Flash_Channel_Count = 8;
+ unsigned int Device_Parameter_Set::Flash_Channel_Width = 1;//Channel width in byte
++unsigned int Device_Parameter_Set::ONFI_t_CS = 20;
++unsigned int Device_Parameter_Set::ONFI_t_WC = 25;
++unsigned int Device_Parameter_Set::ONFI_t_WB = 100;
++unsigned int Device_Parameter_Set::ONFI_t_RR = 20;
+ unsigned int Device_Parameter_Set::Channel_Transfer_Rate = 300;//MT/s
+ unsigned int Device_Parameter_Set::Chip_No_Per_Channel = 4;
+ SSD_Components::ONFI_Protocol Device_Parameter_Set::Flash_Comm_Protocol = SSD_Components::ONFI_Protocol::NVDDR2;
+@@ -611,6 +617,14 @@
+ 			} else if (strcmp(param->name(), "Flash_Channel_Width") == 0) {
+ 				std::string val = param->value();
+ 				Flash_Channel_Width = std::stoul(val);
++			} else if (std::getenv("HBF_T_ONFI") && strcmp(param->name(), "ONFI_t_CS") == 0) {
++				ONFI_t_CS = std::stoul(param->value());
++			} else if (std::getenv("HBF_T_ONFI") && strcmp(param->name(), "ONFI_t_WC") == 0) {
++				ONFI_t_WC = std::stoul(param->value());
++			} else if (std::getenv("HBF_T_ONFI") && strcmp(param->name(), "ONFI_t_WB") == 0) {
++				ONFI_t_WB = std::stoul(param->value());
++			} else if (std::getenv("HBF_T_ONFI") && strcmp(param->name(), "ONFI_t_RR") == 0) {
++				ONFI_t_RR = std::stoul(param->value());
+ 			} else if (strcmp(param->name(), "Channel_Transfer_Rate") == 0) {
+ 				std::string val = param->value();
+ 				Channel_Transfer_Rate = std::stoul(val);
+--- a/src/exec/SSD_Device.cpp
++++ b/src/exec/SSD_Device.cpp
+@@ -94,7 +94,9 @@
+ 				}
+ 				channels[channel_cntr] = new SSD_Components::ONFI_Channel_NVDDR2(channel_cntr, parameters->Chip_No_Per_Channel,
+ 																				 chips, parameters->Flash_Channel_Width,
+-																				 (sim_time_type)((double)1000 / parameters->Channel_Transfer_Rate) * 2, (sim_time_type)((double)1000 / parameters->Channel_Transfer_Rate) * 2);
++																				 (sim_time_type)((double)1000 / parameters->Channel_Transfer_Rate) * 2, (sim_time_type)((double)1000 / parameters->Channel_Transfer_Rate) * 2,
++																				 500, parameters->ONFI_t_CS, parameters->ONFI_t_RR,
++																				 parameters->ONFI_t_WB, parameters->ONFI_t_WC);
+ 				device->Channels.push_back(channels[channel_cntr]); //Channels should not be added to the simulator core, they are passive object that do not handle any simulation event
+ 			}
+ 

@@ -1,0 +1,32 @@
+--- a/src/ssd/TSU_OutofOrder.cpp
++++ b/src/ssd/TSU_OutofOrder.cpp
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++
+ #include "TSU_OutofOrder.h"
+ 
+ namespace SSD_Components
+@@ -312,6 +314,7 @@
+ 			return false;
+ 		}
+ 		suspensionRequired = true;
++	    if (std::getenv("HBF_T_SUSP")) break;
+ 	case ChipStatus::ERASING:
+ 		if (!eraseSuspensionEnabled || _NVMController->HasSuspendedCommand(chip))
+ 		{
+--- a/src/ssd/TSU_Priority_OutOfOrder.cpp
++++ b/src/ssd/TSU_Priority_OutOfOrder.cpp
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++
+ #include "TSU_Priority_OutOfOrder.h"
+ #include "Host_Interface_Defs.h"
+ 
+@@ -415,6 +417,7 @@
+             return false;
+         }
+         suspensionRequired = true;
++        if (std::getenv("HBF_T_SUSP")) break;
+     case ChipStatus::ERASING:
+         if (!eraseSuspensionEnabled || _NVMController->HasSuspendedCommand(chip))
+         {

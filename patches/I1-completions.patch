@@ -1,0 +1,25 @@
+--- a/src/host/IO_Flow_Base.cpp
++++ b/src/host/IO_Flow_Base.cpp
+@@ -1,3 +1,6 @@
++#include <cstdlib>
++#include <fstream>
++
+ #include "IO_Flow_Base.h"
+ #include "../ssd/Host_Interface_Defs.h"
+ #include "../sim/Engine.h"
+@@ -309,6 +312,15 @@
+ 			STAT_transferred_bytes_write += request->LBA_count * SECTOR_SIZE_IN_BYTE;
+ 		}
+ 
++		const char* hbf_log_path = std::getenv("HBF_I1");
++		if (hbf_log_path && *hbf_log_path) {
++			static std::ofstream log(hbf_log_path);
++			if (!log) throw std::runtime_error("Cannot write HBF_I1");
++			log << request->Arrival_time << ',' << request->Enqueue_time << ','
++				<< Simulator->Time() << ',' << request->Start_LBA << ','
++				<< request->LBA_count << ','
++				<< (request->Type == Host_IO_Request_Type::READ ? 'R' : 'W') << '\n';
++		}
+ 		delete request;
+ 
+ 		nvme_queue_pair.Submission_queue_head = cqe->SQ_Head;
