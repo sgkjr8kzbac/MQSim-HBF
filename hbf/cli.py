@@ -16,7 +16,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
              input_csv=None, physical=False):
     directory.mkdir(parents=True, exist_ok=False)
     generation = {
-        "steps": 1, "seed": 1, "fraction": .1, "count": 32, "unit": 0,
+        "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
         "hot_fraction": .5, "hot_units": 1,
     } | (generation or {})
     layout = LAYOUTS[layout_name](cfg, shape)
@@ -55,7 +55,7 @@ def main():
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--fraction", type=float, default=.1)
-    parser.add_argument("--count", type=int, default=32)
+    parser.add_argument("--count", type=int, default=4)
     parser.add_argument("--unit", type=int, default=0)
     parser.add_argument("--hot-fraction", type=float, default=.5)
     parser.add_argument("--hot-units", type=int, default=1)

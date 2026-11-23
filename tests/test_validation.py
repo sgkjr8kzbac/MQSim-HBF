@@ -263,7 +263,7 @@ def test_schema_and_partial_page_union():
 @pytest.mark.parametrize("mode", ["hot_unit", "write_then_read"])
 def test_generator_pipeline(binary, evidence, mode):
     cfg = micro()
-    shape = Shape(1, 1, 128, 128)
+    shape = Shape(1, 1, 128, 256)
     directory = evidence / f"generator-{mode}"
     _, _, steps, stats = pipeline(cfg, shape, "layer_contiguous", directory, binary, mode=mode,
                                   generation={"count": 8, "seed": 18})

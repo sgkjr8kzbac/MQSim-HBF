@@ -111,7 +111,7 @@ MODES = (
 )
 
 
-def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=32, unit=0,
+def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0,
              hot_fraction=.5, hot_units=1):
     shape = layout.shape
     if (mode not in MODES or steps <= 0 or not 0 < fraction <= 1 or count <= 0

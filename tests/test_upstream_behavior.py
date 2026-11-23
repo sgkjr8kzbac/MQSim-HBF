@@ -86,3 +86,26 @@ def test_upstream_first_read_allocates(binary, evidence):
     locations = [(b, p, lpa) for _, event, _, _, _, _, _, b, p, lpa in phy(path) if event == "issue"]
     dump(evidence / "first-read-summary.json", locations)
     assert locations == [(0, 0, 0), (0, 1, 1), (0, 0, 0)]
+
+
+def test_upstream_slc_uses_lsb(binary, evidence):
+    cfg = micro()
+    path = evidence / "slc-lsb"
+    assert raw(binary, path, cfg, "0 0 0 8 1\n0 0 32 8 1\n",
+               device={"Page_Read_Latency_CSB": 20000, "Page_Read_Latency_MSB": 30000}) == 0
+    intervals = {}
+    for time, event, _, _, _, _, _, _, _, lpa in phy(path):
+        intervals.setdefault(lpa, {})[event] = time
+    assert all(events["ready"] - events["cmd_done"] == 4116 for events in intervals.values())
+
+
+def test_upstream_pcie_efficiency(binary, evidence):
+    cfg = micro(channels=64, chips=16, aggregate_gb_s=1024, pcie_lane_gb_s=1)
+    path = evidence / "pcie-low-bandwidth"
+    trace = "".join(f"0 0 {cfg.lba(n)} 8 1\n" for n in range(8192))
+    assert raw(binary, path, cfg, trace) == 0
+    done = list(completions(path / "completions.csv"))
+    service = max(row.complete_ns for row in done)
+    efficiency = len(done) * cfg.page_bytes / service / (cfg.pcie_lanes * cfg.pcie_lane_gb_s)
+    dump(path / "summary.json", {"ns": service, "efficiency": efficiency, "completed": len(done)})
+    assert len(done) == 8192 and .80 <= efficiency <= .83
