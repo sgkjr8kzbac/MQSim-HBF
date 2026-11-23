@@ -16,6 +16,28 @@
   "queue_fetch": 65535,
   "batch_pages": 8192,
   "interval_ns": 100000000,
-  "topologies": {"16x64": [16, 64], "64x16": [64, 16], "256x4": [256, 4]},
-  "calibration": {"cmd_ns": 290, "rb_ns": 20, "host_ns": 1}
+  "topologies": {
+    "16x64": [
+      16,
+      64
+    ],
+    "64x16": [
+      64,
+      16
+    ],
+    "256x4": [
+      256,
+      4
+    ]
+  },
+  "calibration": {
+    "cmd_ns": 290,
+    "rb_ns": 20,
+    "host_ns": 1
+  },
+  "calibration_reference": {
+    "width_gb_s": 64,
+    "xfer_ns": 64,
+    "single_read_ns": 4471
+  }
 }

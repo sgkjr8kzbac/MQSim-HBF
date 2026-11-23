@@ -1,4 +1,5 @@
 import csv
+import json
 from dataclasses import asdict, replace
 from math import comb
 
@@ -6,7 +7,7 @@ import pytest
 
 from hbf.access import Access, LAYOUTS, Shape, generate, read_access, write_access
 from hbf.cli import pipeline
-from hbf.config import CONFIG, check_xml, load, workload_fields, xml_settings
+from hbf.config import CONFIG, PARAMETERS, check_xml, load, workload_fields, xml_settings
 from hbf.controller import Batch, Request, metrics, schedule
 from hbf.simulator import completions, dump, simulate
 
@@ -77,6 +78,9 @@ def test_t0_calibrate(binary, evidence):
         "interleaved_reads": die_stats["Issued_Flash_Interleaved_Read_CMD"]
     })
     assert one == {"cmd_ns": cfg.cmd_ns, "rb_ns": cfg.rb_ns, "xfer_ns": cfg.transfer_ns, "host_ns": cfg.host_ns}
+    reference = json.loads(PARAMETERS.read_text())["calibration_reference"]
+    assert one["xfer_ns"] == reference["xfer_ns"] and cfg.width == reference["width_gb_s"]
+    assert rows[0]["mqsim_ns"] == reference["single_read_ns"]
     assert cycle == 4470
     assert serial_issues == [cfg.interval_ns + cycle * n for n in range(4)]
     assert channel_issues == [2 * cfg.interval_ns + cfg.cmd_ns * n for n in range(4)]

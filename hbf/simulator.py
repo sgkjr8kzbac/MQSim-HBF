@@ -49,12 +49,13 @@ def build(cache=None):
     digest = hashlib.sha256((archive_hash + "".join(map(sha256, patches))).encode()).hexdigest()[:16]
     source = cache / digest
     binary = source / "MQSim"
-    if binary.is_file():
+    ready = source / ".built"
+    if binary.is_file() and ready.is_file():
         return binary
     cache.mkdir(parents=True, exist_ok=True)
     with (cache / "build.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if binary.is_file():
+        if binary.is_file() and ready.is_file():
             return binary
         if source.exists():
             shutil.rmtree(source)
@@ -66,6 +67,7 @@ def build(cache=None):
                            env={**os.environ, "GIT_CEILING_DIRECTORIES": str(cache)})
             subprocess.run(["make", "-j", str(min(8, os.cpu_count() or 1))], cwd=source,
                            check=True, stdout=log, stderr=log)
+        ready.touch()
     return binary
 
 

@@ -123,6 +123,9 @@ class Config:
 def load(topology="64x16", **overrides):
     params = json.loads(PARAMETERS.read_text())
     channels, chips = params.pop("topologies")[topology]
+    reference = params.pop("calibration_reference")
+    if reference["width_gb_s"] * reference["xfer_ns"] != params["page_bytes"]:
+        raise ValueError("Reference NAND transfer calibration disagrees with the page size")
     return replace(Config(channels, chips, **params.pop("calibration"), **params), **overrides)
 
 
