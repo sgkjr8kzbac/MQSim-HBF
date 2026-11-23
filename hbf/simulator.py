@@ -1,9 +1,10 @@
 """Pinned build, trace validation, simulation, completion joins and artifacts."""
 import csv
+import fcntl
 import hashlib
 import json
 import os
-import re
+import shutil
 import subprocess
 import time
 from collections import defaultdict
@@ -11,11 +12,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from .config import ROOT, device_xml, workload_xml
+from .config import PACKAGE, ROOT, device_xml, workload_xml
 from .controller import metrics
 
-PIN = (ROOT / "mqsim.commit").read_text().strip()
-ARCHIVE = ROOT / "vendor" / f"MQSim-{PIN}.tar.gz"
+PIN = (PACKAGE / "mqsim.commit").read_text().strip()
+ARCHIVE = PACKAGE / "vendor" / f"MQSim-{PIN}.tar.gz"
 
 
 def dump(path, value):
@@ -40,23 +41,21 @@ def sha256(path):
 
 
 def build(cache=None):
-    cache = Path(cache or ROOT / ".build").resolve()
-    patches = sorted((ROOT / "patches").glob("*.patch"))
+    cache = Path(cache or Path.cwd() / ".build").resolve()
+    patches = sorted((PACKAGE / "patches").glob("*.patch"))
     archive_hash = sha256(ARCHIVE)
-    if archive_hash != (ROOT / "vendor" / "SHA256").read_text().strip():
+    if archive_hash != (PACKAGE / "vendor" / "SHA256").read_text().strip():
         raise ValueError("Pinned MQSim archive integrity check failed")
     digest = hashlib.sha256((archive_hash + "".join(map(sha256, patches))).encode()).hexdigest()[:16]
     source = cache / digest
     binary = source / "MQSim"
     if binary.is_file():
         return binary
-    import fcntl
     cache.mkdir(parents=True, exist_ok=True)
     with (cache / "build.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if binary.is_file():
             return binary
-        import shutil
         if source.exists():
             shutil.rmtree(source)
         source.mkdir()
@@ -106,13 +105,19 @@ def version(patches):
                             cwd=ROOT, capture_output=True, text=True)
     return {"mqsim_commit": PIN, "repository_commit": rev.stdout.strip() or None,
             "working_tree_modified": bool(status.stdout.strip()), "patches_enabled": patches,
-            "patch_sha256": {p.name: sha256(p) for p in sorted((ROOT / "patches").glob("*.patch"))}}
+            "patch_sha256": {p.name: sha256(p) for p in sorted((PACKAGE / "patches").glob("*.patch"))}}
 
 
 def simulate(cfg, batches, directory, binary, *, physical=False, suspension=False, onfi=False,
              overlap=False, timeout=1200):
     directory.mkdir(parents=True, exist_ok=True)
+    if (directory / "trace.txt").exists():
+        raise ValueError(f"Run directory already contains a trace: {directory}")
     binary = binary.resolve()
+    if suspension and (cfg.dies != 1 or cfg.planes != 1 or cfg.suspend != "PROGRAM"):
+        raise ValueError("T-SUSP probe requires PROGRAM with one die and plane per chip")
+    if not (directory / "meta.json").exists():
+        dump(directory / "meta.json", {"source": "page-level device probe", "batch_count": len(batches)})
     if cfg.onfi is not None and not onfi:
         raise ValueError("ONFI XML overrides require T-ONFI")
     device_xml(cfg, directory / "device.xml")

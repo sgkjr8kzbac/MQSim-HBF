@@ -15,7 +15,10 @@ from .simulator import build, dump, simulate
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False):
     directory.mkdir(parents=True, exist_ok=False)
-    generation = generation or {}
+    generation = {
+        "steps": 1, "seed": 1, "fraction": .1, "count": 32, "unit": 0,
+        "hot_fraction": .5, "hot_units": 1,
+    } | (generation or {})
     layout = LAYOUTS[layout_name](cfg, shape)
     access_path = directory / "access.csv"
     if input_csv is None:

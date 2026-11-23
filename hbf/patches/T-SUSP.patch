@@ -1,0 +1,97 @@
+--- a/src/ssd/TSU_OutofOrder.cpp
++++ b/src/ssd/TSU_OutofOrder.cpp
+@@ -1,6 +1,13 @@
++#include <cstdlib>
++
+ #include "TSU_OutofOrder.h"
+ 
+ namespace SSD_Components
+ {
++
++static bool hbf_program_suspend()
++{
++    return std::getenv("HBF_T_SUSP") != nullptr;
++}
+ 
+ TSU_OutOfOrder::TSU_OutOfOrder(const sim_object_id_type &id, FTL *ftl, NVM_PHY_ONFI_NVDDR2 *NVMController, unsigned int ChannelCount, unsigned int chip_no_per_channel,
+@@ -11,6 +18,9 @@
+ 							   bool EraseSuspensionEnabled, bool ProgramSuspensionEnabled)
+ 	: TSU_Base(id, ftl, NVMController, Flash_Scheduling_Type::OUT_OF_ORDER, ChannelCount, chip_no_per_channel, DieNoPerChip, PlaneNoPerDie,
+-			   WriteReasonableSuspensionTimeForRead, EraseReasonableSuspensionTimeForRead, EraseReasonableSuspensionTimeForWrite,
+-			   EraseSuspensionEnabled, ProgramSuspensionEnabled)
++			   hbf_program_suspend() ? EraseSuspensionEnabled : WriteReasonableSuspensionTimeForRead,
++			   hbf_program_suspend() ? ProgramSuspensionEnabled : EraseReasonableSuspensionTimeForRead,
++			   hbf_program_suspend() ? WriteReasonableSuspensionTimeForRead : EraseReasonableSuspensionTimeForWrite,
++			   hbf_program_suspend() ? EraseReasonableSuspensionTimeForRead : EraseSuspensionEnabled,
++			   hbf_program_suspend() ? EraseReasonableSuspensionTimeForWrite : ProgramSuspensionEnabled)
+ {
+ 	UserReadTRQueue = new Flash_Transaction_Queue *[channel_count];
+@@ -313,4 +323,5 @@
+ 		}
+ 		suspensionRequired = true;
++		if (hbf_program_suspend()) break;
+ 	case ChipStatus::ERASING:
+ 		if (!eraseSuspensionEnabled || _NVMController->HasSuspendedCommand(chip))
+--- a/src/ssd/TSU_Priority_OutOfOrder.cpp
++++ b/src/ssd/TSU_Priority_OutOfOrder.cpp
+@@ -1,2 +1,4 @@
++#include <cstdlib>
++
+ #include "TSU_Priority_OutOfOrder.h"
+ #include "Host_Interface_Defs.h"
+@@ -4,4 +6,9 @@
+ namespace SSD_Components
+ {
++
++static bool hbf_program_suspend()
++{
++    return std::getenv("HBF_T_SUSP") != nullptr;
++}
+ 
+ TSU_Priority_OutOfOrder::TSU_Priority_OutOfOrder(const sim_object_id_type &id,
+@@ -25,9 +32,9 @@
+                DieNoPerChip,
+                PlaneNoPerDie,
+-               WriteReasonableSuspensionTimeForRead,
+-               EraseReasonableSuspensionTimeForRead,
+-               EraseReasonableSuspensionTimeForWrite,
+-               EraseSuspensionEnabled,
+-               ProgramSuspensionEnabled)
++               hbf_program_suspend() ? EraseSuspensionEnabled : WriteReasonableSuspensionTimeForRead,
++               hbf_program_suspend() ? ProgramSuspensionEnabled : EraseReasonableSuspensionTimeForRead,
++               hbf_program_suspend() ? WriteReasonableSuspensionTimeForRead : EraseReasonableSuspensionTimeForWrite,
++               hbf_program_suspend() ? EraseReasonableSuspensionTimeForRead : EraseSuspensionEnabled,
++               hbf_program_suspend() ? EraseReasonableSuspensionTimeForWrite : ProgramSuspensionEnabled)
+ {
+     UserReadTRQueue = new Flash_Transaction_Queue **[channel_count];
+@@ -416,4 +423,5 @@
+         }
+         suspensionRequired = true;
++        if (hbf_program_suspend()) break;
+     case ChipStatus::ERASING:
+         if (!eraseSuspensionEnabled || _NVMController->HasSuspendedCommand(chip))
+--- a/src/ssd/NVM_PHY_ONFI_NVDDR2.cpp
++++ b/src/ssd/NVM_PHY_ONFI_NVDDR2.cpp
+@@ -3,4 +3,5 @@
+ #include "NVM_PHY_ONFI_NVDDR2.h"
+ #include "Stats.h"
++#include <cstdlib>
+ 
+ namespace SSD_Components {
+@@ -160,5 +161,6 @@
+ 				targetChip->Suspend(transaction_list.front()->Address.DieID);
+ 				dieBKE->PrepareSuspend();
+-				if (chipBKE->OngoingDieCMDTransfers.size()) {
++				if (chipBKE->OngoingDieCMDTransfers.size() ||
++					(die_no_per_chip == 1 && std::getenv("HBF_T_SUSP"))) {
+ 					chipBKE->PrepareSuspend();
+ 				}
+@@ -683,4 +685,8 @@
+ 			dieBKE->PrepareResume();
+ 			chipBKE->PrepareResume();
++			if (die_no_per_chip == 1 && std::getenv("HBF_T_SUSP")) {
++				chipBKE->No_of_active_dies = 1;
++				chipBKE->Expected_command_exec_finish_time = dieBKE->Expected_finish_time;
++			}
+ 			chip->Resume(dieBKE->ActiveCommand->Address[0].DieID);
+ 			switch (dieBKE->ActiveCommand->CommandCode) {

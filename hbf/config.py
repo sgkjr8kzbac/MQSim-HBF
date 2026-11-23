@@ -6,8 +6,9 @@ from math import prod
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / "configs"
+PACKAGE = Path(__file__).resolve().parent
+ROOT = PACKAGE.parent
+CONFIG = PACKAGE / "configs"
 PARAMETERS = CONFIG / "parameters.json"
 
 
