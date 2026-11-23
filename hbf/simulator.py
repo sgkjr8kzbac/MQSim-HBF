@@ -32,7 +32,11 @@ def write_table(path, rows):
 
 
 def sha256(path):
-    return hashlib.file_digest(path.open("rb"), "sha256").hexdigest() if hasattr(hashlib, "file_digest") else hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def build(cache=None):
@@ -59,7 +63,8 @@ def build(cache=None):
         with (source / "build.log").open("w") as log:
             subprocess.run(["tar", "-xzf", str(ARCHIVE), "--strip-components=1", "-C", str(source)],
                            check=True, stdout=log, stderr=log)
-            subprocess.run(["git", "apply", *map(str, patches)], cwd=source, check=True, stdout=log, stderr=log)
+            subprocess.run(["git", "apply", *map(str, patches)], cwd=source, check=True, stdout=log, stderr=log,
+                           env={**os.environ, "GIT_CEILING_DIRECTORIES": str(cache)})
             subprocess.run(["make", "-j", str(min(8, os.cpu_count() or 1))], cwd=source,
                            check=True, stdout=log, stderr=log)
     return binary
