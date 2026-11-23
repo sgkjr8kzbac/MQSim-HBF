@@ -47,7 +47,7 @@ def schedule(cfg, layout, accesses):
         requests = []
         for lpa, intervals in sorted(pages.items()):
             useful = union_size(intervals) * layout.token_bytes
-            if op == "W" and useful != cfg.page_bytes:
+            if op == "W" and useful != layout.tokens * layout.token_bytes:
                 raise ValueError("Partial-page prefill write would cause an update read")
             requests.append(Request(lpa, op, useful))
         for start in range(0, len(requests), limit):

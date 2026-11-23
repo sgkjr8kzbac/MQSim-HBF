@@ -64,10 +64,10 @@ class Layout:
     def __init__(self, cfg: Config, shape: Shape, base=0):
         self.shape, self.base = shape, base
         self.token_bytes = shape.head_dim * 2
-        self.tokens, unused = divmod(cfg.page_bytes, self.token_bytes)
-        if base < 0 or self.tokens == 0 or unused:
-            raise ValueError("BF16 token bytes must divide the page capacity")
-        self.blocks = ceil(shape.context / self.tokens)
+        self.tokens = cfg.page_bytes // self.token_bytes
+        if base < 0 or self.tokens == 0:
+            raise ValueError("A BF16 token must fit in one page and base must be nonnegative")
+        self.blocks = (shape.context + self.tokens - 1) // self.tokens
         cfg.lba(base + self.blocks * shape.layers * shape.kv_heads * 2 - 1)
 
     def lpa(self, layer, head, kind, block):

@@ -54,3 +54,20 @@ def test_t10_performance(binary, evidence, size):
     dump(directory / "summary.json", {"pages": size, "wall_seconds": stats["wall_seconds"],
         "peak_rss_kib": stats["peak_rss_kib"], "seconds_per_million": stats["wall_seconds"] * 1e6 / size})
     assert stats["wall_seconds"] > 0 and stats["peak_rss_kib"] > 0
+
+
+@pytest.mark.scale
+def test_t10_64k_split_comparison(binary, evidence):
+    cfg = load()
+    pages = tuple(Request(i) for i in range(65536))
+    unsplit = [Batch(0, 0, 0, 0, pages)]
+    split = [Batch(0, 0, i // cfg.batch_pages, i // cfg.batch_pages * cfg.interval_ns,
+                   pages[i:i + cfg.batch_pages])
+             for i in range(0, len(pages), cfg.batch_pages)]
+    result = {}
+    for label, batches in (("64k-open-burst", unsplit), ("8x8k", split)):
+        _, layers, _, stats = simulate(cfg, batches, evidence / f"t10-{label}", binary)
+        result[label] = {"wall_seconds": stats["wall_seconds"], "peak_rss_kib": stats["peak_rss_kib"],
+                         "reconstructed_service_ns": layers[0]["mqsim_ns"]}
+    dump(evidence / "t10-split-summary.json", result)
+    assert all(value["wall_seconds"] > 0 for value in result.values())

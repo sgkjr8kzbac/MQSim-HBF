@@ -3,7 +3,7 @@ import subprocess
 from xml.etree import ElementTree as ET
 
 from hbf.config import device_xml, workload_xml
-from hbf.simulator import completions, dump, flash_stats
+from hbf.simulator import completions, dump, flash_stats, version
 from test_validation import micro, phy
 
 
@@ -22,6 +22,7 @@ def raw(binary, path, cfg, trace, *, device=None, workload=None, enable_i3=True)
     if enable_i3:
         env["HBF_I3"] = "1"
     dump(path / "meta.json", {"source": "raw MQSim parser probe", "env": env})
+    dump(path / "version.json", version([name[4:] for name in env]))
     with (path / "stdout.log").open("w") as log:
         child = subprocess.run([str(binary), "-i", "device.xml", "-w", "workload.xml"],
                                cwd=path, env=env, stdin=subprocess.DEVNULL,

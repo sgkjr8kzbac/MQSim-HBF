@@ -1,10 +1,11 @@
 import csv
-from dataclasses import replace
+from dataclasses import asdict, replace
 from math import comb
 
 import pytest
 
-from hbf.access import Access, LAYOUTS, Shape, generate
+from hbf.access import Access, LAYOUTS, Shape, generate, read_access, write_access
+from hbf.cli import pipeline
 from hbf.config import CONFIG, check_xml, load, workload_fields, xml_settings
 from hbf.controller import Batch, Request, metrics, schedule
 from hbf.simulator import completions, dump, simulate
@@ -13,6 +14,14 @@ from hbf.simulator import completions, dump, simulate
 def cases(cfg, page_sets):
     return [Batch(i, 0, 0, i * cfg.interval_ns, tuple(Request(pa) for pa in pages))
             for i, pages in enumerate(page_sets)]
+
+
+def scheduled_accesses(cfg, layout, path, accesses, generator):
+    path.mkdir()
+    write_access(path / "access.csv", accesses)
+    dump(path / "meta.json", {"shape": asdict(layout.shape), "layout": "layer_contiguous",
+                              "generator": generator})
+    return schedule(cfg, layout, read_access(path / "access.csv"))
 
 
 def phy(directory):
@@ -108,8 +117,9 @@ def test_t3_same_unit(binary, evidence):
     accesses = (access for step, n in enumerate(ns)
                 for item in generate(cfg, layout, "same_unit", count=n)
                 for access in [replace(item, step=step)])
-    batches = schedule(cfg, layout, accesses)
-    rows, _, _, stats = simulate(cfg, batches, evidence / "t3", binary)
+    path = evidence / "t3"
+    batches = scheduled_accesses(cfg, layout, path, accesses, {"mode": "same_unit", "counts": ns, "seed": 1})
+    rows, _, _, stats = simulate(cfg, batches, path, binary)
     assert_read_only(stats, sum(ns))
     assert [row["read_pages"] for row in rows] == ns
     assert all(row["mqsim_ns"] == n * 4470 + 1 for n, row in zip(ns, rows))
@@ -119,11 +129,12 @@ def test_t4_units(binary, evidence):
     cfg = load("256x4")
     layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 16384))
     sizes = range(1, 1025)
-    batches = schedule(cfg, layout, (
+    path = evidence / "t4-distinct"
+    batches = scheduled_accesses(cfg, layout, path, (
         replace(item, step=step) for step, n in enumerate(sizes)
         for item in generate(cfg, layout, "distinct_units", count=n)
-    ))
-    rows, _, _, stats = simulate(cfg, batches, evidence / "t4-distinct", binary)
+    ), {"mode": "distinct_units", "counts": [1, 1024], "increment": 1, "seed": 1})
+    rows, _, _, stats = simulate(cfg, batches, path, binary)
     assert_read_only(stats, sum(sizes))
     below = [row["mqsim_ns"] for n, row in zip(sizes, rows) if n <= cfg.channels]
     assert max(below) - min(below) < .2 * min(below)
@@ -132,11 +143,11 @@ def test_t4_units(binary, evidence):
     same = load("16x64")
     layout = LAYOUTS["layer_contiguous"](same, Shape(1, 1, 128, 16384))
     sizes = [1, 2, 4, 8, 16, 32, 64]
-    batches = schedule(same, layout, (
+    path = evidence / "t4-one-channel"
+    batches = scheduled_accesses(same, layout, path, (
         replace(item, step=step) for step, n in enumerate(sizes)
         for item in generate(same, layout, "same_channel_distinct_units", count=n)
-    ))
-    path = evidence / "t4-one-channel"
+    ), {"mode": "same_channel_distinct_units", "counts": sizes, "seed": 1})
     serial, _, _, stats = simulate(same, batches, path, binary, physical=True)
     assert_read_only(stats, sum(sizes))
     slope = (serial[-1]["mqsim_ns"] - serial[0]["mqsim_ns"]) / (sizes[-1] - sizes[0])
@@ -149,13 +160,15 @@ def test_t4_units(binary, evidence):
 def test_t5_bandwidth_and_t7_stats(binary, evidence):
     cfg = load()
     layout = LAYOUTS["layer_contiguous"](cfg, Shape(2, 8, 128, 8192))
-    batches = schedule(cfg, layout, generate(cfg, layout, "dense", steps=3))
     controls = {"base": cfg, "pcie-double": replace(cfg, pcie_lane_gb_s=512),
                 "fetch-check": replace(cfg, queue_fetch=32768),
                 "fetch-512": replace(cfg, queue_fetch=512)}
     summary = {}
     for label, config in controls.items():
-        rows, _, _, stats = simulate(config, batches, evidence / f"t5-{label}", binary)
+        path = evidence / f"t5-{label}"
+        batches = scheduled_accesses(config, layout, path, generate(cfg, layout, "dense", steps=3),
+                                     {"mode": "dense", "steps": 3, "seed": 1})
+        rows, _, _, stats = simulate(config, batches, path, binary)
         reads = sum(row["read_pages"] for row in rows)
         service_time = sum(row["mqsim_ns"] for row in rows)
         assert_read_only(stats, reads)
@@ -198,8 +211,10 @@ def test_t6_program_suspend(binary, evidence, scheduler):
 def test_t8_uniform(binary, evidence, fraction):
     cfg = load()
     layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 8, 128, 32768))
-    batches = schedule(cfg, layout, generate(cfg, layout, "uniform_pages", seed=234, fraction=fraction))
     path = evidence / f"t8-{fraction}"
+    batches = scheduled_accesses(cfg, layout, path,
+        generate(cfg, layout, "uniform_pages", seed=234, fraction=fraction),
+        {"mode": "uniform_pages", "seed": 234, "fraction": fraction})
     rows, layers, _, stats = simulate(cfg, batches, path, binary)
     layer = layers[0]
     assert_read_only(stats, layer["read_pages"])
@@ -240,3 +255,18 @@ def test_schema_and_partial_page_union():
         replace(cfg, queue_fetch=65536)
     with pytest.raises(ValueError, match="Partial-page"):
         schedule(cfg, layout, [replace(a, step=-1, op="W")])
+
+@pytest.mark.parametrize("mode", ["hot_unit", "write_then_read"])
+def test_generator_pipeline(binary, evidence, mode):
+    cfg = micro()
+    shape = Shape(1, 1, 128, 128)
+    directory = evidence / f"generator-{mode}"
+    _, _, steps, stats = pipeline(cfg, shape, "layer_contiguous", directory, binary, mode=mode,
+                                  generation={"count": 8, "seed": 18})
+    assert steps[-1]["read_pages"] == 8
+    if mode == "hot_unit":
+        assert steps[-1]["max_unit_pages"] >= 4
+    else:
+        assert [row["step"] for row in steps] == [-1, 0]
+        assert stats["Issued_Flash_Program_CMD"] == 8
+        assert_read_only(stats, 8)
