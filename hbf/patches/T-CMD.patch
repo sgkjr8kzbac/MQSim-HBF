@@ -24,7 +24,7 @@ index 54b8654..6446b93 100644
  	}
  }
 diff --git a/src/ssd/TSU_Priority_OutOfOrder.cpp b/src/ssd/TSU_Priority_OutOfOrder.cpp
-index 73be5f3..d9b604f 100644
+index 73be5f3..be40fa6 100644
 --- a/src/ssd/TSU_Priority_OutOfOrder.cpp
 +++ b/src/ssd/TSU_Priority_OutOfOrder.cpp
 @@ -11,6 +11,17 @@ static bool hbf_program_suspend()
@@ -45,22 +45,30 @@ index 73be5f3..d9b604f 100644
  TSU_Priority_OutOfOrder::TSU_Priority_OutOfOrder(const sim_object_id_type &id,
                                                   FTL *ftl,
                                                   NVM_PHY_ONFI_NVDDR2 *NVMController,
-@@ -126,6 +137,9 @@ void TSU_Priority_OutOfOrder::Validate_simulation_config()
+@@ -126,6 +137,12 @@ void TSU_Priority_OutOfOrder::Validate_simulation_config()
  
  void TSU_Priority_OutOfOrder::Execute_simulator_event(MQSimEngine::Sim_Event *event)
  {
 +    //HBF T-CMD: the coalescing window registered by Schedule() has closed.
 +    hbf_dispatch_pending = false;
++    std::list<NVM_Transaction_Flash *> released;
++    released.swap(hbf_holding);
++    enqueue_transactions(released);
 +    dispatch_to_idle_channels();
  }
  
  void TSU_Priority_OutOfOrder::Report_results_in_XML(std::string name_prefix, Utils::XmlWriter &xmlwriter)
-@@ -280,6 +294,20 @@ void TSU_Priority_OutOfOrder::Schedule()
-         }
+@@ -218,8 +235,26 @@ void TSU_Priority_OutOfOrder::Schedule()
+         return;
      }
  
+-    for (std::list<NVM_Transaction_Flash *>::iterator it = transaction_receive_slots.begin();
+-         it != transaction_receive_slots.end();
 +    if (hbf_coalesce_ns() > 0)
 +    {
++        //HBF T-CMD: hold the new transactions out of the queues until the window closes, so that
++        //no dispatch path (Schedule, channel or chip idle signals) can issue them earlier.
++        hbf_holding.insert(hbf_holding.end(), transaction_receive_slots.begin(), transaction_receive_slots.end());
 +        if (!hbf_dispatch_pending)
 +        {
 +            hbf_dispatch_pending = true;
@@ -68,24 +76,40 @@ index 73be5f3..d9b604f 100644
 +        }
 +        return;
 +    }
++    enqueue_transactions(transaction_receive_slots);
 +    dispatch_to_idle_channels();
 +}
 +
++void TSU_Priority_OutOfOrder::enqueue_transactions(std::list<NVM_Transaction_Flash *> &transactions)
++{
++    for (std::list<NVM_Transaction_Flash *>::iterator it = transactions.begin();
++         it != transactions.end();
+          it++)
+     {
+         switch ((*it)->Type)
+@@ -279,7 +314,10 @@ void TSU_Priority_OutOfOrder::Schedule()
+             break;
+         }
+     }
++}
+ 
 +void TSU_Priority_OutOfOrder::dispatch_to_idle_channels()
 +{
      for (flash_channel_ID_type channelID = 0; channelID < channel_count; channelID++)
      {
          if (_NVMController->Get_channel_status(channelID) == BusChannelStatus::IDLE)
 diff --git a/src/ssd/TSU_Priority_OutOfOrder.h b/src/ssd/TSU_Priority_OutOfOrder.h
-index 3791c72..897177b 100644
+index 3791c72..79297c0 100644
 --- a/src/ssd/TSU_Priority_OutOfOrder.h
 +++ b/src/ssd/TSU_Priority_OutOfOrder.h
-@@ -44,6 +44,8 @@ public:
+@@ -44,6 +44,10 @@ public:
      void Report_results_in_XML(std::string name_prefix, Utils::XmlWriter &xmlwriter);
  
  private:
 +    void dispatch_to_idle_channels();//HBF T-CMD: the dispatch half of Schedule()
 +    bool hbf_dispatch_pending = false;//HBF T-CMD: a coalescing window is open
++    std::list<NVM_Transaction_Flash *> hbf_holding;//HBF T-CMD: transactions received during the window
++    void enqueue_transactions(std::list<NVM_Transaction_Flash *> &transactions);//HBF T-CMD
      Flash_Transaction_Queue ***UserReadTRQueue;
      Flash_Transaction_Queue ***UserWriteTRQueue;
      Flash_Transaction_Queue **GCReadTRQueue;

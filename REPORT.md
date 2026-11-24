@@ -281,7 +281,7 @@ host + [cmd(1) + tR + R/B + x] + [cmd(n−1) + tR + R/B + (n−1)·x]，cmd(n) =
 第二轮审查指出，真实层级下 MQSim 的时延基本随页数而不是随轮数变化：64 个 plane 的 ONFI 读命令要 20 + 64·150 + 63·500 + 120 = 41.2 µs，是 tR 的 10 倍；第一页到达空闲 die 时单独下发，使稀疏 decode 每层多出一条命令。补丁 `T-CMD.patch` 提供两个开关：
 
 - `HBF_T_READ_PLANE_NS=δ`：n plane 读命令 = 单 plane 命令 + (n−1)·δ（`ONFI_Channel_NVDDR2` 构造函数）；
-- `HBF_T_COALESCE_NS=W`：`TSU_Priority_OutOfOrder::Schedule` 收到新事务后不立即下发，登记 now + W 的事件，到时统一下发（窗口内再到的事务不重复登记）。
+- `HBF_T_COALESCE_NS=W`：`TSU_Priority_OutOfOrder::Schedule` 收到新事务后先放进暂存表，不进调度队列，并登记 now + W 的事件（窗口内再到的事务只加入暂存表）；事件到时才把暂存的事务放入队列并统一下发。初版只推迟了 `Schedule` 自己的下发，通道或 chip 空闲信号仍会提前取走队列里的新事务，第三轮审查发现后改为暂存。
 
 单 die 读 n 页，时延等于 W + cmd(n) + tR + R/B + n·x + host，n = 4、8、64 时逐 ns 相等，只发 1 条命令。同一组 16 die × 64 plane、5% 选页的对照：
 
@@ -324,8 +324,8 @@ MQSim 真实层级（16 die × 64 plane，T-CMD δ = 10 ns、窗口 1 µs，T-CA
 原版 MQSim 的读要等全部页传出后 chip 才回到空闲，感测和传输不能重叠。补丁 `T-CACHE.patch`（`HBF_T_CACHE`）对用户读实现双缓冲：
 
 - 感测完成时（`handle_ready_signal_from_chip`），这批页的命令和事务移入一个独立的 cache 记账项，die 的记账项立即释放；
-- TSU 判断能否发读时（`service_read_transaction`），若该 chip 没有正在感测的 die、没有正在传的命令、等待传出的批次不超过 1 个，就视为空闲；
-- 每传完一页（以及感测刚完成、通道空闲时），先让 TSU 尝试发新命令，再继续传排队的数据；
+- TSU 判断能否发读时（`service_read_transaction`），若该 chip 没有正在感测的 die、没有正在传的命令、每个 die 等待传出的批次都不超过 1 个，就视为空闲；
+- 每传完一页（以及感测刚完成、通道空闲时），先做一次"cache 优先"调度：这一轮只允许向上述 cache 就绪的 chip 发读命令，然后继续传排队的数据。写、擦除和其他 chip 的命令仍按上游顺序排在数据传出之后。初版让任何命令都插到数据传出之前，读写混合时读反而慢 5.5%，第三轮审查发现后收窄；
 - 某批数据全部传出后删除对应的 cache 记账项。
 
 时序逐 ns 核对（1 die，T-CMD δ = 10 ns、窗口 500 ns；关闭/打开 T-CACHE）：
@@ -336,13 +336,15 @@ MQSim 真实层级（16 die × 64 plane，T-CMD δ = 10 ns、窗口 1 µs，T-CA
 | 64 plane × 4 轮，64 GB/s（感测受限） | 37,029 | 24,741 | 500 + 920 + 4·4116 + 3·920 + 64·64 + 1 |
 | 64 plane × 3 轮，16 GB/s（传输受限） | 64,761 | 56,529 | 第三轮命令在 22,840 ns 才发出，即第一批传完、cache 空出之后 |
 
+物理时间线上的 `ready` 事件在 cache 路径中也会记录。另有 6 组随机读写混合测试（多 chip、多 die、批次重叠，开关 T-CACHE 各跑一遍），检查全部请求完成、同一 die 的感测不重叠、数据传出不早于感测结束。
+
 cache read 不改变轮数：16 die × 64 plane、lockstep、10% 选页时，开关前后读命令数相同且等于分析轮数，时延下降。目前只覆盖用户读；映射读和 GC 读仍走原路径，并要求不开挂起（与 T-SUSP 的交互未验证）。
 
-真实层级下的时延反而高于"chip 当 plane"，原因是 MQSim 没有 cache read：一轮 multi-plane 读要等全部页依次传完，die 才能开始下一轮，每轮约为 cmd(n) + tR + n·x，命令和传输都不能与感测重叠；而 chip 当 plane 时各 plane 的命令和传输可以与其他 plane 的感测交错。这说明在真实层级下，cache read（规范要求每个 bank 至少 2 个缓冲）是下一步最值得补的器件行为。
+不开 T-CACHE 时，真实层级下的时延反而高于"chip 当 plane"，原因是上游 MQSim 没有 cache read：一轮 multi-plane 读要等全部页依次传完，die 才能开始下一轮，每轮约为 cmd(n) + tR + n·x，命令和传输都不能与感测重叠；而 chip 当 plane 时各 plane 的命令和传输可以与其他 plane 的感测交错。上面的 T-CACHE 补丁补上了这一点。
 
 ## 局限与下一阶段接口
 
-- MQSim 主结果沿用 SSD 的 chip 门控、固定 ONFI 命令和 PCIe/NVMe 协议。当前模型无法表达 NAND cache read 或单 plane 感测和传输重叠；T-PLANE 的真实层级下，这一点使每轮 multi-plane 读都要等全部页传完。理想估算给出相应的吞吐下界模型，T-ONFI 用于独立研究四项命令时序。
+- MQSim 主结果沿用 SSD 的 chip 门控、固定 ONFI 命令和 PCIe/NVMe 协议。上游没有 cache read，感测和传输不能重叠；T-CACHE 为用户读补上了双缓冲，映射读和 GC 读仍走上游路径。T-CMD 的合并窗口对所有新事务统一生效，所以孤立批次和重叠批次都会多出 W 的等待。理想估算给出相应的吞吐下界模型，T-ONFI 用于独立研究四项命令时序。
 - I2 只在 `NVM_PHY_ONFI_NVDDR2::Send_command_to_chip` 记录命令下发。同文件 `perform_interleaved_cmd_data_transfer` 发出的 die 交错命令没有 issue 记录，后续的 cmd_done、ready、data 事件仍有记录。本阶段 D=P=1，不经过该路径。若以后用 D>1 的配置分析时间线，需要补记这一处。
 - 运行需要 `/usr/bin/time`（GNU time）记录峰值 RSS。缺少时中间件在启动 MQSim 前报错，并提示安装 `time` 包。
 - 轨迹按时间戳开环发射，层、步的服务时间通过事后相加重建。GPU 计算、层间动态依赖和真实模型决策反馈仍待接入。

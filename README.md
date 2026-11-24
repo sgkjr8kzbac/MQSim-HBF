@@ -71,14 +71,14 @@ flowchart TB
 | `independent` | 每个 plane 任意块、任意页 | OCP HBF 规范（每个 bank 独立感测）、SPLASH |
 | `lockstep` | 块号和页号都相同 | FlashAccel 的 megaplane |
 
-一条 n plane 的读命令占总线 t_CS + n·6·t_WC + (n−1)·t_DBSY + t_WB + t_RR，t_DBSY 可用 `--dbsy-ns` 调整（原版 500 ns）。数据仍按页依次传出，传完之前 die 不接新命令（没有 cache read）。
+一条 n plane 的读命令占总线 t_CS + n·6·t_WC + (n−1)·t_DBSY + t_WB + t_RR，t_DBSY 可用 `--dbsy-ns` 调整（原版 500 ns）。数据仍按页依次传出；不开 T-CACHE 时，传完之前 die 不接新命令。
 
 ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 41 µs，是 tR 的 10 倍，会把轮数差异淹没。T-CMD 补丁提供两个 HBF 命令模型的选项：
 
 - `--read-plane-ns δ`：n plane 读命令改为单 plane 命令加 (n−1)·δ，对应 base die 并行或广播地址；
 - `--coalesce-ns W`：新到的事务先等 W 再下发，同一批中到达同一 die 的页合成一条命令，去掉"第一页到达空闲 die 时单独下发"的现象。此时每层每 die 的读命令数正好等于机制分析的轮数。
 
-`--cache-read`（T-CACHE 补丁）给每个 plane 两个缓冲：感测完成后数据移入 cache，die 立即可以开始下一轮感测，同时传出上一轮的数据；最多允许一批数据在等待传出时再发新命令，控制器让命令优先于排队的数据传输。OCP 规范要求每个 bank 至少两个缓冲。
+`--cache-read`（T-CACHE 补丁）给每个 plane 两个缓冲：感测完成后数据移入 cache，die 立即可以开始下一轮感测，同时传出上一轮的数据；每个 die 最多允许一批数据在等待传出时再发新命令；只有这类"cache 就绪"的读命令会排到已排队的数据传输之前，写和擦除仍按上游顺序。OCP 规范要求每个 bank 至少两个缓冲。
 
 ### 模块一览
 
@@ -132,7 +132,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 
 ### 建模假设（解读结果前请先看）
 
-- 主结果使用**原版 MQSim 时序**：chip 级门控、每条命令约 290 ns 的 ONFI 开销、没有 cache read。这些都是按 SSD 做的假设，未必符合 HBF，所以用拓扑扫描和 T-ONFI 做敏感性分析。
+- 主结果使用**原版 MQSim 时序**：chip 级门控、每条命令约 290 ns 的 ONFI 开销、没有 cache read（T-PLANE、T-CMD、T-CACHE 是可选的 HBF 化改造，默认关闭）。这些都是按 SSD 做的假设，未必符合 HBF，所以用拓扑扫描和 T-ONFI 做敏感性分析。
 - **FTL 用原版**，作为"未做 HBF 专门设计"的基线。CWDP 按 LPA 轮转到各单元，所以稠密读天然均衡；稀疏读是否均衡，取决于选中了哪些页。
 - **理想 HBF 下界**假设感测与传输可以完全重叠、没有命令开销。它与 MQSim 一致估算之差，就是 MQSim 建模假设带来的额外开销。
 - **估算器 1 有适用范围**：当最忙单元的串行时间和最忙通道的总线时间接近时，它会明显低估。T8 中有两组越界，T9 的 256×4 低估 57%。原因分析见报告。
@@ -280,8 +280,8 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 | I4 | 修复 | 去掉结尾的 `cin.get()`，便于批量运行 | `HBF_I4` 存在即开启 |
 | T-SUSP | 时序对照 | 补上 program 挂起缺少的 `break`，修正 TSU 构造函数传参错序，以及单 die 挂起和恢复的记账 | `HBF_T_SUSP` |
 | T-ONFI | 时序对照 | 把 t_CS、t_WC、t_WB、t_RR 暴露到 XML，默认值与原版一致 | `HBF_T_ONFI` |
-| T-CACHE | 器件扩展 | cache read：用户读感测完成后数据进入 cache，die 可立即开始下一轮感测；双缓冲约束；命令优先于排队的数据传出 | `HBF_T_CACHE` |
-| T-CMD | 器件扩展 | HBF 命令模型：读命令的逐 plane 步长可设；TSU 合并窗口，新事务等待窗口结束再统一下发 | `HBF_T_READ_PLANE_NS`、`HBF_T_COALESCE_NS` |
+| T-CACHE | 器件扩展 | cache read：用户读感测完成后数据进入 cache，die 可立即开始下一轮感测；每 die 双缓冲约束；cache 就绪的读命令优先于排队的数据传出 | `HBF_T_CACHE` |
+| T-CMD | 器件扩展 | HBF 命令模型：读命令的逐 plane 步长可设；TSU 合并窗口，新事务先暂存，窗口结束才进入队列并统一下发 | `HBF_T_READ_PLANE_NS`、`HBF_T_COALESCE_NS` |
 | T-PLANE | 器件扩展 | 命令时间表从 1–4 个 plane 扩展到 64 个（原版超过 4 个 plane 会越界读）；plane 掩码改为 64 位（原版 32 位溢出）；multi-plane 合并规则可选 `independent` / `lockstep`；t_DBSY 可在 XML 中设置 | `HBF_T_PLANE=independent\|lockstep` |
 
 补丁按 `hbf/patches/series` 的顺序应用。主链路默认开启 I1、I3、I4，需要时开启 I2；T 类补丁默认关闭，T-PLANE 在指定 `--plane-rule` 时开启，T-CMD 在指定 `--read-plane-ns` 或 `--coalesce-ns` 时开启，T-CACHE 在指定 `--cache-read` 时开启。T-PLANE 对 1–4 个 plane 的命令时间不变，64 位掩码在 32 个 plane 以内结果相同。已实测确认：所有开关都关闭时，输出与未打补丁的原版**逐位一致**；只开 I 类补丁时，统计输出不变。

@@ -219,3 +219,68 @@ def test_cache_read_keeps_rounds(binary, evidence):
 def test_cache_read_rejects_suspension():
     with pytest.raises(ValueError, match="T-CACHE"):
         load("16x64", cache_read=True, suspend="PROGRAM")
+
+
+def physical_invariants(path, cfg):
+    """Sensing on a die never overlaps and data never leaves before its sensing ended."""
+    sense_end, sensing, errors, ready = defaultdict(list), defaultdict(list), [], 0
+    for time, event, command, channel, chip, die, plane, block, page, lpa in csv.reader((path / "physical.csv").open()):
+        if command not in READ_COMMANDS:
+            continue
+        time, key = int(time), (channel, chip, die, plane, block, page, lpa)
+        ready += event == "ready"
+        if event == "cmd_done":
+            sensing[channel, chip, die].append((time, time + cfg.read_ns + cfg.rb_ns))
+            sense_end[key].append(time + cfg.read_ns + cfg.rb_ns)
+        elif event == "data_start" and (not sense_end[key] or time < sense_end[key].pop(0)):
+            errors.append(("data before sensing ended", key, time))
+    for die, spans in sensing.items():
+        spans = sorted(set(spans))
+        errors += [("overlapping sensing", die, a, b) for a, b in zip(spans, spans[1:]) if b[0] < a[1]]
+    return errors, ready
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_cache_read_random_mixed_workloads(binary, evidence, seed):
+    """Random reads and writes, overlapping batches, several chips and dies, with and without T-CACHE."""
+    import random
+    rng = random.Random(seed)
+    topology, extra = [("1x4", {}), ("1x2", {"dies": 2, "planes": 4, "plane_rule": "independent"}),
+                       ("2x2", {"planes": 16, "plane_rule": "lockstep", "read_plane_ns": 10, "coalesce_ns": 300}),
+                       ("1x4", {"dies": 2, "planes": 8, "plane_rule": "independent", "coalesce_ns": 200}),
+                       ("1x1", {"dies": 4, "planes": 2, "plane_rule": "independent"})][seed % 5]
+    batches, time = [], 0
+    for index in range(rng.randint(3, 8)):
+        time += rng.choice([1, 300, 2000, 20000])
+        lpas = rng.sample(range(600), rng.randint(1, 100))
+        batches.append(Batch(0, index, 0, time, tuple(Request(l, "W" if rng.random() < .2 else "R") for l in lpas)))
+    reads = sum(req.op == "R" for batch in batches for req in batch.requests)
+    for cache in (False, True):
+        cfg = load(topology, blocks_per_plane=32, aggregate_gb_s=16, cache_read=cache, **extra)
+        path = evidence / f"t-cache-fuzz-{seed}-{cache}"
+        simulate(cfg, batches, path, binary, physical=True, overlap=True, timeout=120)
+        errors, ready = physical_invariants(path, cfg)
+        assert errors == [] and ready == reads
+
+
+def test_cache_read_priority_and_window(binary, evidence):
+    """Only cache-ready reads go ahead of queued data out, and nothing leaves before the window closes."""
+    cfg = load("1x4", planes=64, plane_rule="independent", read_plane_ns=10, coalesce_ns=500,
+               blocks_per_plane=64)
+    reads = lambda lpas, op="R": tuple(Request(l, op) for l in lpas)
+    mixed = [Batch(0, 0, 0, 0, reads(range(1024))), Batch(0, 1, 0, 700, reads(range(2048, 2100), "W")),
+             Batch(0, 2, 0, 900, reads(range(1024, 2048)))]
+    last = {}
+    for cache in (False, True):
+        rows, _, _, _ = simulate(load("1x4", planes=64, plane_rule="independent", read_plane_ns=10,
+                                      coalesce_ns=500, blocks_per_plane=64, cache_read=cache),
+                                 mixed, evidence / f"t-cache-mixed-{cache}", binary, overlap=True)
+        last[cache] = rows[-1]["complete_ns"]
+    assert last[True] < last[False]  # writes no longer cut in front of other chips' data out
+    single = load("1x1", planes=64, plane_rule="independent", read_plane_ns=10, coalesce_ns=500,
+                  blocks_per_plane=64, aggregate_gb_s=16, cache_read=True)
+    path = evidence / "t-cache-window"
+    simulate(single, [Batch(0, 0, 0, 0, reads(range(64))), Batch(0, 1, 0, 6000, reads(range(64, 128)))],
+             path, binary, physical=True, overlap=True)
+    issues = sorted({int(row[0]) for row in csv.reader((path / "physical.csv").open()) if row[1] == "issue"})
+    assert issues[0] == 500 and issues[1] >= 6000 + 500

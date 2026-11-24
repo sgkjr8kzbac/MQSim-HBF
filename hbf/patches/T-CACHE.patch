@@ -1,8 +1,8 @@
 diff --git a/src/ssd/NVM_PHY_ONFI_NVDDR2.cpp b/src/ssd/NVM_PHY_ONFI_NVDDR2.cpp
-index 124fb60..697cad8 100644
+index 124fb60..36cc88f 100644
 --- a/src/ssd/NVM_PHY_ONFI_NVDDR2.cpp
 +++ b/src/ssd/NVM_PHY_ONFI_NVDDR2.cpp
-@@ -6,8 +6,26 @@
+@@ -6,8 +6,27 @@
  #include "NVM_PHY_ONFI_NVDDR2.h"
  #include "Stats.h"
  #include <cstdlib>
@@ -20,6 +20,7 @@ index 124fb60..697cad8 100644
 +		return enabled;
 +	}
 +	static std::unordered_map<NVM_Transaction_Flash*, DieBookKeepingEntry*> hbf_cache_owner;
++	static bool hbf_priority_pass = false;
 +	static DieBookKeepingEntry* hbf_owner(NVM_Transaction_Flash* tr, DieBookKeepingEntry* fallback)
 +	{
 +		auto it = hbf_cache_owner.find(tr);
@@ -29,7 +30,7 @@ index 124fb60..697cad8 100644
  	/*hack: using this style to emulate event/delegate*/
  	NVM_PHY_ONFI_NVDDR2* NVM_PHY_ONFI_NVDDR2::_my_instance;
  
-@@ -89,6 +107,21 @@ namespace SSD_Components {
+@@ -89,6 +108,35 @@ namespace SSD_Components {
  		return bookKeepingTable[chip->ChannelID][chip->ChipID].Status;
  	}
  	
@@ -38,20 +39,34 @@ index 124fb60..697cad8 100644
 +		if (!hbf_cache_read()) return false;
 +		ChipBookKeepingEntry* chipBKE = &bookKeepingTable[chip->ChannelID][chip->ChipID];
 +		if (chipBKE->No_of_active_dies != 0 || chipBKE->OngoingDieCMDTransfers.size() != 0 || chipBKE->HasSuspend
-+			|| chipBKE->HbfCacheBatches > 1
 +			|| (chipBKE->Status != ChipStatus::WAIT_FOR_DATA_OUT && chipBKE->Status != ChipStatus::DATA_OUT)) {
 +			return false;
 +		}
 +		for (unsigned int die = 0; die < die_no_per_chip; die++) {
-+			if (!chipBKE->Die_book_keeping_records[die].Free) return false;
++			DieBookKeepingEntry* dieBKE = &chipBKE->Die_book_keeping_records[die];
++			if (!dieBKE->Free || dieBKE->HbfPendingBatches > 1) return false;
 +		}
 +		return true;
++	}
++
++	bool NVM_PHY_ONFI_NVDDR2::Hbf_cache_priority_pass()
++	{
++		return hbf_priority_pass;
++	}
++
++	//Let the TSU issue reads to chips whose previous pages wait in the cache, ahead of queued data
++	//out. Other commands (writes, erases, reads to busy chips) keep upstream's order.
++	void NVM_PHY_ONFI_NVDDR2::hbf_issue_cache_reads(flash_channel_ID_type channel_id)
++	{
++		hbf_priority_pass = true;
++		broadcastChannelIdleSignal(channel_id);
++		hbf_priority_pass = false;
 +	}
 +
  	inline sim_time_type NVM_PHY_ONFI_NVDDR2::Expected_finish_time(NVM::FlashMemory::Flash_Chip* chip)
  	{
  		return bookKeepingTable[chip->ChannelID][chip->ChipID].Expected_command_exec_finish_time;
-@@ -437,6 +470,7 @@ namespace SSD_Components {
+@@ -437,6 +485,7 @@ namespace SSD_Components {
  						break;
  					}
  				}
@@ -59,12 +74,12 @@ index 124fb60..697cad8 100644
  				dieBKE->ActiveTransfer = NULL;
  				if (dieBKE->ActiveTransactions.size() == 0) {
  					dieBKE->ClearCommand();
-@@ -455,12 +489,24 @@ namespace SSD_Components {
+@@ -455,12 +504,24 @@ namespace SSD_Components {
  						send_resume_command_to_chip(targetChip, chipBKE);
  					}
  				}
 +				if (dieBKE->HbfCached && dieBKE->Free) {
-+					chipBKE->HbfCacheBatches--;
++					dieBKE->HbfOrigin->HbfPendingBatches--;
 +					delete dieBKE;
 +				}
  				targetChannel->SetStatus(BusChannelStatus::IDLE, targetChip);
@@ -75,7 +90,7 @@ index 124fb60..697cad8 100644
  
 +		if (hbf_cache_read() && WaitingReadTX[channel_id].size() > 0 && WaitingCopybackWrites[channel_id].size() == 0
 +			&& WaitingMappingRead_TX[channel_id].size() == 0) {
-+			broadcastChannelIdleSignal(channel_id);
++			hbf_issue_cache_reads(channel_id);
 +			if (channels[channel_id]->GetStatus() == BusChannelStatus::BUSY) {
 +				return;
 +			}
@@ -84,7 +99,7 @@ index 124fb60..697cad8 100644
  		/* Copyback requests are prioritized over other type of requests since they need very short transfer time.
  		In addition, they are just used for GC purpose. */
  		if (WaitingCopybackWrites[channel_id].size() > 0) {
-@@ -501,7 +547,7 @@ namespace SSD_Components {
+@@ -501,7 +562,7 @@ namespace SSD_Components {
  			NVM_Transaction_Flash_RD* waitingTR = (NVM_Transaction_Flash_RD*)WaitingReadTX[channel_id].front();
  			WaitingReadTX[channel_id].pop_front();
  			transfer_read_data_from_chip(&bookKeepingTable[channel_id][waitingTR->Address.ChipID],
@@ -93,7 +108,7 @@ index 124fb60..697cad8 100644
  
  			return;
  		} else if (WaitingGCRead_TX[channel_id].size() > 0) {
-@@ -530,6 +576,38 @@ namespace SSD_Components {
+@@ -530,6 +591,41 @@ namespace SSD_Components {
  			if (chipBKE->No_of_active_dies == 0)//After finishing the last command, the chip state is changed
  				chipBKE->Status = ChipStatus::WAIT_FOR_DATA_OUT;
  
@@ -106,18 +121,21 @@ index 124fb60..697cad8 100644
 +				cached->Suspended = false;
 +				cached->SuspendedCommand = NULL;
 +				cached->SuspendedTransactions.clear();
++				cached->HbfOrigin = dieBKE;
++				cached->HbfPendingBatches = 0;
 +				dieBKE->ActiveCommand = NULL;
 +				dieBKE->ActiveTransactions.clear();
 +				dieBKE->Free = true;
-+				chipBKE->HbfCacheBatches++;
++				dieBKE->HbfPendingBatches++;
 +				for (auto* tr : cached->ActiveTransactions) {
++					hbf_physical_event("ready", command->CommandCode, tr);
 +					hbf_cache_owner[tr] = cached;
 +					chipBKE->WaitingReadTXCount++;
 +					_my_instance->WaitingReadTX[chip->ChannelID].push_back(tr);
 +				}
 +				if (_my_instance->channels[chip->ChannelID]->GetStatus() == BusChannelStatus::IDLE) {
 +					//Start the next sensing first if a command is waiting, then the data out.
-+					_my_instance->broadcastChannelIdleSignal(chip->ChannelID);
++					_my_instance->hbf_issue_cache_reads(chip->ChannelID);
 +					if (_my_instance->channels[chip->ChannelID]->GetStatus() == BusChannelStatus::IDLE
 +						&& _my_instance->WaitingReadTX[chip->ChannelID].size() > 0) {
 +						NVM_Transaction_Flash* first = _my_instance->WaitingReadTX[chip->ChannelID].front();
@@ -133,38 +151,52 @@ index 124fb60..697cad8 100644
  				it != dieBKE->ActiveTransactions.end(); it++)
  			{
 diff --git a/src/ssd/NVM_PHY_ONFI_NVDDR2.h b/src/ssd/NVM_PHY_ONFI_NVDDR2.h
-index be51ac2..683c835 100644
+index be51ac2..4c36e70 100644
 --- a/src/ssd/NVM_PHY_ONFI_NVDDR2.h
 +++ b/src/ssd/NVM_PHY_ONFI_NVDDR2.h
-@@ -37,6 +37,7 @@ namespace SSD_Components
+@@ -37,6 +37,9 @@ namespace SSD_Components
  		sim_time_type Expected_finish_time;
  		sim_time_type RemainingExecTime;
  		sim_time_type DieInterleavedTime;//If the command transfer is done in die-interleaved mode, the transfer time is recorded in this temporary variable
 +		bool HbfCached = false;//HBF T-CACHE: sensed pages held in the cache register, waiting for data out
++		DieBookKeepingEntry* HbfOrigin = NULL;//HBF T-CACHE: the die a cached entry came from
++		unsigned int HbfPendingBatches = 0;//HBF T-CACHE: batches of this die not yet fully transferred
  
  		void PrepareSuspend()
  		{
-@@ -80,6 +81,7 @@ namespace SSD_Components
- 		std::queue<DieBookKeepingEntry*> OngoingDieCMDTransfers;
- 		unsigned int WaitingReadTXCount;
- 		unsigned int No_of_active_dies;
-+		unsigned int HbfCacheBatches = 0;//HBF T-CACHE: sensed read batches of this chip not yet fully transferred
- 
- 		void PrepareSuspend() { HasSuspend = true; No_of_active_dies = 0; }
- 		void PrepareResume() { HasSuspend = false; }
-@@ -102,6 +104,7 @@ namespace SSD_Components
+@@ -102,6 +105,8 @@ namespace SSD_Components
  		LPA_type Get_metadata(flash_channel_ID_type channe_id, flash_chip_ID_type chip_id, flash_die_ID_type die_id, flash_plane_ID_type plane_id, flash_block_ID_type block_id, flash_page_ID_type page_id);//A simplification to decrease the complexity of GC execution! The GC unit may need to know the metadata of a page to decide if a page is valid or invalid. 
  		bool HasSuspendedCommand(NVM::FlashMemory::Flash_Chip* chip);
  		ChipStatus GetChipStatus(NVM::FlashMemory::Flash_Chip* chip);
 +		bool Hbf_cache_read_ready(NVM::FlashMemory::Flash_Chip* chip);//HBF T-CACHE
++		bool Hbf_cache_priority_pass();//HBF T-CACHE: only cache-ready reads may be issued now
  		sim_time_type Expected_finish_time(NVM::FlashMemory::Flash_Chip* chip);
  		sim_time_type Expected_finish_time(NVM_Transaction_Flash* transaction);
  		sim_time_type Expected_transfer_time(NVM_Transaction_Flash* transaction);
+@@ -110,6 +115,7 @@ namespace SSD_Components
+ 		void Change_memory_status_preconditioning(const NVM::NVM_Memory_Address* address, const void* status_info);
+ 	private:
+ 		void transfer_read_data_from_chip(ChipBookKeepingEntry* chipBKE, DieBookKeepingEntry* dieBKE, NVM_Transaction_Flash* tr);
++		void hbf_issue_cache_reads(flash_channel_ID_type channel_id);//HBF T-CACHE
+ 		void perform_interleaved_cmd_data_transfer(NVM::FlashMemory::Flash_Chip* chip, DieBookKeepingEntry* bookKeepingEntry);
+ 		void send_resume_command_to_chip(NVM::FlashMemory::Flash_Chip* chip, ChipBookKeepingEntry* chipBKE);
+ 		static void handle_ready_signal_from_chip(NVM::FlashMemory::Flash_Chip* chip, NVM::FlashMemory::Flash_Command* command);
 diff --git a/src/ssd/TSU_Priority_OutOfOrder.cpp b/src/ssd/TSU_Priority_OutOfOrder.cpp
-index d9b604f..d26d463 100644
+index be40fa6..3d272db 100644
 --- a/src/ssd/TSU_Priority_OutOfOrder.cpp
 +++ b/src/ssd/TSU_Priority_OutOfOrder.cpp
-@@ -436,6 +436,10 @@ bool TSU_Priority_OutOfOrder::service_read_transaction(NVM::FlashMemory::Flash_C
+@@ -379,6 +379,10 @@ Flash_Transaction_Queue *TSU_Priority_OutOfOrder::get_next_read_service_queue(NV
+ 
+ bool TSU_Priority_OutOfOrder::service_read_transaction(NVM::FlashMemory::Flash_Chip *chip)
+ {
++    if (_NVMController->Hbf_cache_priority_pass() && !_NVMController->Hbf_cache_read_ready(chip))
++    {
++        return false;//HBF T-CACHE: this pass only issues reads to cache-ready chips
++    }
+     Flash_Transaction_Queue *sourceQueue1 = NULL, *sourceQueue2 = NULL;
+ 
+     //Flash transactions that are related to FTL mapping data have the highest priority
+@@ -446,6 +450,10 @@ bool TSU_Priority_OutOfOrder::service_read_transaction(NVM::FlashMemory::Flash_C
  
      bool suspensionRequired = false;
      ChipStatus cs = _NVMController->GetChipStatus(chip);
@@ -175,3 +207,25 @@ index d9b604f..d26d463 100644
      switch (cs)
      {
      case ChipStatus::IDLE:
+@@ -516,6 +524,10 @@ Flash_Transaction_Queue *TSU_Priority_OutOfOrder::get_next_write_service_queue(N
+ 
+ bool TSU_Priority_OutOfOrder::service_write_transaction(NVM::FlashMemory::Flash_Chip *chip)
+ {
++    if (_NVMController->Hbf_cache_priority_pass())
++    {
++        return false;//HBF T-CACHE: writes keep upstream's order behind queued data out
++    }
+     Flash_Transaction_Queue *sourceQueue1 = NULL, *sourceQueue2 = NULL;
+ 
+     //If flash transactions related to GC are prioritzed (non-preemptive execution mode of GC), then GC queues are checked first
+@@ -583,6 +595,10 @@ bool TSU_Priority_OutOfOrder::service_write_transaction(NVM::FlashMemory::Flash_
+ 
+ bool TSU_Priority_OutOfOrder::service_erase_transaction(NVM::FlashMemory::Flash_Chip *chip)
+ {
++    if (_NVMController->Hbf_cache_priority_pass())
++    {
++        return false;//HBF T-CACHE: erases keep upstream's order behind queued data out
++    }
+     if (_NVMController->GetChipStatus(chip) != ChipStatus::IDLE)
+     {
+         return false;
