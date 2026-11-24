@@ -1,6 +1,7 @@
-"""Logical access schema, replaceable layouts and seeded workloads."""
+"""Logical access schema, tensor formats, replaceable layouts and seeded workloads."""
 import csv
-from dataclasses import dataclass, fields
+import json
+from dataclasses import asdict, dataclass, fields
 from math import ceil
 from random import Random
 
@@ -20,6 +21,49 @@ class Shape:
 
 
 @dataclass(frozen=True)
+class TensorSpec:
+    """Stored format of one per-head KV tensor: one row of ``dims`` elements of ``bits`` per token.
+
+    The defaults are BF16 K and V. Compressed methods declare their own tensors, e.g. 2-bit
+    quantized K plus a 16-bit scale tensor (KIVI), K with pruned channels (ThinK) or a low-rank
+    latent. Pages hold tokens of a single tensor. Per-block metadata such as Quest's page
+    summaries has one row per block rather than per token and is not expressible yet.
+    """
+    name: str
+    bits: int
+    dims: int
+
+    def __post_init__(self):
+        if (not isinstance(self.name, str) or not self.name.isidentifier()
+                or any(type(n) is not int or n <= 0 for n in (self.bits, self.dims))
+                or self.bits > 64 or self.dims * self.bits % 8):
+            raise ValueError(f"Invalid tensor spec {self}: need an identifier name, "
+                             "positive bits <= 64 and whole bytes per token")
+
+    @property
+    def token_bytes(self):
+        return self.dims * self.bits // 8
+
+
+def default_tensors(shape):
+    return TensorSpec("K", 16, shape.head_dim), TensorSpec("V", 16, shape.head_dim)
+
+
+def parse_tensors(text):
+    """Parse ``[{"name": "K", "bits": 2, "dims": 128}, ...]`` from JSON text or a file path."""
+    if text is None:
+        return None
+    try:
+        items = json.loads(text)
+    except json.JSONDecodeError:
+        with open(text) as stream:
+            items = json.load(stream)
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise ValueError("Tensor specs must be a JSON list of objects")
+    return tuple(TensorSpec(**item) for item in items)
+
+
+@dataclass(frozen=True)
 class Access:
     step: int
     layer: int
@@ -30,13 +74,16 @@ class Access:
     token_end: int
     bits: int = 16
 
-    def validate(self, shape):
+    def validate(self, layout):
+        """``kind`` names a tensor of the layout and ``bits`` must match its stored format."""
+        shape = layout.shape
         numbers = (self.step, self.layer, self.kv_head, self.token_start, self.token_end, self.bits)
-        if any(type(n) is not int for n in numbers) or not (
+        spec = layout.specs.get(self.kind)
+        if any(type(n) is not int for n in numbers) or spec is None or not (
             self.step >= -1 and 0 <= self.layer < shape.layers and
-            0 <= self.kv_head < shape.kv_heads and self.kind in {"K", "V"} and
+            0 <= self.kv_head < shape.kv_heads and
             self.op in {"R", "W"} and 0 <= self.token_start < self.token_end <= shape.context
-            and self.bits == 16
+            and self.bits == spec.bits
         ):
             raise ValueError(f"Invalid logical access: {self}")
 
@@ -46,6 +93,10 @@ def write_access(path, accesses):
         writer = csv.writer(stream)
         writer.writerow([f.name for f in fields(Access)])
         writer.writerows(vars(access).values() for access in accesses)
+
+
+def tensors_meta(layout):
+    return [asdict(spec) for spec in layout.tensors]
 
 
 def read_access(path):
@@ -61,47 +112,96 @@ def read_access(path):
 
 
 class Layout:
-    def __init__(self, cfg: Config, shape: Shape, base=0):
-        self.shape, self.base = shape, base
-        self.token_bytes = shape.head_dim * 2
-        self.tokens = cfg.page_bytes // self.token_bytes
-        if base < 0 or self.tokens == 0:
-            raise ValueError("A BF16 token must fit in one page and base must be nonnegative")
-        self.blocks = (shape.context + self.tokens - 1) // self.tokens
-        cfg.lba(base + self.blocks * shape.layers * shape.kv_heads * 2 - 1)
+    """Maps (layer, tensor index, head, block) to LPAs. A block is one page of one tensor."""
 
-    def lpa(self, layer, head, kind, block):
+    def __init__(self, cfg: Config, shape: Shape, base=0, tensors=None):
+        self.shape, self.base = shape, base
+        self.tensors = tuple(tensors) if tensors is not None else default_tensors(shape)
+        names = [spec.name for spec in self.tensors]
+        if not self.tensors or len(set(names)) != len(names):
+            raise ValueError("Tensor names must be unique and nonempty")
+        self.specs = {spec.name: spec for spec in self.tensors}
+        self.index = {name: t for t, name in enumerate(names)}
+        self.tokens_per_page = tuple(cfg.page_bytes // spec.token_bytes for spec in self.tensors)
+        if base < 0 or 0 in self.tokens_per_page:
+            raise ValueError("A token row must fit in one page and base must be nonnegative")
+        self.block_counts = tuple(-(-shape.context // tokens) for tokens in self.tokens_per_page)
+        self.pages = shape.layers * shape.kv_heads * sum(self.block_counts)
+        cfg.lba(base + self.pages - 1)
+
+    def tensor_index(self, name):
+        return self.index[name]
+
+    def tokens(self, t):
+        return self.tokens_per_page[t]
+
+    def blocks(self, t):
+        return self.block_counts[t]
+
+    def token_bytes(self, t):
+        return self.tensors[t].token_bytes
+
+    def lpa(self, layer, head, t, block):
         raise NotImplementedError
 
     def decode(self, lpa):
         raise NotImplementedError
 
     def page_access(self, lpa, step=0, op="R"):
-        layer, head, kind, block = self.decode(lpa)
-        lo = block * self.tokens
-        return Access(step, layer, head, "KV"[kind], op, lo, min(lo + self.tokens, self.shape.context))
+        layer, head, t, block = self.decode(lpa)
+        lo = block * self.tokens(t)
+        spec = self.tensors[t]
+        return Access(step, layer, head, spec.name, op, lo, min(lo + self.tokens(t), self.shape.context),
+                      spec.bits)
 
 
 class LayerContiguous(Layout):
-    def lpa(self, layer, head, kind, block):
-        return self.base + ((layer * 2 + kind) * self.shape.kv_heads + head) * self.blocks + block
+    """Regions ordered (layer, tensor, head), each holding that tensor's blocks contiguously.
+
+    With the default K/V specs this is ((layer*2 + kind)*H + head)*blocks + block.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        heads = self.shape.kv_heads
+        self.offsets, offset = [], 0
+        for count in self.block_counts:
+            self.offsets.append(offset)
+            offset += heads * count
+        self.layer_pages = offset
+
+    def lpa(self, layer, head, t, block):
+        if not 0 <= block < self.block_counts[t]:
+            raise ValueError("Block outside the tensor's reserved region")
+        return (self.base + layer * self.layer_pages + self.offsets[t]
+                + head * self.block_counts[t] + block)
 
     def decode(self, lpa):
-        group, block = divmod(lpa - self.base, self.blocks)
-        group, head = divmod(group, self.shape.kv_heads)
-        layer, kind = divmod(group, 2)
-        return layer, head, kind, block
+        layer, rest = divmod(lpa - self.base, self.layer_pages)
+        t = max(i for i, offset in enumerate(self.offsets) if offset <= rest)
+        head, block = divmod(rest - self.offsets[t], self.block_counts[t])
+        return layer, head, t, block
 
 
 class VllmInterleaved(Layout):
-    def lpa(self, layer, head, kind, block):
-        return self.base + (((block * self.shape.layers + layer) * self.shape.kv_heads + head) * 2 + kind)
+    """vLLM-style block table: one block index shared by all tensors, layers and heads."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if len(set(self.tokens_per_page)) != 1:
+            raise ValueError("vllm_interleaved requires the same tokens per page for every tensor")
+
+    def lpa(self, layer, head, t, block):
+        if not 0 <= block < self.block_counts[t]:
+            raise ValueError("Block outside the block table")
+        count = len(self.tensors)
+        return self.base + (((block * self.shape.layers + layer) * self.shape.kv_heads + head) * count + t)
 
     def decode(self, lpa):
-        group, kind = divmod(lpa - self.base, 2)
+        group, t = divmod(lpa - self.base, len(self.tensors))
         group, head = divmod(group, self.shape.kv_heads)
         block, layer = divmod(group, self.shape.layers)
-        return layer, head, kind, block
+        return layer, head, t, block
 
 
 LAYOUTS = {"layer_contiguous": LayerContiguous, "vllm_interleaved": VllmInterleaved}
@@ -123,14 +223,13 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
         for step in range(steps):
             for layer in range(shape.layers):
                 for head in range(shape.kv_heads):
-                    for kind in "KV":
+                    for t, spec in enumerate(layout.tensors):
                         if mode == "dense":
-                            yield Access(step, layer, head, kind, "R", 0, shape.context)
+                            yield Access(step, layer, head, spec.name, "R", 0, shape.context, spec.bits)
                         else:
-                            blocks = rng.sample(range(layout.blocks), ceil(layout.blocks * fraction))
-                            for block in sorted(blocks):
-                                pa = layout.lpa(layer, head, "KV".index(kind), block)
-                                yield layout.page_access(pa, step)
+                            blocks = layout.blocks(t)
+                            for block in sorted(rng.sample(range(blocks), ceil(blocks * fraction))):
+                                yield layout.page_access(layout.lpa(layer, head, t, block), step)
         return
 
     if mode == "same_unit":
@@ -158,7 +257,7 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
         used[target] = k + 1
         pa = cfg.unit_lpa(target, k, layout.base)
         access = layout.page_access(pa)
-        access.validate(shape)
+        access.validate(layout)
         addresses.append(pa)
     if mode == "write_then_read":
         for pa in addresses:

@@ -30,24 +30,26 @@ def union_size(intervals):
 def schedule(cfg, layout, accesses):
     logical = defaultdict(dict)
     for access in accesses:
-        access.validate(layout.shape)
+        access.validate(layout)
         if access.op == "W" and access.step != -1:
             raise ValueError("Phase 0 only accepts prefill writes")
         group = logical[access.step, access.layer, access.op]
-        for block in range(access.token_start // layout.tokens, (access.token_end - 1) // layout.tokens + 1):
-            start = block * layout.tokens
-            lpa = layout.lpa(access.layer, access.kv_head, "KV".index(access.kind), block)
-            group.setdefault(lpa, []).append((
-                max(access.token_start, start), min(access.token_end, start + layout.tokens)
+        t = layout.tensor_index(access.kind)
+        tokens = layout.tokens(t)
+        for block in range(access.token_start // tokens, (access.token_end - 1) // tokens + 1):
+            start = block * tokens
+            lpa = layout.lpa(access.layer, access.kv_head, t, block)
+            group.setdefault(lpa, (t, []))[1].append((
+                max(access.token_start, start), min(access.token_end, start + tokens)
             ))
     batches = []
     serials = Counter()
     limit = cfg.batch_pages
     for (step, layer, op), pages in sorted(logical.items(), key=lambda item: (*item[0][:2], item[0][2] == "R")):
         requests = []
-        for lpa, intervals in sorted(pages.items()):
-            useful = union_size(intervals) * layout.token_bytes
-            if op == "W" and useful != layout.tokens * layout.token_bytes:
+        for lpa, (t, intervals) in sorted(pages.items()):
+            useful = union_size(intervals) * layout.token_bytes(t)
+            if op == "W" and useful != layout.tokens(t) * layout.token_bytes(t):
                 raise ValueError("Partial-page prefill write would cause an update read")
             requests.append(Request(lpa, op, useful))
         for start in range(0, len(requests), limit):

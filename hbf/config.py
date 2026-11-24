@@ -119,8 +119,16 @@ class Config:
 
     @property
     def gc_page_budget(self):
-        """Fresh pages one plane may allocate before the free block pool reaches the threshold."""
-        return max(self.blocks_per_plane - self.gc_threshold_blocks, 0) * self.pages_per_block
+        """Fresh pages one plane may allocate while the free block pool stays at the GC threshold.
+
+        Flash_Block_Manager_Base takes three write-frontier blocks (data, translation, GC) per
+        flow at start, so the pool begins at B - 3 for the single flow used here. Filling the
+        k-th data block takes a new one at once, so the pool falls below the threshold when page
+        (B - 3 - threshold + 1) * pages_per_block is allocated. With invalid pages (rewrites)
+        GC then erases; with only valid pages upstream MQSim later livelocks.
+        """
+        blocks = self.blocks_per_plane - 3 - self.gc_threshold_blocks + 1
+        return max(blocks * self.pages_per_block - 1, 0)
 
     def lba(self, lpa):
         if not 0 <= lpa < self.capacity_sectors // self.spp:
