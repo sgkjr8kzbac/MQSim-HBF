@@ -1,6 +1,7 @@
 """Logical access schema, tensor formats, replaceable layouts and seeded workloads."""
 import csv
 import json
+from bisect import bisect_right
 from dataclasses import asdict, dataclass, fields
 from math import ceil
 from random import Random
@@ -204,7 +205,48 @@ class VllmInterleaved(Layout):
         return layer, head, t, block
 
 
-LAYOUTS = {"layer_contiguous": LayerContiguous, "vllm_interleaved": VllmInterleaved}
+class StripedContiguous(Layout):
+    """``layer_contiguous`` regions started at a chosen plane phase (SPLASH-style striping).
+
+    Pages land on plane ``lpa mod units`` (CWDP), so a region's first block decides where all its
+    blocks go. With 32K BF16 tokens a head holds 2,048 blocks, a multiple of 1,024 planes, and
+    ``layer_contiguous`` puts block b of every head and tensor on the same plane. Here region
+    (layer, t, head) starts on plane ``t*P/T + head*P/(T*H)`` (mod P): heads P/(2H) apart and V half
+    a device away from K for the default two tensors, as in SPLASH. Regions keep their order and
+    are padded by less than P pages each to reach their phase.
+    """
+
+    def __init__(self, cfg, shape, base=0, tensors=None):
+        Layout.__init__(self, cfg, shape, base, tensors)
+        units, count, heads = cfg.units, len(self.tensors), shape.kv_heads
+        self.starts, self.regions, cursor = {}, [], 0
+        for layer in range(shape.layers):
+            for t in range(count):
+                for head in range(heads):
+                    phase = (t * units // count + head * units // (count * heads)) % units
+                    start = cursor + (phase - (base + cursor)) % units
+                    self.starts[layer, t, head] = start
+                    self.regions.append((start, layer, t, head))
+                    cursor = start + self.block_counts[t]
+        self.span = cursor
+        cfg.lba(base + self.span - 1)
+
+    def lpa(self, layer, head, t, block):
+        if not 0 <= block < self.block_counts[t]:
+            raise ValueError("Block outside the tensor's reserved region")
+        return self.base + self.starts[layer, t, head] + block
+
+    def decode(self, lpa):
+        offset = lpa - self.base
+        index = bisect_right(self.regions, (offset, float("inf"))) - 1
+        if index < 0 or not 0 <= offset - self.regions[index][0] < self.block_counts[self.regions[index][2]]:
+            raise ValueError(f"LPA {lpa} is padding, not a page of the layout")
+        start, layer, t, head = self.regions[index]
+        return layer, head, t, offset - start
+
+
+LAYOUTS = {"layer_contiguous": LayerContiguous, "vllm_interleaved": VllmInterleaved,
+           "striped_contiguous": StripedContiguous}
 
 
 def prefill(layout):
@@ -222,7 +264,7 @@ def prefill(layout):
             for spec in layout.tensors:
                 yield Access(-1, layer, head, spec.name, "W", 0, shape.context, spec.bits)
 MODES = (
-    "dense", "uniform_pages", "same_unit", "distinct_units", "same_channel_distinct_units",
+    "dense", "uniform_pages", "sink_recent", "same_unit", "distinct_units", "same_channel_distinct_units",
     "hot_unit", "write_then_read",
 )
 
@@ -235,6 +277,19 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
             or not 0 <= unit < cfg.units):
         raise ValueError("Invalid generator parameters")
     rng = Random(seed)
+    if mode == "sink_recent":
+        # StreamingLLM-style: the first ``count`` tokens plus the last ``fraction`` of the context.
+        recent = max(1, round(shape.context * fraction))
+        for step in range(steps):
+            for layer in range(shape.layers):
+                for head in range(shape.kv_heads):
+                    for spec in layout.tensors:
+                        sink = min(count, shape.context - recent)
+                        if sink > 0:
+                            yield Access(step, layer, head, spec.name, "R", 0, sink, spec.bits)
+                        yield Access(step, layer, head, spec.name, "R", shape.context - recent, shape.context,
+                                     spec.bits)
+        return
     if mode in {"dense", "uniform_pages"}:
         for step in range(steps):
             for layer in range(shape.layers):

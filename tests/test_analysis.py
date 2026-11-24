@@ -155,3 +155,50 @@ def test_prefill_rejects_user_writes_and_cli_checks_groups(tmp_path, monkeypatch
     with pytest.raises(SystemExit):
         main()
     assert not (tmp_path / "g").exists()
+
+
+def test_striped_layout_phases_and_round_trip():
+    cfg = load("16x64")
+    shape = Shape(2, 4, 128, 1000)
+    tensors = (TensorSpec("K", 16, 128), TensorSpec("K_scale", 16, 2), TensorSpec("V", 16, 128))
+    layout = LAYOUTS["striped_contiguous"](cfg, shape, base=5, tensors=tensors)
+    seen = set()
+    for layer in range(2):
+        for t in range(3):
+            for head in range(4):
+                first = layout.lpa(layer, head, t, 0)
+                assert first % cfg.units == (t * 1024 // 3 + head * 1024 // 12) % 1024
+                for block in range(layout.blocks(t)):
+                    lpa = layout.lpa(layer, head, t, block)
+                    assert lpa not in seen and layout.decode(lpa) == (layer, head, t, block)
+                    seen.add(lpa)
+    assert len(seen) == layout.pages and max(seen) == 5 + layout.span - 1
+    with pytest.raises(ValueError, match="padding"):
+        layout.decode(layout.lpa(0, 0, 0, layout.blocks(0) - 1) + 1)
+
+
+def test_striping_removes_the_same_block_collision():
+    cfg = load("16x64")
+    shape = Shape(2, 8, 128, 32768)
+    rows = {}
+    for name in ("layer_contiguous", "striped_contiguous"):
+        layout = LAYOUTS[name](cfg, shape)
+        batches = schedule(cfg, layout, generate(cfg, layout, "sink_recent", count=4, fraction=1 / 64))
+        rows[name], _ = analyze(cfg, batches)
+    for contiguous, striped in zip(rows["layer_contiguous"], rows["striped_contiguous"]):
+        # 16 regions x (1 sink page + 32 recent pages); contiguous stacks the same blocks on 33 planes.
+        assert contiguous["pages"] == striped["pages"] == 16 * 33
+        assert (contiguous["rounds"], contiguous["active_planes"]) == (16, 33)
+        assert striped["rounds"] == striped["min_rounds"] == 1
+    layout = LAYOUTS["striped_contiguous"](cfg, Shape(1, 8, 128, 32768))
+    (row,), _ = analyze(cfg, schedule(cfg, layout, generate(cfg, layout, "dense")))
+    assert row["utilization"] == 1
+
+
+def test_striped_layout_runs_in_mqsim(binary, tmp_path):
+    cfg = load("16x1", planes=64, blocks_per_plane=64, plane_rule="independent", coalesce_ns=1000)
+    _, layers, _, stats = pipeline(cfg, Shape(2, 8, 128, 4096), "striped_contiguous", tmp_path / "s", binary,
+                                   mode="sink_recent", generation={"count": 4, "fraction": .05},
+                                   prefill_layout=True)
+    reads = [row for row in layers if row["step"] == 0]
+    assert len(reads) == 2 and all(row["read_pages"] == 16 * (1 + 13) for row in reads)

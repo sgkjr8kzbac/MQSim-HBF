@@ -16,14 +16,14 @@
 ```mermaid
 flowchart LR
     subgraph IN["输入"]
-        GEN["随机生成器<br/>7 种模式，固定种子"]
+        GEN["随机生成器<br/>8 种模式，固定种子"]
         CSV["access.csv<br/>真实模型或压缩方法产出"]
         TS["张量规格 TensorSpec<br/>name · bits · dims"]
     end
 
     subgraph MW["中间件 hbf/"]
         ACC["access.py<br/>访问记录校验"]
-        LAY["布局<br/>layer_contiguous / vllm_interleaved<br/>(层, 张量, 头, 块) → LPA"]
+        LAY["布局<br/>layer_contiguous / vllm_interleaved / striped_contiguous<br/>(层, 张量, 头, 块) → LPA"]
         CTL["controller.py<br/>按 (step, layer) 分批、去重<br/>≤ 8,192 页子批、间隔 100 ms"]
         SIM["simulator.py<br/>GC 预算检查 · 写轨迹 · 运行<br/>完整性与重叠断言"]
         EST["估算器与指标<br/>MQSim 一致估算 · 理想 HBF 下界<br/>读放大 · 不均衡度"]
@@ -84,7 +84,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 
 | 模块 | 作用 |
 |---|---|
-| [`hbf/access.py`](hbf/access.py) | 访问记录格式与校验、张量规格 `TensorSpec`、两种布局、7 种随机生成模式 |
+| [`hbf/access.py`](hbf/access.py) | 访问记录格式与校验、张量规格 `TensorSpec`、三种布局、8 种生成模式（含 StreamingLLM 式 `sink_recent`）、整体 prefill |
 | [`hbf/controller.py`](hbf/controller.py) | token 区间到页的转换、批内去重、有用字节按区间并集计算、64 B 突发传输字节、子批划分、两个估算器和负载指标 |
 | [`hbf/analysis.py`](hbf/analysis.py) | 机制分析：不跑 MQSim，按层计算读轮数、最少轮数、plane 利用率、均衡损失和感测放大，支持独立 plane 与同偏移联动两种组织 |
 | [`hbf/simulator.py`](hbf/simulator.py) | 校验源码散列、打补丁、编译 MQSim；GC 预算检查；写轨迹；运行并对回逐请求完成日志；聚合结果 |
@@ -109,7 +109,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | 真实 die/plane 层级 | T-PLANE：每 die 最多 64 个 plane，multi-plane 读写，独立或同偏移两种地址规则；`--prefill` 先整体写入，使物理位置与 LPA 一一对应 |
 | 机制分析 | `--analysis-only` 不跑 MQSim，数秒到数十秒内（32 层 × 128K 全量读约 33 s）算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
 | 容量 | 默认每 plane 512 块，单 stack 512 GiB 物理容量（规范示例 cube 的容量），1,024 plane 时 MQSim 峰值内存约 4.2 GB |
-| 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照） |
+| 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照）；`striped_contiguous`（SPLASH 式条带：每个 (层, 张量, 头) 区域从指定的 plane 相位开始，头之间错开 P/(2H)，V 与 K 相隔 P/2，消除 32K 时各头同一块落在同一 plane 的冲突） |
 | 压缩后的存储格式 | 用 `TensorSpec(name, bits, dims)` 声明，例如 KIVI 的 2 bit K 加量化参数张量、ThinK 的静态通道裁剪、低秩 latent。每页 token 数和有用字节按各张量计算 |
 | 选择类方法 | StreamingLLM、SnapKV、动态选页等：访问记录本身就能表达读哪些 token 区间，部分覆盖的页按整页读并统计读放大 |
 | 指标 | 读页数、有用字节、读放大、按 64 B 突发计的传输字节和传输放大、最忙单元和最忙通道的页数、不均衡度、MQSim makespan、两个估算值及比值，按子批、层、步输出 |

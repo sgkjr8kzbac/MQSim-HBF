@@ -296,6 +296,29 @@ host + [cmd(1) + tR + R/B + x] + [cmd(n−1) + tR + R/B + (n−1)·x]，cmd(n) =
 
 补丁改动了 T-SUSP 也改过的文件，必须在其后应用，所以新增 `hbf/patches/series` 规定顺序，构建时按它应用，并检查它列出了全部补丁。
 
+### 条带布局与 sink_recent 负载
+
+新增布局 `striped_contiguous`：按 `layer_contiguous` 的顺序排列区域，但每个 (层, 张量, 头) 区域补齐到指定的 plane 相位再开始，相位为 t·P/T + h·P/(T·H)，即默认 K/V 时头之间错开 P/(2H)、V 与 K 相隔 P/2（SPLASH 的做法）。每个区域最多补 P−1 个空页，空页不会被写入或读取。新增生成模式 `sink_recent`：每层每头每张量读前 `count` 个 token 加最后 `fraction` 比例的 token（StreamingLLM 式）。
+
+32K 上下文下 `layer_contiguous` 每个头 2,048 块，正好是 1,024 的倍数，各头各张量的同一块落在同一 plane。机制分析（Llama-3.1-8B 形状、32 层、sink 4 个 token、最近 1/64）：
+
+| 布局 | 每层读页 | 32 层轮数（独立 plane） | 最少轮数 | 利用率 |
+|---|---:|---:|---:|---:|
+| layer_contiguous | 528 | 512 | 32 | 0.032 |
+| striped_contiguous | 528 | 32 | 32 | 0.516 |
+| vllm_interleaved | 528 | 544 | 32 | 0.030 |
+
+MQSim 真实层级（16 die × 64 plane，T-CMD δ = 10 ns、窗口 1 µs，T-CACHE，prefill 后读 4 层）：
+
+| 布局 | plane 规则 | 4 层轮数 | 每层时延 |
+|---|---|---:|---:|
+| layer_contiguous | independent | 64 | 72.0 µs |
+| striped_contiguous | independent | 4 | 8.9 µs |
+| layer_contiguous | lockstep | 128 | 142.3 µs |
+| striped_contiguous | lockstep | 128 | 142.3 µs |
+
+条带化只在 plane 能独立寻址时有效：lockstep 要求同一轮读同一偏移，而各头的 sink 页和最近窗口在各自 plane 上的偏移不同，条带化改变的是它们落在哪个 plane，不改变偏移，所以轮数不变。
+
 ### T-CACHE：cache read
 
 原版 MQSim 的读要等全部页传出后 chip 才回到空闲，感测和传输不能重叠。补丁 `T-CACHE.patch`（`HBF_T_CACHE`）对用户读实现双缓冲：
