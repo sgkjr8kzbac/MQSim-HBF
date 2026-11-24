@@ -44,7 +44,7 @@ T5 中将 PCIe 加倍，每个 8,192 页子批缩短 **64 ns（0.089%）**。吞
 | 子批上限、开环间隔 | 8,192 页、100 ms | 抑制大批运行时间，逐批检查完成时刻 |
 | 默认补丁 | I1、I3、I4；I2 按需 | 记录完成时间、修复 ID 解析、批处理，主结果关闭 T 类补丁 |
 
-单 flow 的可用逻辑容量为 `1024 × floor(64 × 256 × 8 × (1.0 − 0.07)) = 124,821,504` 扇区，低于 2 TiB。容量计算与 `Logical_Address_Partitioning_Unit::Allocate_logical_address_for_flows` 一致，先以二进制双精度计算每 plane 扇区数并截断，再求和。控制器只允许完整页区域内的 LPA。上游 NVMe 拆包在 `Host_Interface_NVMe.cpp` 的 `Request_Fetch_Unit_NVMe::Process_pcie_read_message` 把高位移 31 位，主机打包在 `IO_Flow_Base::NVMe_read_sqe` 所在文件把地址右移 32 位。2 TiB 上限使扇区地址高位字为零。
+单 flow 的可用逻辑容量为 `1024 × floor(64 × 256 × 8 × (1.0 − 0.07)) = 124,821,504` 扇区，低于 2 TiB。页容量、扇区大小、每块页数及每 plane 块数须为正整数。容量计算与 `Logical_Address_Partitioning_Unit::Allocate_logical_address_for_flows` 一致，先以二进制双精度计算每 plane 扇区数并截断，再求和。控制器只允许完整页区域内的 LPA。上游 NVMe 拆包在 `Host_Interface_NVMe.cpp` 的 `Request_Fetch_Unit_NVMe::Process_pcie_read_message` 把高位移 31 位，主机打包在 `IO_Flow_Base::NVMe_read_sqe` 所在文件把地址右移 32 位。2 TiB 上限使扇区地址高位字为零。
 
 ## T0 校准
 
@@ -65,7 +65,7 @@ T5 中将 PCIe 加倍，每个 8,192 页子批缩短 **64 ns（0.089%）**。吞
 ## 预审事实逐条复核
 
 1. **并行单元是 chip。** T0 两 die 都被寻址，命令相隔一个完整的页周期，`Issued_Flash_Interleaved_Read_CMD=0`。两个调度器的 `service_read_transaction` 检查 chip 状态，`NVM_PHY_ONFI_NVDDR2::Execute_simulator_event` 在最后一次读传输完成后将 chip 置为 IDLE。
-2. **ONFI 启动和就绪延迟。** `ONFI_Channel_NVDDR2::ONFI_Channel_NVDDR2` 用 `20 + 6×25 + 100 + 20` ns 计算命令时间。R/B 的 20 ns 默认值来自 `Flash_Chip.h` 的构造参数。原版 XML 无对应字段。T-ONFI 启用且配置覆盖值时，估算器从同一组 XML 参数推导 `tCS + 6×tWC + tWB + tRR`。仅设置四项覆盖值为 10 ns 即得到 90 ns 命令，单页实测和估算均为 4,271 ns。
+2. **ONFI 启动和就绪延迟。** `ONFI_Channel_NVDDR2::ONFI_Channel_NVDDR2` 用 `20 + 6×25 + 100 + 20` ns 计算命令时间。R/B 的 20 ns 默认值来自 `Flash_Chip.h` 的构造参数。原版 XML 无对应字段。T-ONFI 启用且配置覆盖值时，估算器从同一组 XML 参数推导 `tCS + 6×tWC + tWB + tRR`。四项非对称覆盖值为 3、9、20、7 ns 时，命令实测 84 ns，单页实测和估算均为 4,265 ns。未提供覆盖值时使用固定的 290 ns，单页实测和估算均为 4,471 ns。非默认 `cmd_ns` 需要显式 ONFI 时序配置。
 3. **同 chip 的感测与传输串行。** T0、T3 的后继命令与上一读页数据完成在同一时刻，T3 的斜率为 4.470 µs/页。相关路径为 `NVM_PHY_ONFI_NVDDR2::Send_command_to_chip`、`transfer_read_data_from_chip` 和 `Execute_simulator_event`。
 4. **传输率取整。** `SSD_Device::SSD_Device` 中 tRC 为 `2 × floor(1000/rate)` ns，`ONFI_Channel_NVDDR2.h` 的 `NVDDR2DataOutTransferTime` 每两个通道宽度计一次。宽度 64 B 时，rate 500、501、750、1000、1001 实测为 128、64、64、64、0 ns，rate 1001 正常退出。
 5. **program 挂起。** 两个 `service_read_transaction` 都复现原版 fallthrough。首次只补 `break`，挂起计数仍为 0。进一步核对两个派生构造函数和 `TSU_Base::TSU_Base`，发现三项时间阈值和两个布尔开关传参错序。修正后可以发挂起命令，但原版 `NVM_PHY_ONFI_NVDDR2::Send_command_to_chip` 在普通单 die program 感测期没有更新 chip 级挂起账本，读完成也无法驱动写恢复。T-SUSP 开关内同时修复转参及单 die 挂起／恢复账本，并由 T6 检查读和写都完成。调度基线保留原有 chip 门控。
@@ -97,13 +97,13 @@ T5 中将 PCIe 加倍，每个 8,192 页子批缩短 **64 ns（0.089%）**。吞
 
 T4 在前 256 页每个通道只处理 1 页，255 ns 的尾部增长来自主机侧返回序列化。当 N 跨越 256 的倍数时，每通道增加一轮命令与数据竞争，造成阶梯。T0 直接测得同通道的命令启动错开 290 ns。单通道多 chip 的阶段变化反映命令和数据共享通道的调度。
 
-T8 按每个 (head, K/V) 无放回抽样，向上取整页数。pytest 逐组核对三档各有 21、205、1,024 页，并核对合并后的整层读页数和 NAND 读计数。用每单元 32 个候选页的二项近似估算最忙单元，取 `1024×P(X≥k)≥1` 的最大 k。同头内的无放回相关性使该统计只作为量级对照。50% 拆成两个 8,192 页子批，时延比按各子批核验，最大负载按完整层统计。
+T8 按每个 (head, K/V) 无放回抽样，向上取整页数。pytest 从调度后的请求还原各张量的实际页集合，逐组核对三档各有 21、205、1,024 页，并检查整层读页数和 NAND 读计数。生成器测试验证 100% 抽样包含末尾的部分页，以及同一种子重跑得到相同页集合、改变种子可改变所选页。用每单元 32 个候选页的二项近似估算最忙单元，取 `1024×P(X≥k)≥1` 的最大 k。同头内的无放回相关性使该统计只作为量级对照。50% 拆成两个 8,192 页子批，时延比按各子批核验，最大负载按完整层统计。
 
 ## T9 稠密矩阵
 
 32 层、8 个 KV 头、head_dim=128、BF16，上下文 32,768。每页 16 个 token，每层 128 MiB，每步 4 GiB。每层四个 8,192 页子批，表中的层时延为四个子批 makespan 之和，步时延为 32 层之和。两种估算都逐子批计算后求和。每组 32 层的最小、平均、最大在本轮相同。
 
-回归测试按拓扑成对执行两种布局。各层时延允许相对表中基线偏差 5%，两种布局的平均层时延比允许相对基线偏差 10%。基线时延比按 16×64、64×16、256×4 顺序为 6.201、16.579、24.201。
+回归测试按拓扑成对执行两种布局。各层实测时延允许相对表中基线偏差 5%，两种布局的平均层时延比允许相对基线偏差 10%。基线时延比按 16×64、64×16、256×4 顺序为 6.201、16.579、24.201。测试按数值核对子批和层的两种估算，涵盖层级未拆分估算，并核对步实测时延与两种估算均等于相应的逐层结果之和。
 
 | 拓扑 | 布局 | 最忙单元页 | MQSim µs/层 | MQSim 估算 µs/层 | 理想下界 µs/层 | MQSim/估算 | 估算−理想 µs/层 | MQSim ms/步 |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
@@ -145,10 +145,12 @@ T8 按每个 (head, K/V) 无放回抽样，向上取整页数。pytest 逐组核
 
 ## 结果文件
 
-审核修复后，以代码提交 `8b1027f` 跑完全部 pytest，共 **35 项通过，1 项 xfail**。非规模测试 26 项通过，T10 通过 6 项，T9 在三种拓扑中分别成对跑完两种布局。六组 T9 的层时延、步时延及两种估算均与表中数据一致。T5 的基线和 PCIe 加倍逐批复测为 72,020 ns 和 71,956 ns，严格相等预期保留为 xfail。 [复测日志](evidence/pytest/review-fixes.log)
+复审修复后，以代码提交 `afa5a2a` 跑完全部 pytest，共 **43 项通过，1 项 xfail**。非规模测试通过 34 项，T10 通过 6 项，T9 的三个拓扑用例各跑完两种布局。六组 T9 的层时延、步时延及两种估算均与表中数据一致。T5 的基线和 PCIe 加倍逐批复测为 72,020 ns 和 71,956 ns，严格相等预期保留为 xfail。 [本轮复测日志](evidence/pytest/recheck-fixes.log)
 
-容量回归使用 16×1、每 plane 125 块的配置。最后一个完整页 LPA 476,157 以 LBA 3,809,256 正常完成，只发出一次闪存读。下一页在写入轨迹前被拒绝。超时回归以测试进程代替 MQSim，验证超时后 GNU time 和子进程所在进程组被终止，子进程停止运行。常规 CLI 的 16,384 页设置被拒绝。
+容量回归使用 16×1、每 plane 125 块的配置。最后一个完整页 LPA 476,157 以 LBA 3,809,256 正常完成，只发出一次闪存读。下一页在写入轨迹前被拒绝。每 plane 125.5 块等小数配置也在生成 XML 前被拒绝。常规 CLI 的 16,384 页设置被拒绝。
 
-T10 性能表为首次实测。本轮复测中，8,192 页用时 0.365 s，32,768 页用时 4.327 s，同组地址从 64K 同时到达改为 8×8K 后，墙钟时间由 19.526 s 降至 1.820 s。两种方式的模拟服务时延分别为 561.492 µs 和 576.160 µs。
+CLI 和主线程中的 API 调用会在模拟期间暂时处理 SIGTERM，清理 GNU time 与 MQSim 进程组后恢复原有信号处理方式，再递交 SIGTERM。回归测试使用含空格路径的解释器和模拟器替身，分别验证内部超时与外部 SIGTERM。另用外层 GNU `timeout` 复现原调用方式，退出码为 124，替身停止写入。工作线程中的外部信号处理由宿主进程负责。
 
-复测原始记录位于 `runs/review-fixes-validation/`、`runs/review-fixes-t9-*/` 和 `runs/review-fixes-t10/`。历史结果及关键版本见 [T9 结果](evidence/t9.csv)、[T10 结果](evidence/t10.csv) 和 [验证证据索引](evidence/README.md)。
+T10 性能表为首次实测。本轮复测中，8,192 页用时 0.365 s，32,768 页用时 4.526 s，同组地址从 64K 同时到达改为 8×8K 后，墙钟时间由 19.421 s 降至 1.719 s。两种方式的模拟服务时延分别为 561.492 µs 和 576.160 µs。
+
+复测原始记录位于 `runs/recheck-validation/`、`runs/recheck-t9-*/` 和 `runs/recheck-t10/`。历史结果及关键版本见 [上一轮复测日志](evidence/pytest/review-fixes.log)、[T9 结果](evidence/t9.csv)、[T10 结果](evidence/t10.csv) 和 [验证证据索引](evidence/README.md)。

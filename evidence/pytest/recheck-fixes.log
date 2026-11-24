@@ -1,0 +1,21 @@
+t10
+......                                                                   [100%]
+6 passed, 3 deselected in 28.81s
+
+t9-16x64
+.                                                                        [100%]
+1 passed, 8 deselected in 100.81s (0:01:40)
+
+t9-256x4
+.                                                                        [100%]
+1 passed, 8 deselected in 192.68s (0:03:12)
+
+t9-64x16
+.                                                                        [100%]
+1 passed, 8 deselected in 153.56s (0:02:33)
+
+validation
+..............x....................                                      [100%]
+=========================== short test summary info ============================
+XFAIL tests/test_validation.py::test_t5_bandwidth_and_t7_stats - PCIe double changes makespan by 64 ns/batch; strict equality in the task is not reproduced
+34 passed, 9 deselected, 1 xfailed in 38.51s
