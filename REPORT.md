@@ -200,9 +200,85 @@ T8 原先只在默认的 64×16 上运行。现在对三种拓扑各跑三档，
 
 常规入口默认且最多每子批 8,192 页，可用 `--batch-pages` 选择更小的上限。一次进程可承载多个子批，复用设备初始化。T10 用底层接口提交显式批次。64K 同时到达探针受 NVMe 队列上限约束，有少量请求在主机等待入队。墙钟时间对机器、负载分布和批次顺序敏感，特别是大量页堆在少数 chip 的交错布局。
 
+## 第 1 阶段：模拟器改进
+
+本节记录第 0 阶段之后对模拟器本身的三项改进。三项都在分支 `claude/gallant-maxwell-x9sgi0` 上分别提交，可以单独评估是否合入。
+
+### 容量：每 plane 512 块
+
+第 0 阶段每 plane 只配 64 块，逻辑容量约 1,560 万页，Llama-3.1-8B 在 32K 上下文、batch 16 时就会超出。这个上限来自配置，不是 MQSim 写死的。实测 MQSim 内存约为每物理页 31 B：
+
+| 每 plane 块数 | 逻辑容量 | MQSim 峰值 RSS（1,024 plane） |
+|---:|---:|---:|
+| 64 | 1,560 万页（约 64 GiB 物理） | 0.57 GB |
+| 256 | 6,240 万页 | 2.1 GB |
+| 512 | 1.25 亿页（512 GiB 物理，与 OCP 规范示例 cube 相同） | 4.2 GB |
+
+默认值改为 512 块，GC 预算相应变为每 plane 124,159 页。两个 GC 边界测试仍固定使用 64 块，以保持运行时间不变。
+
+### 机制分析模式
+
+新模块 `hbf/analysis.py` 不运行 MQSim，只根据 CWDP 映射把每页放到 (die, plane, 偏移)，逐个 (step, layer) 计算：
+
+- 读轮数 R：独立 plane 时为最忙 plane 的页数；同偏移联动时为每组需要的不同偏移个数的最大值；
+- 最少轮数 R* = ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失 R/R*；
+- 感测页数与感测放大：联动时，组内每个 plane 每轮都要感测，即使它没有要读的页；
+- 64 B 突发传输字节：OCP 规范 §4.1 允许读突发为 64 B 到 4 KiB，因此传输可以小于整页，感测始终是整页。
+
+偏移取 `lpa // 单元数`，即连续 prefill 写入时的物理位置。独立 plane 的轮数与已有指标 `max_unit_pages` 逐层相等，有测试核对。
+
+**示例扫描**：Llama-3.1-8B 形状（32 层、8 个 KV 头、32K），每层每头每张量均匀随机选页，下表为 32 层合计的读轮数（括号内为均衡损失 R/R*），数据见 [evidence/stage1-analysis-sweep.csv](evidence/stage1-analysis-sweep.csv)：
+
+| plane 数 | 格式 | 布局 | 选页比例 | 读页 | 独立 plane | 联动 16 | 联动 32 | 联动 64 |
+|---:|---|---|---:|---:|---:|---:|---:|---:|
+| 1,024 | BF16 | layer_contiguous | 1% | 10,752 | 101 (3.2) | 332 | 461 | 664 |
+| 1,024 | BF16 | layer_contiguous | 5% | 52,736 | 215 (3.4) | 789 | 971 | 1,024 |
+| 1,024 | BF16 | layer_contiguous | 20% | 209,920 | 473 (2.1) | 1,024 | 1,024 | 1,024 |
+| 1,024 | 2 bit | layer_contiguous | 1% | 1,536 | 58 (1.8) | 95 | 106 | 123 |
+| 1,024 | BF16 | vllm_interleaved | 1% | 10,752 | 488 (15.3) | 488 | 488 | 672 |
+| 256 | BF16 | layer_contiguous | 1% | 10,752 | 175 (2.7) | 841 | — | — |
+
+几点观察（均匀随机选页，真实方法的选择有局部性，结论需用真实 trace 复核）：
+
+1. BF16、`layer_contiguous` 的稀疏读，即使 plane 独立寻址，利用率也只有约 10–43%，原因是每层页数少于或接近 plane 数，最忙 plane 决定轮数（球入箱问题）。
+2. 2 bit 格式读的页数是 BF16 的 1/7，轮数只少 1.7 倍：压缩和稀疏选择的收益在感测粒度上叠加不起来。
+3. BF16 时同偏移联动使稀疏读的轮数增加 3–7 倍，1% 选页时感测放大达到 15–48；选页比例高到每组的每个偏移都要读时，联动和独立的差距才缩小。
+4. 布局影响仍然最大：`vllm_interleaved` 每层只用 32 个 plane，独立 plane 下轮数也是 `layer_contiguous` 的 4.8 倍。
+
+### T-PLANE：真实 die/plane 层级
+
+第 0 阶段用"一个 MQSim chip 当一个 plane"规避了 MQSim multi-plane 的问题。源码核对发现原版 multi-plane 有三处限制：
+
+| 问题 | 位置 | 后果 |
+|---|---|---|
+| 命令时间表只填了 1–4 个 plane | `ONFI_Channel_NVDDR2.h` 中 `ReadCommandTime[5]` 等 | 超过 4 个 plane 时越界读取 |
+| plane 掩码为 32 位 `unsigned int` | `TSU_Base::issue_command_to_chip` | 超过 32 个 plane 时溢出 |
+| 合并条件固定为页号相同 | 同上 | 只能表达同偏移规则，不能表达规范的独立寻址 |
+
+补丁 `T-PLANE.patch` 把三张命令时间表按原版的逐 plane 增量扩展到 64 个 plane，掩码改为 64 位，并由 `HBF_T_PLANE` 选择合并规则：`independent`（任意块、页）或 `lockstep`（块号和页号都相同）；不设时保持原版。另把 t_DBSY 暴露到 XML（`ONFI_t_DBSY`，原版 500 ns）。1–4 个 plane 的表项不变；32 个 plane 以内掩码结果不变；规则在单 plane 配置下不起作用，均有测试核对。
+
+**时序核对**：单 die 读 n 页（n = 4、8、64，t_DBSY 取 500、0、100 ns），MQSim 时延与公式
+
+host + [cmd(1) + tR + R/B + x] + [cmd(n−1) + tR + R/B + (n−1)·x]，cmd(n) = t_CS + n·6·t_WC + (n−1)·t_DBSY + t_WB + t_RR
+
+逐 ns 相等。第一页单独下发，是因为它到达时 die 空闲、队列里只有它一个。n = 4 时为 10,369 ns，与第 0 阶段探针一致。
+
+**与机制分析对照**：16 die × 64 plane，8 个头、8K 上下文、均匀选 5% 的页，先整体 prefill：
+
+| 规则 | 分析：最忙 die 的轮数 | 分析：16 个 die 的轮数之和 | MQSim 读命令数（16 个 die 合计） | MQSim 读时延 |
+|---|---:|---:|---:|---:|
+| chip 当 plane（对照） | 4 | — | 416（每页一条） | 21.8 µs |
+| independent | 4 | 38 | 54 | 42.9 µs |
+| lockstep | 8 | 122 | 133 | 61.7 µs |
+| 不设（原版规则） | 8 | 122 | 133 | 61.7 µs |
+
+16 个 die 合计的读命令数落在 [各 die 所需轮数之和, 该和 + die 数] 之内，多出的部分来自上面说的首页单独下发，有测试核对。prefill 不可省：MQSim 在首次读到一个 LPA 时按到达顺序分配物理页，不写入就读，稀疏读的页会被紧凑地分配在相同偏移上，lockstep 和 independent 会给出相同结果。
+
+真实层级下的时延反而高于"chip 当 plane"，原因是 MQSim 没有 cache read：一轮 multi-plane 读要等全部页依次传完，die 才能开始下一轮，每轮约为 cmd(n) + tR + n·x，命令和传输都不能与感测重叠；而 chip 当 plane 时各 plane 的命令和传输可以与其他 plane 的感测交错。这说明在真实层级下，cache read（规范要求每个 bank 至少 2 个缓冲）是下一步最值得补的器件行为。
+
 ## 局限与下一阶段接口
 
-- MQSim 主结果沿用 SSD 的 chip 门控、固定 ONFI 命令和 PCIe/NVMe 协议。当前模型无法表达 NAND cache read 或单 plane 感测和传输重叠。理想估算给出相应的吞吐下界模型，T-ONFI 用于独立研究四项命令时序。
+- MQSim 主结果沿用 SSD 的 chip 门控、固定 ONFI 命令和 PCIe/NVMe 协议。当前模型无法表达 NAND cache read 或单 plane 感测和传输重叠；T-PLANE 的真实层级下，这一点使每轮 multi-plane 读都要等全部页传完。理想估算给出相应的吞吐下界模型，T-ONFI 用于独立研究四项命令时序。
 - I2 只在 `NVM_PHY_ONFI_NVDDR2::Send_command_to_chip` 记录命令下发。同文件 `perform_interleaved_cmd_data_transfer` 发出的 die 交错命令没有 issue 记录，后续的 cmd_done、ready、data 事件仍有记录。本阶段 D=P=1，不经过该路径。若以后用 D>1 的配置分析时间线，需要补记这一处。
 - 运行需要 `/usr/bin/time`（GNU time）记录峰值 RSS。缺少时中间件在启动 MQSim 前报错，并提示安装 `time` 包。
 - 轨迹按时间戳开环发射，层、步的服务时间通过事后相加重建。GPU 计算、层间动态依赖和真实模型决策反馈仍待接入。

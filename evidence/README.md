@@ -5,3 +5,5 @@
 完整记录保存在当前工作区的 `runs/checks/`、`runs/final-t9-*/`、`runs/performance-final/` 和 `runs/diagnostic-*/`。克隆仓库后可用 README 中的命令在本地重建这些记录。
 
 第二轮审查修改：`t8-topologies.csv` 是三种拓扑 × 三档的 T8 时延比与通道项/单元项之比，`t9-unsplit.csv` 是单层一次提交与 4×8K 拆分的对照，`pytest/review-round2.log` 是对应的测试日志。
+
+第 1 阶段：`stage1-analysis-sweep.csv` 是机制分析的示例扫描（Llama-3.1-8B 形状、32K、均匀随机选页，1,024 与 256 个 plane，BF16 与 2 bit，两种布局，独立与同偏移联动），由 `hbf/analysis.py` 生成，不经过 MQSim。

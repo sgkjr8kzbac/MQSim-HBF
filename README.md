@@ -61,19 +61,32 @@ flowchart TB
 
 一次页读在 MQSim 中依次经过：发命令（约 290 ns）→ 感测 tR（4,096 ns）→ R/B 就绪（20 ns）→ 通道传输（4096 B ÷ 每通道带宽）→ 主机接口（约 1 ns）。同一 chip 上感测和传输不能重叠，同一通道上的命令和数据传输共享总线。
 
+### 真实层级模式（T-PLANE）
+
+上面的 chip 当 plane 是默认模式。打开 T-PLANE 补丁后，可以改用和 HBF 一致的层级：**通道 = 一个 die 到 base die 的数据通路，chip = HBF die，MQSim plane = HBF plane**，例如 `--topology 16x1 --planes 64`，即 SPLASH 的 16 die × 64 plane。一个 die 的多个 plane 用一条 multi-plane 命令同时感测，plane 之间的地址规则可选：
+
+| `--plane-rule` | 一条命令能合并哪些页 | 对应 |
+|---|---|---|
+| 不设（原版） | 页号相同，块号任意 | MQSim 上游规则 |
+| `independent` | 每个 plane 任意块、任意页 | OCP HBF 规范（每个 bank 独立感测）、SPLASH |
+| `lockstep` | 块号和页号都相同 | FlashAccel 的 megaplane |
+
+一条 n plane 的读命令占总线 t_CS + n·6·t_WC + (n−1)·t_DBSY + t_WB + t_RR，t_DBSY 可用 `--dbsy-ns` 调整（原版 500 ns）。数据仍按页依次传出，传完之前 die 不接新命令（没有 cache read）。
+
 ### 模块一览
 
 | 模块 | 作用 |
 |---|---|
 | [`hbf/access.py`](hbf/access.py) | 访问记录格式与校验、张量规格 `TensorSpec`、两种布局、7 种随机生成模式 |
-| [`hbf/controller.py`](hbf/controller.py) | token 区间到页的转换、批内去重、有用字节按区间并集计算、子批划分、两个估算器和负载指标 |
+| [`hbf/controller.py`](hbf/controller.py) | token 区间到页的转换、批内去重、有用字节按区间并集计算、64 B 突发传输字节、子批划分、两个估算器和负载指标 |
+| [`hbf/analysis.py`](hbf/analysis.py) | 机制分析：不跑 MQSim，按层计算读轮数、最少轮数、plane 利用率、均衡损失和感测放大，支持独立 plane 与同偏移联动两种组织 |
 | [`hbf/simulator.py`](hbf/simulator.py) | 校验源码散列、打补丁、编译 MQSim；GC 预算检查；写轨迹；运行并对回逐请求完成日志；聚合结果 |
 | [`hbf/config.py`](hbf/config.py) | 参数文件、三套拓扑、设备与 workload XML 的生成和互相校验、CWDP 正反映射、逻辑容量上界 |
 | [`hbf/cli.py`](hbf/cli.py) | 一键入口：生成或导入 → 轨迹 → MQSim → 解析 → 简报 |
 | [`hbf/mqsim/`](hbf/mqsim) | MQSim 上游原版源码，逐文件 SHA-256 校验，不直接修改 |
-| [`hbf/patches/`](hbf/patches) | I1–I4 仪表与修复补丁，T-SUSP、T-ONFI 时序对照补丁 |
+| [`hbf/patches/`](hbf/patches) | I1–I4 仪表与修复补丁，T-SUSP、T-ONFI 时序对照补丁，T-PLANE 多 plane 补丁 |
 | [`hbf/configs/`](hbf/configs) | 参数 JSON、设备模板、三种拓扑的设备和 workload XML |
-| [`tests/`](tests) | T0–T10 验证测试、上游行为探针、规模测试 |
+| [`tests/`](tests) | T0–T10 验证测试、机制分析与 T-PLANE 测试、上游行为探针、规模测试 |
 | [`evidence/`](evidence) | 随仓库保存的实测摘要和测试日志 |
 
 ---
@@ -85,11 +98,14 @@ flowchart TB
 | 能力 | 说明 |
 |---|---|
 | 页级读时序 | 逐请求的到达、入队、完成时间；可选物理时间线，精确到每条命令的通道、chip、块、页 |
-| 拓扑扫描 | 16×64、64×16、256×4 三种配置共 1,024 个单元，每种都按 1 TB/s 标称带宽配置 |
+| 拓扑扫描 | 16×64、64×16、256×4 三种命名配置，或任意"通道数x每通道 chip 数"（例如 16x16 即 256 个 plane，对应规范示例），都按 1 TB/s 标称带宽配置 |
+| 真实 die/plane 层级 | T-PLANE：每 die 最多 64 个 plane，multi-plane 读写，独立或同偏移两种地址规则；`--prefill` 先整体写入，使物理位置与 LPA 一一对应 |
+| 机制分析 | `--analysis-only` 不跑 MQSim，几秒内算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
+| 容量 | 默认每 plane 512 块，单 stack 512 GiB 物理容量（规范示例 cube 的容量），1,024 plane 时 MQSim 峰值内存约 4.2 GB |
 | 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照） |
 | 压缩后的存储格式 | 用 `TensorSpec(name, bits, dims)` 声明，例如 KIVI 的 2 bit K 加量化参数张量、ThinK 的静态通道裁剪、低秩 latent。每页 token 数和有用字节按各张量计算 |
 | 选择类方法 | StreamingLLM、SnapKV、动态选页等：访问记录本身就能表达读哪些 token 区间，部分覆盖的页按整页读并统计读放大 |
-| 指标 | 读页数、有用字节、读放大、最忙单元和最忙通道的页数、不均衡度、MQSim makespan、两个估算值及比值，按子批、层、步输出 |
+| 指标 | 读页数、有用字节、读放大、按 64 B 突发计的传输字节和传输放大、最忙单元和最忙通道的页数、不均衡度、MQSim makespan、两个估算值及比值，按子批、层、步输出 |
 | prefill 写与写读干扰 | 整页写入；写读干扰对照（T6，配合 T-SUSP 补丁） |
 | 敏感性分析 | T-ONFI 改命令时序，T-SUSP 打开 program 挂起，结果都只作为对照 |
 | 安全保护 | 运行前检查 GC 预算和逻辑容量；运行后断言请求数、读写命令数一致，擦除数和 GC 数为 0，子批之间不重叠 |
@@ -105,7 +121,7 @@ flowchart TB
 | 读一个张量的部分通道 | 需要通道主序的布局，目前不支持 |
 | 同一张量分段使用不同位宽 | 例如 KIVI 的全精度残差窗口，目前要声明成两个张量 |
 | 按块存的元数据 | 例如 Quest 的页摘要，它每块一行而不是每 token 一行，需要单独的块索引维度 |
-| HBF 专有器件行为 | cache read、感测与传输重叠、die 级共享资源、刷新、读扰动、热，均未建模 |
+| HBF 专有器件行为 | cache read、感测与传输重叠、刷新、读扰动、热，均未建模 |
 
 ### 建模假设（解读结果前请先看）
 
@@ -162,6 +178,18 @@ python3 -m hbf.cli --topology 256x4 --mode dense --layers 32 --heads 8 --context
 python3 -m hbf.cli --topology 64x16 --mode dense --tensors '[{"name":"K","bits":2,"dims":128},{"name":"K_scale","bits":16,"dims":2},{"name":"V","bits":16,"dims":128}]'
 ```
 
+只做机制分析（不编译、不运行 MQSim），同时比较独立 plane 和 32 个 plane 的同偏移联动：
+
+```bash
+python3 -m hbf.cli --analysis-only --topology 16x64 --layers 32 --context 32768 --mode uniform_pages --fraction 0.05 --plane-group 1 --plane-group 32
+```
+
+真实层级（16 die × 64 plane），先整体写入再读，plane 独立寻址：
+
+```bash
+python3 -m hbf.cli --topology 16x1 --planes 64 --plane-rule independent --prefill --mode uniform_pages --fraction 0.05 --context 8192
+```
+
 导入已有的访问记录：
 
 ```bash
@@ -203,7 +231,7 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 | `step` | decode 步号，prefill 用 −1 |
 | `layer`、`kv_head` | 从 0 开始 |
 | `kind` | 张量名，必须是已声明的张量规格之一，默认 `K` 或 `V` |
-| `op` | `R` 读，`W` 写（只支持 prefill 的整页写） |
+| `op` | `R` 读，`W` 写（只支持 prefill 的整页写；上下文末尾不满一页的最后一页按整页写一次） |
 | `token_start`、`token_end` | 左闭右开的 token 区间 |
 | `bits` | 必须等于该张量规格的位宽 |
 
@@ -225,11 +253,12 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 | `stdout.log`、`workload_scenario_1.xml`、`completions.csv` | MQSim 原始输出和逐请求完成日志（I1） |
 | `physical.csv` | 物理时间线（I2），需要加 `--physical` |
 | `batches.csv`、`layers.csv`、`steps.csv`、`report.md` | 子批、层、步的指标，以及简报 |
+| `analysis_layers.csv`、`analysis_steps.csv` | 机制分析：每层和每步的读轮数、plane 利用率、感测放大等，每种 plane 组织各一组 |
 
 ### 运行约束
 
 - 子批上限为 8,192 页（`--batch-pages` 可以设更小）。更大的单批在 MQSim 中耗时会超线性增长，见报告 T10。
-- **GC 预算**：一次运行中，每个 plane 新分配的物理页数（每次写，加上首次读的 LPA 数）不得超过 13,311 页，超出时在写轨迹之前报错。原因是上游 MQSim 超过这个量后，有失效页时会执行 GC，全是有效页时会陷入死循环。
+- **GC 预算**：一次运行中，每个 plane 新分配的物理页数（每次写，加上首次读的 LPA 数）不得超过 `(块数 − 3 − 阈值块数 + 1) × 每块页数 − 1`，默认 512 块时为 124,159 页（64 块时为 13,311 页），超出时在写轨迹之前报错。原因是上游 MQSim 超过这个量后，有失效页时会执行 GC，全是有效页时会陷入死循环。
 - 所有 LPA 必须在 MQSim 的逻辑容量之内，保证不发生地址取模回绕。
 
 ---
@@ -244,8 +273,9 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 | I4 | 修复 | 去掉结尾的 `cin.get()`，便于批量运行 | `HBF_I4` 存在即开启 |
 | T-SUSP | 时序对照 | 补上 program 挂起缺少的 `break`，修正 TSU 构造函数传参错序，以及单 die 挂起和恢复的记账 | `HBF_T_SUSP` |
 | T-ONFI | 时序对照 | 把 t_CS、t_WC、t_WB、t_RR 暴露到 XML，默认值与原版一致 | `HBF_T_ONFI` |
+| T-PLANE | 器件扩展 | 命令时间表从 1–4 个 plane 扩展到 64 个（原版超过 4 个 plane 会越界读）；plane 掩码改为 64 位（原版 32 位溢出）；multi-plane 合并规则可选 `independent` / `lockstep`；t_DBSY 可在 XML 中设置 | `HBF_T_PLANE=independent\|lockstep` |
 
-主链路默认开启 I1、I3、I4，需要时开启 I2；T 类补丁默认关闭。已实测确认：所有开关都关闭时，输出与未打补丁的原版**逐位一致**；只开 I 类补丁时，统计输出不变。
+主链路默认开启 I1、I3、I4，需要时开启 I2；T 类补丁默认关闭，T-PLANE 在指定 `--plane-rule` 时开启。T-PLANE 对 1–4 个 plane 的命令时间不变，64 位掩码在 32 个 plane 以内结果相同。已实测确认：所有开关都关闭时，输出与未打补丁的原版**逐位一致**；只开 I 类补丁时，统计输出不变。
 
 ---
 
@@ -278,11 +308,12 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 ├── hbf/                 中间件 Python 包
 │   ├── access.py        访问记录、张量规格、布局、生成器
 │   ├── controller.py    分批、去重、估算器、指标
+│   ├── analysis.py      机制分析：读轮数与 plane 利用率
 │   ├── simulator.py     构建、GC 预算、运行、结果对回与聚合
 │   ├── config.py        参数、XML 生成与校验、地址映射
 │   ├── cli.py           命令行入口
 │   ├── configs/         参数 JSON、设备模板、三种拓扑的 XML
-│   ├── patches/         I1–I4、T-SUSP、T-ONFI
+│   ├── patches/         I1–I4、T-SUSP、T-ONFI、T-PLANE
 │   ├── mqsim/           MQSim 上游源码（固定 commit）
 │   ├── mqsim.commit     固定的上游 commit
 │   └── mqsim.sha256     逐文件校验清单
