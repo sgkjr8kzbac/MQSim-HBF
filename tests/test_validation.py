@@ -449,7 +449,7 @@ def test_generator_pipeline(binary, evidence, mode):
 
 
 def test_gc_budget_guard(binary, evidence):
-    cfg = micro(channels=1, chips=1, interval_ns=2_000_000_000)
+    cfg = micro(channels=1, chips=1, blocks_per_plane=64, interval_ns=2_000_000_000)
     assert cfg.gc_threshold_blocks == 10 and cfg.gc_page_budget == (64 - 3 - 10 + 1) * 256 - 1 == 13_311
     pages = tuple(Request(pa) for pa in range(cfg.gc_page_budget))
     limit = cfg.batch_pages
@@ -536,7 +536,7 @@ def test_tensor_specs_pipeline_and_meta(binary, evidence):
 
 def test_gc_budget_with_rewrites(binary, evidence):
     """Rewrites leave invalid pages, so GC really erases once the pool drops below the threshold."""
-    cfg = micro(channels=1, chips=1, interval_ns=2_000_000_000)
+    cfg = micro(channels=1, chips=1, blocks_per_plane=64, interval_ns=2_000_000_000)
     first, limit = 6000, cfg.batch_pages
 
     def phases(fresh):

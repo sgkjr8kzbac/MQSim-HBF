@@ -2,7 +2,7 @@
   "page_bytes": 4096,
   "sector_bytes": 512,
   "pages_per_block": 256,
-  "blocks_per_plane": 64,
+  "blocks_per_plane": 512,
   "read_ns": 4096,
   "program_ns": 100000,
   "erase_ns": 1000000,

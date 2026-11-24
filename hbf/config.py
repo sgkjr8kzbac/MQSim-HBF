@@ -22,7 +22,7 @@ class Config:
     page_bytes: int = 4096
     sector_bytes: int = 512
     pages_per_block: int = 256
-    blocks_per_plane: int = 64
+    blocks_per_plane: int = 512
     read_ns: int = 4096
     program_ns: int = 100000
     erase_ns: int = 1000000
