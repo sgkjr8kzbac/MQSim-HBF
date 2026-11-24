@@ -359,7 +359,7 @@ cache read 不改变轮数：16 die × 64 plane、lockstep、10% 选页时，开
 
 ## 结果文件
 
-**第 1 阶段（提交 `970c2b8`）**：全量 pytest 共 **116 项通过，3 项 xfail**，用时 14 min 19 s，[测试日志](evidence/pytest/stage1.log)。3 项 xfail 与第 0 阶段相同。新增测试 55 项，其中 `tests/test_analysis.py` 17 项、`tests/test_plane.py` 41 项（含参数化），另有 3 项用到 64 块的 GC 测试做了相应调整。
+**第 1 阶段（提交 `970c2b8`）**：全量 pytest 共 **116 项通过，3 项 xfail**，用时 14 min 19 s，[测试日志](evidence/pytest/stage1.log)。3 项 xfail 与第 0 阶段相同。新增测试 58 项（含参数化），其中 `tests/test_analysis.py` 17 项、`tests/test_plane.py` 41 项；两项 GC 边界测试改为显式使用 64 块。
 
 
 **第二轮审查修改后（提交 `df8925e`）**：全量 pytest 共 **58 项通过，3 项 xfail**。3 项 xfail 是 T5 的 PCIe 严格相等，以及 T8 的 16×64@1% 和 256×4@50%。全量运行（含规模测试）在 `df8925e` 之前的代码上完成，结果为 57 项通过、3 项 xfail；`df8925e` 只改动了 GC 预算、T8 的 xfail 写法和文档，此后非规模测试重跑为 43 项通过、3 项 xfail，新增 1 项重写场景的 GC 测试。六组 T9 的层时延与上一轮逐位一致。本轮新增的证据：
