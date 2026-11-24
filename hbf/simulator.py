@@ -19,7 +19,8 @@ from .config import PACKAGE, ROOT, device_xml, workload_xml
 from .controller import metrics
 
 PIN = (PACKAGE / "mqsim.commit").read_text().strip()
-ARCHIVE = PACKAGE / "vendor" / f"MQSim-{PIN}.tar.gz"
+MQSIM_SOURCE = PACKAGE / "mqsim"
+MQSIM_MANIFEST = PACKAGE / "mqsim.sha256"
 
 
 def dump(path, value):
@@ -46,10 +47,16 @@ def sha256(path):
 def build(cache=None):
     cache = Path(cache or Path.cwd() / ".build").resolve()
     patches = sorted((PACKAGE / "patches").glob("*.patch"))
-    archive_hash = sha256(ARCHIVE)
-    if archive_hash != (PACKAGE / "vendor" / "SHA256").read_text().strip():
-        raise ValueError("Pinned MQSim archive integrity check failed")
-    digest = hashlib.sha256((archive_hash + "".join(map(sha256, patches))).encode()).hexdigest()[:16]
+    manifest = MQSIM_MANIFEST.read_bytes()
+    source_files = []
+    for line in manifest.decode().splitlines():
+        expected, relative_path = line.split("  ", 1)
+        upstream_file = MQSIM_SOURCE / relative_path
+        if not upstream_file.is_file() or sha256(upstream_file) != expected:
+            raise ValueError(f"Pinned MQSim source integrity check failed: {relative_path}")
+        source_files.append(relative_path)
+    build_inputs = manifest + (PIN + "".join(map(sha256, patches))).encode()
+    digest = hashlib.sha256(build_inputs).hexdigest()[:16]
     source = cache / digest
     binary = source / "MQSim"
     ready = source / ".built"
@@ -63,9 +70,11 @@ def build(cache=None):
         if source.exists():
             shutil.rmtree(source)
         source.mkdir()
+        for relative_path in source_files:
+            target = source / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(MQSIM_SOURCE / relative_path, target)
         with (source / "build.log").open("w") as log:
-            subprocess.run(["tar", "-xzf", str(ARCHIVE), "--strip-components=1", "-C", str(source)],
-                           check=True, stdout=log, stderr=log)
             subprocess.run(["git", "apply", *map(str, patches)], cwd=source, check=True, stdout=log, stderr=log,
                            env={**os.environ, "GIT_CEILING_DIRECTORIES": str(cache)})
             subprocess.run(["make", "-j", str(min(8, os.cpu_count() or 1))], cwd=source,

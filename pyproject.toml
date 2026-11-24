@@ -19,4 +19,4 @@ hbf-stage0 = "hbf.cli:main"
 packages = ["hbf"]
 
 [tool.setuptools.package-data]
-hbf = ["mqsim.commit", "configs/*.xml", "configs/*.json", "patches/*.patch", "vendor/*"]
+hbf = ["mqsim.commit", "mqsim.sha256", "mqsim/.gitignore", "mqsim/**/*", "configs/*.xml", "configs/*.json", "patches/*.patch"]

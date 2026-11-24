@@ -14,10 +14,10 @@ T5 中将 PCIe 加倍，每个 8,192 页子批缩短 **64 ns（0.089%）**。吞
 | `hbf/config.py`、`hbf/configs/` | Python 参数、三套设备和 workload XML、互校验、CWDP 与地址上界 |
 | `hbf/controller.py` | 区间求并集、页请求去重、子批调度、两个估算值与负载指标 |
 | `hbf/simulator.py`、`hbf/cli.py` | 固定版本构建、运行、按到达时间和 LBA 对回完成日志、聚合和简报 |
-| `hbf/vendor/`、`hbf/patches/` | 上游未修改的源码归档、SHA-256、I1–I4、T-SUSP、T-ONFI |
+| `hbf/mqsim/`、`hbf/mqsim.sha256`、`hbf/patches/` | 上游原版源码、逐文件 SHA-256、I1–I4、T-SUSP、T-ONFI |
 | `tests/`、`evidence/`、`runs/` | pytest、随 Git 保存的摘要、当前工作区的完整运行记录 |
 
-固定上游 commit 为 `51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16`，tree 为 `c5cbd1a1e75c61f2020273ff415ebf40f9446a1c`。构建时在缓存目录解包再应用补丁。g++ 13.3.0、C++11、Python 3.12、pytest 9.2.0。本机用原版设备 XML 和自带 `tpcc-small.trace` 场景验证了未打补丁的 MQSim，生成并完成 6,999 个请求，用时 2.44 s。每次正式运行的 `version.json` 记录当时的仓库 commit、二进制及补丁散列和开关状态。可复现命令见 [README.md](README.md)。上游来源见 [MQSim 固定版本](https://github.com/CMU-SAFARI/MQSim/commit/51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16)。
+固定上游 commit 为 `51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16`，tree 为 `c5cbd1a1e75c61f2020273ff415ebf40f9446a1c`。源码可直接在仓库中浏览，构建时逐文件校验并复制到缓存目录，再应用补丁。g++ 13.3.0、C++11、Python 3.12、pytest 9.2.0。本机用原版设备 XML 和自带 `tpcc-small.trace` 场景验证了未打补丁的 MQSim，生成并完成 6,999 个请求，用时 2.44 s。每次正式运行的 `version.json` 记录当时的仓库 commit、二进制及补丁散列和开关状态。 [MQSim 源码](hbf/mqsim/src) · [MQSim 固定版本](https://github.com/CMU-SAFARI/MQSim/commit/51f0f2d3fed92d88ef4a0fa61a38024b07bf9d16) · [复现命令](README.md)
 
 ## 设备与工作负载配置
 

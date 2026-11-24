@@ -4,7 +4,7 @@
 
 ## 运行
 
-Linux 上需要 Python 3.10+、g++、make、git、tar 和 GNU time。核心包只使用 Python 标准库。仓库内有未经修改的 MQSim 源码归档，构建无需网络。
+Linux 上需要 Python 3.10+、g++、make、git 和 GNU time。核心包只使用 Python 标准库。仓库直接包含固定版本的 MQSim 上游源码及许可证，构建无需网络。构建时逐文件校验 SHA-256，将源码复制到 `.build/`，再应用项目补丁并编译。 [MQSim 源码](hbf/mqsim/src) · [上游许可证](hbf/mqsim/LICENSE) · [版本](hbf/mqsim.commit) · [校验清单](hbf/mqsim.sha256) · [补丁](hbf/patches)
 
 ```bash
 python3 -m hbf.cli --topology 64x16 --mode uniform_pages --seed 234 --fraction 0.1

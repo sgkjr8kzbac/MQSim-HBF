@@ -1,0 +1,2 @@
+# Preserve the upstream bytes checked by hbf/mqsim.sha256 on every checkout.
+hbf/mqsim/** -text
