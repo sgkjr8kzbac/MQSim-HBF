@@ -23,8 +23,18 @@ T5 中将 PCIe 加倍，每个 8,192 页子批缩短 **64 ns（0.089%）**。吞
 
 设备参数采用任务给定的 SPLASH 单堆栈基线。带宽沿用题设的 16×64、64×16、256×4，三组标称均为 **1,024 GB/s**。带宽及吞吐以十进制 GB/s 计，容量的 GiB 以二进制计。 [SPLASH 论文](https://arxiv.org/abs/2609.23816)
 
+| 拓扑 | 设备 XML | Workload XML |
+|---|---|---|
+| 16×64 | [16x64.xml](hbf/configs/16x64.xml) | [16x64-workload.xml](hbf/configs/16x64-workload.xml) |
+| 64×16 | [64x16.xml](hbf/configs/64x16.xml) | [64x16-workload.xml](hbf/configs/64x16-workload.xml) |
+| 256×4 | [256x4.xml](hbf/configs/256x4.xml) | [256x4-workload.xml](hbf/configs/256x4-workload.xml) |
+
+设备 XML 以 MQSim 样例为模板，按下表设置 HBF 基线及其余沿用的参数。中间件从参数 JSON 读取拓扑、几何、时序和控制器基线，运行时生成并保存实际使用的设备和 workload XML。T0、T5、T6 等用例的覆盖值可在各自的运行目录查阅。 [设备模板](hbf/configs/template.xml) · [参数 JSON](hbf/configs/parameters.json) · [配置生成与校验](hbf/config.py)
+
 | 参数 | 最终取值 | 理由 |
 |---|---|---|
+| `Seed` | 321 | 沿用样例并固定 MQSim 随机状态。逻辑访问生成器的种子单独保存在每次运行的 meta 中 |
+| `Memory_Type`、`HostInterface_Type`、`Flash_Comm_Protocol` | FLASH、NVME、NVDDR2 | 固定 NAND 器件、PCIe/NVMe 主机路径和 ONFI NVDDR2 通道模型 |
 | `Flash_Channel_Count × Chip_No_Per_Channel` | 16×64、64×16、256×4 | 扫描每通道 chip 数，共 1,024 个单元 |
 | `Die_No_Per_Chip`、`Plane_No_Per_Die` | 1、1 | 对应 HBF plane，T0 另用 2 die 验证 |
 | `Flash_Channel_Width`、`Channel_Transfer_Rate` | 64、16、4 B，rate 各为 1000 | 1 B 对应 1 GB/s，4 KiB 均可被两倍通道宽度整除 |
@@ -32,19 +42,30 @@ T5 中将 PCIe 加倍，每个 8,192 页子批缩短 **64 ns（0.089%）**。吞
 | `Flash_Technology` | SLC | 只使用 LSB 时序 |
 | `Page_Read_Latency_*` | 4,096 ns | 感测时延 |
 | `Page_Program_Latency_*`、`Block_Erase_Latency` | 100,000、1,000,000 ns | 写入和擦除基线 |
+| `Page_Metadat_Capacity`、`Block_PE_Cycles_Limit` | 448 B、10,000 次 | 沿用样例的页元数据和耐久性参数，本阶段只扫描布局和时序 |
 | `PCIe_Lane_Bandwidth × PCIe_Lane_Count` | 256 GB/s × 16 | 为 NAND 留出主机传输余量 |
+| `SATA_Processing_Delay` | 400,000 ns | 保留样例设置，基线使用 NVMe |
+| `Enable_ResponseTime_Logging`、`ResponseTime_Logging_Period_Length` | false、1,000,000 ns | 关闭周期响应日志，保留样例周期，逐请求结果由 I1 提供 |
 | `IO_Queue_Depth`、`Queue_Fetch_Size` | 65,535、65,535 | uint16 上界，支持大规模开环发射 |
-| `Plane_Allocation_Scheme`、调度器 | CWDP、PRIORITY_OUT_OF_ORDER | 固定上游 FTL 与调度基线 |
+| `Address_Mapping`、`Plane_Allocation_Scheme`、`Transaction_Scheduling_Policy` | PAGE_LEVEL、CWDP、PRIORITY_OUT_OF_ORDER | 使用上游页级 FTL，固定 CWDP 分配和调度基线 |
 | `Ideal_Mapping_Table`、`Enabled_Preconditioning` | true、false | 映射命中，首次读由原版 FTL 分配页 |
+| `CMT_Capacity`、`CMT_Sharing_Mode` | 2,097,152 B、SHARED | 沿用样例，映射访问由理想映射设置控制 |
+| `Caching_Mechanism`、`Data_Cache_Sharing_Mode`、`Data_Cache_Capacity` | ADVANCED、SHARED、268,435,456 B | 保留样例的缓存管理器配置，基线 flow 关闭数据缓存 |
+| `Data_Cache_DRAM_Row_Size`、`Data_Cache_DRAM_Data_Rate`、`Data_Cache_DRAM_Data_Busrt_Size`、`Data_Cache_DRAM_tRCD`、`Data_Cache_DRAM_tCL`、`Data_Cache_DRAM_tRP` | 8,192、100、1、13、13、13（XML 原值） | 沿用样例的缓存 DRAM 参数，基线 flow 绕过缓存 |
 | `Overprovisioning_Ratio`、`GC_Exec_Threshold` | 0.07、0.05 | 保留空闲块，触发下限为 10 块 |
-| 静态和动态磨损均衡、`Preemptible_GC_Enabled` | false | 保持读基线可重复 |
+| `GC_Block_Selection_Policy`、`GC_Hard_Threshold`、`Use_Copyback_for_GC` | RGA、0.005、false | 沿用样例的 GC 候选选择和阈值。T7 核对基线的 GC 队列保持为空 |
+| `Static_Wearleveling_Enabled`、`Dynamic_Wearleveling_Enabled`、`Preemptible_GC_Enabled` | false、false、false | 关闭磨损均衡和可抢占 GC，固定读基线 |
+| `Static_Wearleveling_Threshold` | 100 | 保留样例阈值，静态磨损均衡已关闭 |
 | `CMD_Suspension_Support` | NONE | T6 独立使用 PROGRAM |
 | `Suspend_Program_Time`、`Preferred_suspend_write_time_for_read` | 100,000 ns、100,000 ns | 保留样例值，T6 为 5,000 ns、0 ns |
-| flow、设备缓存、重放、执行比例 | 单 flow、TURNED_OFF、1、100% | 覆盖全部 ID，页请求直达 FTL |
+| `Suspend_Erase_Time`、`Preferred_suspend_erase_time_for_read`、`Preferred_suspend_erase_time_for_write` | 各 700,000 ns | 保留样例的擦除挂起参数，T6 仅对照写入挂起 |
+| flow、`Priority_Class`、`Channel_IDs`、`Chip_IDs`、`Die_IDs`、`Plane_IDs` | 单 flow、HIGH。通道和 chip 各从 0 覆盖至该拓扑上限，die 和 plane 均为 0 | 一个优先级的请求流覆盖全部并行单元 |
+| `Device_Level_Data_Caching_Mode`、`Initial_Occupancy_Percentage` | TURNED_OFF、0% | 页请求直达 FTL，从空设备开始 |
+| `File_Path`、`Time_Unit`、`Relay_Count`、`Percentage_To_Be_Executed` | trace.txt、NANOSECOND、1、100% | 每次运行提交完整的纳秒轨迹一次 |
 | 子批上限、开环间隔 | 8,192 页、100 ms | 抑制大批运行时间，逐批检查完成时刻 |
 | 默认补丁 | I1、I3、I4；I2 按需 | 记录完成时间、修复 ID 解析、批处理，主结果关闭 T 类补丁 |
 
-单 flow 的可用逻辑容量为 `1024 × floor(64 × 256 × 8 × (1.0 − 0.07)) = 124,821,504` 扇区，低于 2 TiB。页容量、扇区大小、每块页数及每 plane 块数须为正整数。容量计算与 `Logical_Address_Partitioning_Unit::Allocate_logical_address_for_flows` 一致，先以二进制双精度计算每 plane 扇区数并截断，再求和。控制器只允许完整页区域内的 LPA。上游 NVMe 拆包在 `Host_Interface_NVMe.cpp` 的 `Request_Fetch_Unit_NVMe::Process_pcie_read_message` 把高位移 31 位，主机打包在 `IO_Flow_Base::NVMe_read_sqe` 所在文件把地址右移 32 位。2 TiB 上限使扇区地址高位字为零。
+单 flow 的可用逻辑容量为 `1024 × floor(64 × 256 × 8 × (1.0 − 0.07)) = 124,821,504` 扇区，低于 2 TiB。页容量、扇区大小、每块页数及每 plane 块数须为正整数。容量计算与 `src/utils/Logical_Address_Partitioning_Unit.cpp` 中的 `Logical_Address_Partitioning_Unit::Allocate_logical_address_for_flows` 一致，先以二进制双精度计算每 plane 扇区数并截断，再求和。控制器只允许完整页区域内的 LPA。上游 NVMe 拆包在 `src/ssd/Host_Interface_NVMe.cpp` 的 `Request_Fetch_Unit_NVMe::Process_pcie_read_message` 把高位移 31 位，主机打包在 `src/host/IO_Flow_Base.cpp` 的 `IO_Flow_Base::NVMe_read_sqe` 把地址右移 32 位。2 TiB 上限使扇区地址高位字为零。
 
 ## T0 校准
 
@@ -64,20 +85,26 @@ T5 中将 PCIe 加倍，每个 8,192 页子批缩短 **64 ns（0.089%）**。吞
 
 ## 预审事实逐条复核
 
-1. **并行单元是 chip。** T0 两 die 都被寻址，命令相隔一个完整的页周期，`Issued_Flash_Interleaved_Read_CMD=0`。两个调度器的 `service_read_transaction` 检查 chip 状态，`NVM_PHY_ONFI_NVDDR2::Execute_simulator_event` 在最后一次读传输完成后将 chip 置为 IDLE。
-2. **ONFI 启动和就绪延迟。** `ONFI_Channel_NVDDR2::ONFI_Channel_NVDDR2` 用 `20 + 6×25 + 100 + 20` ns 计算命令时间。R/B 的 20 ns 默认值来自 `Flash_Chip.h` 的构造参数。原版 XML 无对应字段。T-ONFI 启用且配置覆盖值时，估算器从同一组 XML 参数推导 `tCS + 6×tWC + tWB + tRR`。四项非对称覆盖值为 3、9、20、7 ns 时，命令实测 84 ns，单页实测和估算均为 4,265 ns。未提供覆盖值时使用固定的 290 ns，单页实测和估算均为 4,471 ns。非默认 `cmd_ns` 需要显式 ONFI 时序配置。
-3. **同 chip 的感测与传输串行。** T0、T3 的后继命令与上一读页数据完成在同一时刻，T3 的斜率为 4.470 µs/页。相关路径为 `NVM_PHY_ONFI_NVDDR2::Send_command_to_chip`、`transfer_read_data_from_chip` 和 `Execute_simulator_event`。
-4. **传输率取整。** `SSD_Device::SSD_Device` 中 tRC 为 `2 × floor(1000/rate)` ns，`ONFI_Channel_NVDDR2.h` 的 `NVDDR2DataOutTransferTime` 每两个通道宽度计一次。宽度 64 B 时，rate 500、501、750、1000、1001 实测为 128、64、64、64、0 ns，rate 1001 正常退出。
-5. **program 挂起。** 两个 `service_read_transaction` 都复现原版 fallthrough。首次只补 `break`，挂起计数仍为 0。进一步核对两个派生构造函数和 `TSU_Base::TSU_Base`，发现三项时间阈值和两个布尔开关传参错序。修正后可以发挂起命令，但原版 `NVM_PHY_ONFI_NVDDR2::Send_command_to_chip` 在普通单 die program 感测期没有更新 chip 级挂起账本，读完成也无法驱动写恢复。T-SUSP 开关内同时修复转参及单 die 挂起／恢复账本，并由 T6 检查读和写都完成。调度基线保留原有 chip 门控。
+以下 `src/…` 路径以固定版本的 MQSim 源码根目录为起点。
+
+1. **并行单元是 chip。** T0 两 die 都被寻址，命令相隔一个完整的页周期，`Issued_Flash_Interleaved_Read_CMD=0`。`src/ssd/TSU_Priority_OutOfOrder.cpp` 中的 `TSU_Priority_OutOfOrder::service_read_transaction` 和 `src/ssd/TSU_OutofOrder.cpp` 中的 `TSU_OutOfOrder::service_read_transaction` 均检查 chip 状态。`src/ssd/NVM_PHY_ONFI_NVDDR2.cpp` 中的 `NVM_PHY_ONFI_NVDDR2::Execute_simulator_event` 在最后一次读传输完成后将 chip 置为 IDLE。
+2. **ONFI 启动和就绪延迟。** `src/ssd/ONFI_Channel_NVDDR2.cpp` 中的 `ONFI_Channel_NVDDR2::ONFI_Channel_NVDDR2` 按头文件 `src/ssd/ONFI_Channel_NVDDR2.h` 的默认参数计算命令时间 `20 + 6×25 + 100 + 20` ns。`src/nvm_chip/flash_memory/Flash_Chip.h` 中的 `Flash_Chip::Flash_Chip` 声明将 R/B 延迟默认设为 20 ns。原版 XML 无对应字段。T-ONFI 扩展了 `src/exec/Device_Parameter_Set.cpp` 中的 `Device_Parameter_Set::XML_deserialize`，由 `src/exec/SSD_Device.cpp` 中的 `SSD_Device::SSD_Device` 将命令时序传入 ONFI 通道，估算器也用同一组参数推导 `tCS + 6×tWC + tWB + tRR`。四项非对称覆盖值为 3、9、20、7 ns 时，命令实测 84 ns，单页实测和估算均为 4,265 ns。未提供覆盖值时使用固定的 290 ns，单页实测和估算均为 4,471 ns。非默认 `cmd_ns` 需要显式 ONFI 时序配置。
+3. **同 chip 的感测与传输串行。** T0、T3 的后继命令与上一读页数据完成在同一时刻，T3 的斜率为 4.470 µs/页。相关逻辑在 `src/ssd/NVM_PHY_ONFI_NVDDR2.cpp` 的 `NVM_PHY_ONFI_NVDDR2::Send_command_to_chip`、`transfer_read_data_from_chip` 和 `Execute_simulator_event` 中。
+4. **传输率取整。** `src/exec/SSD_Device.cpp` 中的 `SSD_Device::SSD_Device` 将 tRC 设为 `2 × floor(1000/rate)` ns，`src/ssd/ONFI_Channel_NVDDR2.h` 的 `NVDDR2DataOutTransferTime` 宏每两个通道宽度计一次。宽度 64 B 时，rate 500、501、750、1000、1001 实测为 128、64、64、64、0 ns，rate 1001 正常退出。
+5. **program 挂起。** 第 1 项列出的两个 `service_read_transaction` 都复现原版 fallthrough。首次只补 `break`，挂起计数仍为 0。对照同文件中的 `TSU_Priority_OutOfOrder::TSU_Priority_OutOfOrder`、`TSU_OutOfOrder::TSU_OutOfOrder` 和 `src/ssd/TSU_Base.cpp` 中的 `TSU_Base::TSU_Base`，发现三项时间阈值和两个布尔开关传参错序。修正后可以发挂起命令。原版 `src/ssd/NVM_PHY_ONFI_NVDDR2.cpp` 的 `NVM_PHY_ONFI_NVDDR2::Send_command_to_chip` 在普通单 die program 感测期未更新 chip 级挂起账本，读完成也无法驱动写恢复。T-SUSP 开关内同时修复转参及单 die 挂起／恢复账本，并由 T6 检查读和写都完成。调度基线保留原有 chip 门控。
 6. **静默错误与 GC。**
-   - `Device_Parameter_Set.h` 两个队列字段为 uint16。单独设为 65,536 的两个原版 XML 探针均正常退出且读命令为 0。T5 把 fetch 降到 512，吞吐从 465.904 降到 401.450 GB/s。
-   - `IO_Flow_Parameter_Set::XML_deserialize` 原版用 1,000 字节数组和 `strncpy`。320 个 ID 时，指定通道 319 的 LPA 实测落到 42，开启 I3 后落到 319。256 个紧凑 ID 的串长为 913 字节，该拓扑的最高编号也已用 T1 实测。
-   - `IO_Flow_Trace_Based::Start_simulation` 在非五字段行停止预扫描，三行输入的中间行畸形时只完成第一条。源码检查时间戳非降序。设置 MICROSECOND 的探针提交时间仍为 100、123 ns。
-   - `Address_Mapping_Unit_Page_Level::online_create_entry_for_reads` 调用 `Flash_Block_Manager::Allocate_block_and_page_in_plane_for_user_write`。两条首次读依次占用物理页 0、1，重读第一个 LPA 仍访问页 0。块写满时推进写前沿并检查 GC。
-   - `GC_and_WL_Unit_Base::GC_and_WL_Unit_Base` 与 `GC_and_WL_Unit_Page_Level::Check_gc_required` 确认为空闲池低于 `max(floor(GC_Exec_Threshold×块数), 10)` 时检查 GC，候选块还要满足安全和可回收条件。`(64−10)×256=13,824` 是粗略预算，预留写前沿会占用块，实际临界页数未用压满实验核实。OP 由 `Logical_Address_Partitioning_Unit::Allocate_logical_address_for_flows` 用于逻辑容量计算。T7 实测验证所选工作负载未执行 GC。
-   - 保留 `main` 中原版 `cin.get()` 行为，基线样例通过 EOF 退出。批量链路使用 I4 和 EOF。
+   - `src/exec/Device_Parameter_Set.h` 将两个队列字段声明为 uint16，由 `src/exec/Device_Parameter_Set.cpp` 中的 `Device_Parameter_Set::XML_deserialize` 赋值。单独设为 65,536 的两个原版 XML 探针均正常退出且读命令为 0。T5 把 fetch 降到 512，吞吐从 465.904 降到 401.450 GB/s。
+   - `src/exec/IO_Flow_Parameter_Set.cpp` 中的 `IO_Flow_Parameter_Set::XML_deserialize` 原版用 1,000 字节数组和 `strncpy`。320 个 ID 时，指定通道 319 的 LPA 实测落到 42，开启 I3 后落到 319。256 个紧凑 ID 的串长为 913 字节，该拓扑的最高编号也已用 T1 实测。
+   - `src/host/IO_Flow_Trace_Based.cpp` 中的 `IO_Flow_Trace_Based::Start_simulation` 检查时间戳非降序，在非五字段行停止预扫描。三行输入的中间行畸形时只完成第一条。设置 MICROSECOND 的探针提交时间仍为 100、123 ns。
+   - `src/ssd/Address_Mapping_Unit_Page_Level.cpp` 中的 `Address_Mapping_Unit_Page_Level::online_create_entry_for_reads` 调用 `src/ssd/Flash_Block_Manager.cpp` 中的 `Flash_Block_Manager::Allocate_block_and_page_in_plane_for_user_write`。两条首次读依次占用物理页 0、1，重读第一个 LPA 仍访问页 0。块写满时推进写前沿并检查 GC。
+   - `src/ssd/GC_and_WL_Unit_Base.cpp` 中的 `GC_and_WL_Unit_Base::GC_and_WL_Unit_Base` 计算阈值，`src/exec/SSD_Device.cpp` 中的 `SSD_Device::SSD_Device` 传入每 plane 最多 10 个在途 GC 请求，构成阈值下限。`src/ssd/GC_and_WL_Unit_Page_Level.cpp` 中的 `GC_and_WL_Unit_Page_Level::Check_gc_required` 在空闲池低于 `max(floor(GC_Exec_Threshold×块数), 10)` 时检查 GC，候选块还要满足安全和可回收条件。`(64−10)×256=13,824` 是粗略预算，预留写前沿会占用块，实际临界页数未用压满实验核实。OP 由 `src/utils/Logical_Address_Partitioning_Unit.cpp` 中的 `Logical_Address_Partitioning_Unit::Allocate_logical_address_for_flows` 用于逻辑容量计算。T7 实测验证所选工作负载未执行 GC。
+   - `src/main.cpp` 的 `main` 保留原版 `cin.get()`，基线样例通过 EOF 退出。批量链路使用 I4 和 EOF。
 7. **大批的墙钟时间超线性。** 本机从 8,192 页 0.314 s 升至 32,768 页 3.871 s。64K 一次提交 16.794 s，拆成八批 1.516 s。绝对值与预审机器不同，趋势一致。设备物理页数为 16,777,216，峰值 RSS 除以这一容量约 35 B/物理页。
-8. **其余行为。** 三处 CWDP 已对照 `Address_Mapping_Unit_Page_Level::allocate_plane_for_preconditioning`、`allocate_plane_for_user_write`、`online_create_entry_for_reads`，并用 T1 直接核对首次读位置。 `IO_Flow_Trace_Based::Execute_simulator_event` 按轨迹时间发射，T6 读在写完成前进入队列。 `Data_Cache_Manager_Flash_Advanced::process_new_user_request` 在 TURNED_OFF 下调用 FTL 地址翻译。理想映射的映射页读数在 T7 为 0。 `SSD_Device::SSD_Device` 的 SLC 分支使用 LSB，改动 CSB/MSB 的探针保持 4,116 ns 感测加就绪延迟。 `SSD_Defs.h` 定义扇区为 512 B。 `PCIe_Link::estimate_transfer_time` 的 TLP 负载占比为 128/(128+28)≈82.1%，将主机链接降至 16 GB/s 后，端到端有效率实测 80.6%，包括请求控制流量和设备启动时间。
+8. **其余行为。**
+   - `src/ssd/Address_Mapping_Unit_Page_Level.cpp` 中的 `Address_Mapping_Unit_Page_Level::allocate_plane_for_preconditioning`、`allocate_plane_for_user_write`、`online_create_entry_for_reads` 使用相同的 CWDP 公式。T1 直接核对首次读位置。同文件中 `AddressMappingDomain::Mapping_entry_accessible` 在理想映射下返回可访问，T7 实测映射页读数为 0。
+   - `src/host/IO_Flow_Trace_Based.cpp` 中的 `IO_Flow_Trace_Based::Execute_simulator_event` 按轨迹时间发射，T6 的读在写完成前进入队列。`src/ssd/Data_Cache_Manager_Flash_Advanced.cpp` 中的 `Data_Cache_Manager_Flash_Advanced::process_new_user_request` 在 TURNED_OFF 下调用 FTL 地址翻译。
+   - `src/exec/SSD_Device.cpp` 中的 `SSD_Device::SSD_Device` 在 SLC 分支使用 LSB。改动 CSB/MSB 的探针保持 4,116 ns 感测加就绪延迟。`src/ssd/SSD_Defs.h` 的 `SECTOR_SIZE_IN_BYTE` 宏定义扇区为 512 B。
+   - `src/host/PCIe_Link.h` 中的 `PCIe_Link::estimate_transfer_time` 按 GB/s 计算链路时延，满载 TLP 的载荷占比为 128/(128+28)≈82.1%。将主机链路降至 16 GB/s 后，端到端有效率实测 80.6%，包括请求控制流量和设备启动时间。
 
 ## T0–T10 验收
 
@@ -96,6 +123,10 @@ T5 中将 PCIe 加倍，每个 8,192 页子批缩短 **64 ns（0.089%）**。吞
 | T10 | 测五档规模的资源和单位页耗时，给出子批建议 | 见性能表，64K 附加拆分实验支持 8K 选择 | 通过 |
 
 T4 在前 256 页每个通道只处理 1 页，255 ns 的尾部增长来自主机侧返回序列化。当 N 跨越 256 的倍数时，每通道增加一轮命令与数据竞争，造成阶梯。T0 直接测得同通道的命令启动错开 290 ns。单通道多 chip 的阶段变化反映命令和数据共享通道的调度。
+
+**T5 的 64 ns 差异来自 MQSim 对 PCIe 返回时延的整数截断及串行排队。** 基线为 16 lane × 256 GB/s，加倍为 16 lane × 512 GB/s。`src/ssd/Host_Interface_NVMe.cpp` 中的 `Request_Fetch_Unit_NVMe::Send_read_data` 提交 4 KiB 读数据。`src/host/PCIe_Link.h` 中的 `PCIe_Link::estimate_transfer_time` 将这笔数据计为 32 个载荷 128 B、额外开销 28 B 的包，共 4,992 B，分摊到 16 条 lane 为 312 B/lane。两档的耗时为 1.21875 ns 和 0.609375 ns，转成整数 `sim_time_type` 后分别为 **1 ns 和 0 ns**。`src/host/PCIe_Link.cpp` 中的 `PCIe_Link::Deliver` 和 `PCIe_Link::Execute_simulator_event` 逐个发送排队的返回消息。
+
+按到达时间和 LBA 对照 I1 的完成日志，两档的入队时间逐请求一致。每批最后一组 64 页在加倍档同一时刻完成，在基线档逐个完成，差值从 1 ns 累积到 64 ns。六批的 makespan 均由 72,020 ns 降为 71,956 ns。吞吐与 fetch 对照仍通过，PCIe 加倍后严格相等的断言保留为 **xfail**。 [T5 汇总](evidence/validation/t5-summary.json) · [回归日志](evidence/pytest/recheck-fixes.log)
 
 T8 按每个 (head, K/V) 无放回抽样，向上取整页数。pytest 从调度后的请求还原各张量的实际页集合，逐组核对三档各有 21、205、1,024 页，并检查整层读页数和 NAND 读计数。生成器测试验证 100% 抽样包含末尾的部分页，以及同一种子重跑得到相同页集合、改变种子可改变所选页。用每单元 32 个候选页的二项近似估算最忙单元，取 `1024×P(X≥k)≥1` 的最大 k。同头内的无放回相关性使该统计只作为量级对照。50% 拆成两个 8,192 页子批，时延比按各子批核验，最大负载按完整层统计。
 
@@ -116,7 +147,7 @@ T8 按每个 (head, K/V) 无放回抽样，向上取整页数。pytest 从调度
 
 估算器 1 取最忙单元页数乘串行页读周期与最忙通道页数乘每页通道占用的较大值，再加 1 ns。理想下界取最忙单元感测时间与总字节除聚合带宽的较大值。连续布局均匀铺满 1,024 个单元，理想步时延为 4.194 ms。交错布局每层的 16 个 (head, kind) 偏移按 512 LPA 步长推进，模 1,024 只能遍历两组偏移，于是每层 32 个活跃单元各承担 1,024 页，理想步时延升至 134.218 ms。
 
-256×4 的通道页传输为 1,024 ns。第一个连续布局子批中，通道 0 的 32 页有 24 页在 R/B 就绪后排队，平均等待 1,101 ns，最大 2,202 ns。交错布局的通道 0 则有 512 页，其中 256 页等待，平均 367 ns。`NVM_PHY_ONFI_NVDDR2::handle_ready_signal_from_chip` 把通道忙时就绪的读放入等待队列。这段等待会推迟 chip 进入 IDLE，随后才能启动同 chip 的下一条命令。估算器 1 只取两个独立占用时间的最大值，无法表达这一相互制约。
+256×4 的通道页传输为 1,024 ns。第一个连续布局子批中，通道 0 的 32 页有 24 页在 R/B 就绪后排队，平均等待 1,101 ns，最大 2,202 ns。交错布局的通道 0 则有 512 页，其中 256 页等待，平均 367 ns。`src/ssd/NVM_PHY_ONFI_NVDDR2.cpp` 中的 `NVM_PHY_ONFI_NVDDR2::handle_ready_signal_from_chip` 把通道忙时就绪的读放入等待队列。这段等待会推迟 chip 进入 IDLE，随后才能启动同 chip 的下一条命令。估算器 1 只取两个独立占用时间的最大值，无法表达这一相互制约。
 
 子批间隔只用于实验隔离。对照 T10 的 64K 开环发射和 8×8K 拆分，同组地址的服务时间分别为 561.492 和 576.160 µs，拆分高出约 2.61%，因为每批单独经历启动和排空。T9 的整批公式也保存在 `layers.csv`，本矩阵的公式拆分差别为 3 ns/层，来自额外三次主机常数。T9 的未拆分 MQSim makespan 未测。
 
