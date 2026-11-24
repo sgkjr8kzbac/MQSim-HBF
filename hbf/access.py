@@ -25,8 +25,9 @@ class TensorSpec:
     """Stored format of one per-head KV tensor: one row of ``dims`` elements of ``bits`` per token.
 
     The defaults are BF16 K and V. Compressed methods declare their own tensors, e.g. 2-bit
-    quantized K plus a 16-bit scale tensor (KIVI), K with pruned channels (ThinK), a low-rank
-    latent, or per-page metadata (Quest). Pages hold tokens of a single tensor.
+    quantized K plus a 16-bit scale tensor (KIVI), K with pruned channels (ThinK) or a low-rank
+    latent. Pages hold tokens of a single tensor. Per-block metadata such as Quest's page
+    summaries has one row per block rather than per token and is not expressible yet.
     """
     name: str
     bits: int
@@ -226,8 +227,8 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
                         if mode == "dense":
                             yield Access(step, layer, head, spec.name, "R", 0, shape.context, spec.bits)
                         else:
-                            count = layout.blocks(t)
-                            for block in sorted(rng.sample(range(count), ceil(count * fraction))):
+                            blocks = layout.blocks(t)
+                            for block in sorted(rng.sample(range(blocks), ceil(blocks * fraction))):
                                 yield layout.page_access(layout.lpa(layer, head, t, block), step)
         return
 
