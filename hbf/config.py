@@ -10,6 +10,7 @@ ROOT = PACKAGE.parent
 CONFIG = PACKAGE / "configs"
 PARAMETERS = CONFIG / "parameters.json"
 MAX_BATCH_PAGES = 8192
+DEFAULT_READ_COMMAND_NS = 290
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ class Config:
     queue_fetch: int = 65535
     batch_pages: int = MAX_BATCH_PAGES
     interval_ns: int = 100_000_000
-    cmd_ns: int = 290
+    cmd_ns: int = DEFAULT_READ_COMMAND_NS
     rb_ns: int = 20
     host_ns: int = 1
     suspend: str = "NONE"
@@ -47,6 +48,9 @@ class Config:
     def __post_init__(self):
         if any(type(n) is not int or not 1 <= n <= 65535 for n in self.geometry):
             raise ValueError("Invalid flash topology")
+        for name in ("page_bytes", "sector_bytes", "pages_per_block", "blocks_per_plane"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if self.page_bytes <= 0 or self.sector_bytes != 512 or self.page_bytes % self.sector_bytes:
             raise ValueError("MQSim requires 512 B sectors and sector-aligned pages")
         if (self.transfer_rate != 1000 or self.width <= 0
@@ -59,7 +63,7 @@ class Config:
         if (type(self.batch_pages) is not int or not 1 <= self.batch_pages <= MAX_BATCH_PAGES
                 or self.batch_pages >= self.queue_depth):
             raise ValueError(f"Batch size must be between 1 and {MAX_BATCH_PAGES} pages and below queue depth")
-        if (min(self.pages_per_block, self.blocks_per_plane, self.read_ns, self.program_ns,
+        if (min(self.read_ns, self.program_ns,
                 self.erase_ns, self.pcie_lanes, self.pcie_lane_gb_s) <= 0
                 or not 0 <= self.op_ratio < 1 or not 0 < self.gc_threshold < 1
                 or self.suspend not in {"NONE", "PROGRAM"}
@@ -67,6 +71,8 @@ class Config:
                 or self.onfi is not None and (len(self.onfi) != 4 or
                     any(type(ns) is not int or not 0 <= ns < 2**32 for ns in self.onfi))):
             raise ValueError("Invalid flash timing, capacity, or controller settings")
+        if self.onfi is None and self.cmd_ns != DEFAULT_READ_COMMAND_NS:
+            raise ValueError("Non-default read command latency requires explicit ONFI XML timings")
         if not 0 < self.capacity_sectors * self.sector_bytes < 2**41:
             raise ValueError("Logical capacity must be positive and below 2 TiB")
 

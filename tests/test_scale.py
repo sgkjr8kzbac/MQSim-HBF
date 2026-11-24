@@ -10,7 +10,7 @@ from hbf.controller import Batch, Request
 from hbf.simulator import dump, simulate
 
 
-def run_dense_case(binary, evidence, topology, layout):
+def run_dense_case(binary, evidence, topology, layout, expected_mq_est_ns):
     cfg = load(topology)
     shape = Shape(32, 8, 128, 32768)
     directory = evidence / f"t9-{topology}-{layout}"
@@ -36,22 +36,40 @@ def run_dense_case(binary, evidence, topology, layout):
     assert stats["gc_enqueued"] == stats["Issued_Flash_Erase_CMD"] == 0
     if layout == "layer_contiguous":
         assert all(row["active_units"] == 1024 and row["max_unit_pages"] == 32 for row in layers)
-        assert all(row["ideal_unsplit_ns"] == 131072 for row in layers)
+        ideal_layer_ns = 131_072
     else:
         assert all(row["active_units"] == 32 and row["max_unit_pages"] == 1024 for row in layers)
-        assert all(row["ideal_unsplit_ns"] == 4194304 for row in layers)
+        ideal_layer_ns = 4_194_304
+    assert all(row["mq_est_ns"] == expected_mq_est_ns // 4 for row in batches)
+    assert all(row["ideal_ns"] == ideal_layer_ns // 4 for row in batches)
+    expected_layer = {
+        "mq_est_ns": expected_mq_est_ns,
+        "mq_est_unsplit_ns": expected_mq_est_ns - 3,  # One host constant vs. four.
+        "ideal_ns": ideal_layer_ns,
+        "ideal_unsplit_ns": ideal_layer_ns,
+    }
+    for key, expected_ns in expected_layer.items():
+        assert all(row[key] == expected_ns for row in layers)
+    for key in ("mqsim_ns", *expected_layer):
+        assert steps[0][key] == sum(row[key] for row in layers)
     return summary
 
 
 @pytest.mark.scale
 @pytest.mark.parametrize(
-    ("topology", "contiguous_ns", "interleaved_ns"),
-    [("16x64", 738448, 4578760), ("64x16", 288080, 4776136), ("256x4", 273088, 6608960)],
+    ("topology", "contiguous_baseline", "interleaved_baseline"),
+    [
+        ("16x64", (738_448, 724_996), (4_578_760, 4_577_284)),
+        ("64x16", (288_080, 279_556), (4_776_136, 4_773_892)),
+        ("256x4", (273_088, 173_764), (6_608_960, 5_560_324)),
+    ],
     ids=["16x64", "64x16", "256x4"],
 )
-def test_t9_dense_matrix(binary, evidence, topology, contiguous_ns, interleaved_ns):
-    contiguous = run_dense_case(binary, evidence, topology, "layer_contiguous")
-    interleaved = run_dense_case(binary, evidence, topology, "vllm_interleaved")
+def test_t9_dense_matrix(binary, evidence, topology, contiguous_baseline, interleaved_baseline):
+    contiguous_ns, contiguous_est_ns = contiguous_baseline
+    interleaved_ns, interleaved_est_ns = interleaved_baseline
+    contiguous = run_dense_case(binary, evidence, topology, "layer_contiguous", contiguous_est_ns)
+    interleaved = run_dense_case(binary, evidence, topology, "vllm_interleaved", interleaved_est_ns)
     # The pinned baseline reproduced these service times. Use tolerance for regressions.
     for summary, expected_ns in ((contiguous, contiguous_ns), (interleaved, interleaved_ns)):
         assert summary["min_layer_ns"] == pytest.approx(expected_ns, rel=.05)

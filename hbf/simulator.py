@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from collections import defaultdict
 from contextlib import suppress
@@ -112,6 +113,53 @@ def version(patches):
             "patch_sha256": {p.name: sha256(p) for p in sorted((PACKAGE / "patches").glob("*.patch"))}}
 
 
+def run_timed(command, directory, env, timeout):
+    timed_command = ["/usr/bin/time", "-f", "%M", "-o", "rss_kib.txt", *command]
+    process = None
+    terminated = False
+
+    def stop_group():
+        if process is not None and process.returncode is None:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+
+    def on_sigterm(signum, frame):
+        nonlocal terminated
+        terminated = True
+        stop_group()
+
+    # Python installs signal handlers only on the main thread. Keep the caller's
+    # disposition and restore it before delivering SIGTERM after cleanup.
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.getsignal(signal.SIGTERM)
+        if previous not in (None, signal.SIG_IGN):
+            signal.signal(signal.SIGTERM, on_sigterm)
+        else:
+            previous = None
+    try:
+        with (directory / "stdout.log").open("w") as log, subprocess.Popen(
+            timed_command, cwd=directory, env=env, stdin=subprocess.DEVNULL,
+            stdout=log, stderr=log, start_new_session=True,
+        ) as child:
+            process = child
+            if terminated:
+                stop_group()
+            try:
+                returncode = child.wait(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                stop_group()
+                child.wait()
+                raise
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+            if terminated:
+                signal.raise_signal(signal.SIGTERM)
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, timed_command)
+
+
 def simulate(cfg, batches, directory, binary, *, physical=False, suspension=False, onfi=False,
              overlap=False, timeout=1200):
     directory.mkdir(parents=True, exist_ok=True)
@@ -157,21 +205,7 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
         "binary_sha256": sha256(binary), "mqsim_command": command, "mqsim_env": flags,
     })
     start = time.perf_counter()
-    timed_command = ["/usr/bin/time", "-f", "%M", "-o", "rss_kib.txt", *command]
-    with (directory / "stdout.log").open("w") as log, subprocess.Popen(
-        timed_command, cwd=directory, env=env, stdin=subprocess.DEVNULL,
-        stdout=log, stderr=log, start_new_session=True,
-    ) as process:
-        try:
-            returncode = process.wait(timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            # GNU time starts MQSim as a child. Stop the whole group and reap the wrapper.
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            raise
-        if returncode != 0:
-            raise subprocess.CalledProcessError(returncode, timed_command)
+    run_timed(command, directory, env, timeout)
     elapsed = time.perf_counter() - start
     stats = flash_stats(directory / "workload_scenario_1.xml")
     stats.update(wall_seconds=elapsed, peak_rss_kib=int((directory / "rss_kib.txt").read_text()))
