@@ -12,10 +12,17 @@ rounds a group needs depends on how its pages land on the planes and on the plan
   a group needs one round per distinct offset it must read, and every plane of the group senses
   in that round whether it holds a wanted page or not.
 
-Pages are placed by MQSim's CWDP static mapping (``Config.physical``). The *offset* of a page in
-its plane is ``lpa // units``, the order in which a contiguous prefill writes it there.
+Pages are placed on planes by MQSim's CWDP static mapping (``Config.physical``). The *offset* of
+a page inside its plane follows MQSim's allocation (``placement``): each plane fills its pages in
+trace order, at every write of an LPA and at the first read of an LPA that was never written.
+So with ``--prefill`` the offsets follow the prefill order, and without it sparse reads get
+compact offsets in first-touch order, exactly as in MQSim.
+
+A layer larger than ``Config.batch_pages`` is split into sub-batches that MQSim serves one after
+another; ``batch_rounds`` sums the rounds of the sub-batches and is the figure to compare with
+MQSim, while ``rounds`` treats the whole layer as one burst.
 """
-from collections import defaultdict
+from collections import Counter, defaultdict
 from math import ceil
 
 
@@ -30,34 +37,62 @@ def plane_geometry(cfg):
     return cfg.channels * cfg.chips * cfg.dies, cfg.planes
 
 
-def locate(cfg, lpa):
-    """(die, plane in die, offset in plane) of an LPA."""
+def locate(cfg, lpa, offsets=None):
+    """(die, plane in die, offset in plane) of an LPA.
+
+    ``offsets`` maps LPAs to their offset in the plane (see ``placement``). Without it the offset
+    is ``lpa // units``, the rank of the LPA among its plane's LPAs when a layout that starts at
+    LPA 0 is written in LPA order.
+    """
     channel, chip, die, plane = cfg.physical(lpa)
-    offset = lpa // cfg.units
+    offset = lpa // cfg.units if offsets is None else offsets[lpa]
     if cfg.dies == cfg.planes == 1:
         return channel, chip, offset
     return (channel * cfg.chips + chip) * cfg.dies + die, plane, offset
 
 
-def analyze_group(cfg, requests, group=1):
-    """Round metrics of the reads of one (step, layer)."""
-    dies, per_die = plane_geometry(cfg)
+def placement(cfg, batches):
+    """Offset of every LPA in its plane as MQSim allocates it.
+
+    MQSim takes the next page of the plane's write frontier at every write (out of place) and at
+    the first read of an unwritten LPA (online_create_entry_for_reads), in trace order. The
+    schedule only accepts prefill writes, which precede the reads of their layer, so these final
+    offsets are also the ones that every read sees.
+    """
+    offsets, used = {}, Counter()
+    for batch in batches:
+        for req in batch.requests:
+            if req.op == "W" or req.lpa not in offsets:
+                unit = req.lpa % cfg.units
+                offsets[req.lpa] = used[unit]
+                used[unit] += 1
+    return offsets
+
+
+def check_group(cfg, group):
+    _, per_die = plane_geometry(cfg)
     if type(group) is not int or group < 1 or per_die % group:
         raise ValueError(f"Lock-step group of {group} planes must divide {per_die} planes per die")
+
+
+def analyze_group(cfg, requests, group=1, offsets=None):
+    """Round metrics of the reads of one (step, layer), or of one sub-batch."""
+    check_group(cfg, group)
+    dies, per_die = plane_geometry(cfg)
     reads = [req for req in requests if req.op == "R"]
     if len({req.lpa for req in reads}) != len(reads):
         raise ValueError("Requests of one layer must be deduplicated pages")
-    offsets = defaultdict(set)
+    needed = defaultdict(set)
     planes = set()
     for req in reads:
-        die, plane, offset = locate(cfg, req.lpa)
+        die, plane, offset = locate(cfg, req.lpa, offsets)
         planes.add((die, plane))
-        offsets[die, plane // group].add(offset)
+        needed[die, plane // group].add(offset)
     pages = len(reads)
     total = dies * per_die
-    rounds = max(map(len, offsets.values()), default=0)
+    rounds = max(map(len, needed.values()), default=0)
     best = ceil(pages / total)
-    senses = group * sum(map(len, offsets.values()))
+    senses = group * sum(map(len, needed.values()))
     useful = sum(req.useful_bytes for req in reads)
     bursts = sum(req.burst_bytes for req in reads)
     return {
@@ -74,23 +109,28 @@ def analyze_group(cfg, requests, group=1):
 
 def analyze(cfg, batches, groups=(1,)):
     """Per-layer rows and per-step totals for each plane organization in ``groups``."""
-    reads = defaultdict(list)
+    for group in groups:
+        check_group(cfg, group)
+    offsets = placement(cfg, batches)
+    parts = defaultdict(list)
     for batch in batches:
-        reads[batch.step, batch.layer].extend(req for req in batch.requests if req.op == "R")
+        part = [req for req in batch.requests if req.op == "R"]
+        if part:
+            parts[batch.step, batch.layer].append(part)
+    keys = ("pages", "rounds", "batch_rounds", "min_rounds", "sensed_pages", "useful_bytes", "burst_bytes")
     layers, steps = [], []
     for group in groups:
         totals = {}
-        for (step, layer), requests in sorted(reads.items()):
-            if not requests:
-                continue
-            row = {"step": step, "layer": layer, **analyze_group(cfg, requests, group)}
+        for (step, layer), chunks in sorted(parts.items()):
+            requests = [req for chunk in chunks for req in chunk]
+            row = {"step": step, "layer": layer, **analyze_group(cfg, requests, group, offsets)}
+            row["subbatches"] = len(chunks)
+            row["batch_rounds"] = sum(analyze_group(cfg, chunk, group, offsets)["rounds"] for chunk in chunks)
             layers.append(row)
             total = totals.setdefault(step, {"group": group, "step": step, "planes": row["planes"],
-                                             "layers": 0, "pages": 0,
-                                             "rounds": 0, "min_rounds": 0, "sensed_pages": 0,
-                                             "useful_bytes": 0, "burst_bytes": 0})
+                                             "layers": 0, **dict.fromkeys(keys, 0)})
             total["layers"] += 1
-            for key in ("pages", "rounds", "min_rounds", "sensed_pages", "useful_bytes", "burst_bytes"):
+            for key in keys:
                 total[key] += row[key]
         for total in totals.values():
             total["utilization"] = total["pages"] / (total["rounds"] * total["planes"])

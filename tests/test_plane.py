@@ -5,7 +5,7 @@ from collections import defaultdict
 import pytest
 
 from hbf.access import LAYOUTS, Shape, read_access
-from hbf.analysis import locate
+from hbf.analysis import locate, placement
 from hbf.cli import pipeline
 from hbf.config import load
 from hbf.controller import Batch, Request, schedule
@@ -98,3 +98,40 @@ def test_hierarchy_commands_follow_rounds(hierarchy_runs):
 def test_plane_config_validation(overrides, message):
     with pytest.raises(ValueError, match=message):
         load("16x64", chips=1, **overrides)
+
+
+READ_COMMANDS = {"48", "50"}  # CMD_READ_PAGE, CMD_READ_PAGE_MULTIPLANE
+
+
+@pytest.mark.parametrize("layout_name, shape, mode, prefill", [
+    ("vllm_interleaved", Shape(3, 5, 128, 256), "dense", True),
+    ("layer_contiguous", Shape(3, 5, 128, 1000), "uniform_pages", True),
+    ("vllm_interleaved", Shape(3, 5, 128, 1000), "uniform_pages", False),
+])
+@pytest.mark.parametrize("rule, group", [("independent", 1), ("lockstep", 8)])
+def test_analysis_offsets_follow_mqsim_allocation(binary, evidence, layout_name, shape, mode, prefill,
+                                                 rule, group):
+    """Per layer and die, MQSim issues the analysed rounds plus at most one lone first page."""
+    cfg = load("2x1", planes=8, blocks_per_plane=16, plane_rule=rule, aggregate_gb_s=128)
+    path = evidence / f"t-plane-align-{layout_name}-{shape.context}-{prefill}-{rule}"
+    pipeline(cfg, shape, layout_name, path, binary, mode=mode, generation={"fraction": .3, "seed": 5},
+             physical=True, prefill_layout=prefill)
+    batches = schedule(cfg, LAYOUTS[layout_name](cfg, shape), read_access(path / "access.csv"))
+    offsets = placement(cfg, batches)
+    owner = {req.lpa: batch for batch in batches for req in batch.requests if req.op == "R"}
+    issued = defaultdict(set)
+    for time, event, command, channel, *_, lpa in csv.reader((path / "physical.csv").open()):
+        if event == "issue" and command in READ_COMMANDS:
+            batch = owner[int(lpa)]
+            issued[batch.step, batch.layer, int(channel)].add(int(time))
+    for batch in batches:
+        needed = defaultdict(set)
+        for req in batch.requests:
+            if req.op == "R":
+                die, plane, offset = locate(cfg, req.lpa, offsets)
+                needed[die, plane // group].add(offset)
+        rounds = defaultdict(int)
+        for (die, _), values in needed.items():
+            rounds[die] = max(rounds[die], len(values))
+        for die, count in rounds.items():
+            assert count <= len(issued[batch.step, batch.layer, die]) <= count + 1

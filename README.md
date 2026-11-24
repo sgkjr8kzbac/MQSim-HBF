@@ -100,7 +100,7 @@ flowchart TB
 | 页级读时序 | 逐请求的到达、入队、完成时间；可选物理时间线，精确到每条命令的通道、chip、块、页 |
 | 拓扑扫描 | 16×64、64×16、256×4 三种命名配置，或任意"通道数x每通道 chip 数"（例如 16x16 即 256 个 plane，对应规范示例），都按 1 TB/s 标称带宽配置 |
 | 真实 die/plane 层级 | T-PLANE：每 die 最多 64 个 plane，multi-plane 读写，独立或同偏移两种地址规则；`--prefill` 先整体写入，使物理位置与 LPA 一一对应 |
-| 机制分析 | `--analysis-only` 不跑 MQSim，几秒内算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
+| 机制分析 | `--analysis-only` 不跑 MQSim，数秒到数十秒内（32 层 × 128K 全量读约 33 s）算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
 | 容量 | 默认每 plane 512 块，单 stack 512 GiB 物理容量（规范示例 cube 的容量），1,024 plane 时 MQSim 峰值内存约 4.2 GB |
 | 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照） |
 | 压缩后的存储格式 | 用 `TensorSpec(name, bits, dims)` 声明，例如 KIVI 的 2 bit K 加量化参数张量、ThinK 的静态通道裁剪、低秩 latent。每页 token 数和有用字节按各张量计算 |

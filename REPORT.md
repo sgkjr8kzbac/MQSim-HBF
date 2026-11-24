@@ -38,7 +38,7 @@ T5 中将 PCIe 加倍，每个 8,192 页子批缩短 **64 ns（0.089%）**。吞
 | `Flash_Channel_Count × Chip_No_Per_Channel` | 16×64、64×16、256×4 | 扫描每通道 chip 数，共 1,024 个单元 |
 | `Die_No_Per_Chip`、`Plane_No_Per_Die` | 1、1 | 对应 HBF plane，T0 另用 2 die 验证 |
 | `Flash_Channel_Width`、`Channel_Transfer_Rate` | 64、16、4 B，rate 各为 1000 | 1 B 对应 1 GB/s，4 KiB 均可被两倍通道宽度整除 |
-| `Page_Capacity`、扇区、`Page_No_Per_Block`、`Block_No_Per_Plane` | 4,096 B、512 B、256、64 | 页请求为 8 扇区，设备 64 GiB 物理容量 |
+| `Page_Capacity`、扇区、`Page_No_Per_Block`、`Block_No_Per_Plane` | 4,096 B、512 B、256、64（第 1 阶段起默认 512） | 页请求为 8 扇区，设备 64 GiB 物理容量（512 块时 512 GiB） |
 | `Flash_Technology` | SLC | 只使用 LSB 时序 |
 | `Page_Read_Latency_*` | 4,096 ns | 感测时延 |
 | `Page_Program_Latency_*`、`Block_Erase_Latency` | 100,000、1,000,000 ns | 写入和擦除基线 |
@@ -225,9 +225,11 @@ T8 原先只在默认的 64×16 上运行。现在对三种拓扑各跑三档，
 - 感测页数与感测放大：联动时，组内每个 plane 每轮都要感测，即使它没有要读的页；
 - 64 B 突发传输字节：OCP 规范 §4.1 允许读突发为 64 B 到 4 KiB，因此传输可以小于整页，感测始终是整页。
 
-偏移取 `lpa // 单元数`，即连续 prefill 写入时的物理位置。独立 plane 的轮数与已有指标 `max_unit_pages` 逐层相等，有测试核对。
+页在 plane 内的偏移按 MQSim 的实际分配方式计算：每个 plane 按轨迹顺序，在每次写入、以及未写过的 LPA 首次被读时，取写前沿的下一页。加 `--prefill` 时偏移由整体写入的顺序决定；不加时，稀疏读的页按首次读取的顺序紧凑排列，与 MQSim 一致。一层超过子批上限被拆开时，`batch_rounds` 给出各子批轮数之和，这是与 MQSim 对照的口径；`rounds` 把整层当作一次突发。独立 plane 的轮数与已有指标 `max_unit_pages` 逐层相等，有测试核对。
 
-**示例扫描**：Llama-3.1-8B 形状（32 层、8 个 KV 头、32K），每层每头每张量均匀随机选页，下表为 32 层合计的读轮数（括号内为均衡损失 R/R*），数据见 [evidence/stage1-analysis-sweep.csv](evidence/stage1-analysis-sweep.csv)：
+**与 MQSim 逐层核对**：2 die × 8 plane，`vllm_interleaved` 与 `layer_contiguous`，含层数、头数不整除 plane 数的形状，加或不加 prefill，independent 与 lockstep 两种规则，共 6 组。用物理时间线统计每层每 die 实际发出的读命令数，全部落在 [分析轮数, 分析轮数 + 1] 之内，多出的 1 条是首页单独下发。初版曾直接取 `lpa // 单元数` 作偏移，在 `vllm_interleaved` 加 prefill（逐层写入）和不加 prefill 两种情况下与 MQSim 不符，由第二轮审查发现后改正。
+
+**示例扫描**：Llama-3.1-8B 形状（32 层、8 个 KV 头、32K），先整体 prefill，再每层每头每张量均匀随机选页，下表为 32 层合计的读轮数（括号内为均衡损失 R/R*），数据见 [evidence/stage1-analysis-sweep.csv](evidence/stage1-analysis-sweep.csv)：
 
 | plane 数 | 格式 | 布局 | 选页比例 | 读页 | 独立 plane | 联动 16 | 联动 32 | 联动 64 |
 |---:|---|---|---:|---:|---:|---:|---:|---:|

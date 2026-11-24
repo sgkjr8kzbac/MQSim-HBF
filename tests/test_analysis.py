@@ -4,10 +4,10 @@ import csv
 import pytest
 
 from hbf.access import Access, LAYOUTS, Shape, TensorSpec, generate
-from hbf.analysis import analyze, analyze_group, locate, plane_geometry
-from hbf.cli import pipeline
+from hbf.analysis import analyze, analyze_group, locate, placement, plane_geometry
+from hbf.cli import main, pipeline
 from hbf.config import load, parse_topology
-from hbf.controller import Request, burst_bytes, metrics, schedule
+from hbf.controller import Batch, Request, burst_bytes, metrics, schedule
 
 
 def tiny():
@@ -122,3 +122,36 @@ def test_parse_topology():
     assert parse_topology("64x16", {"64x16": [64, 16]}) == (64, 16)
     with pytest.raises(ValueError, match="neither named"):
         parse_topology("sixteen")
+
+
+def test_batch_rounds_add_up_sub_batches():
+    cfg = load("16x64", batch_pages=1024)
+    shape = Shape(1, 8, 128, 32768)
+    layout = LAYOUTS["layer_contiguous"](cfg, shape)
+    batches = schedule(cfg, layout, generate(cfg, layout, "uniform_pages", fraction=.25, seed=2))
+    (row,), _ = analyze(cfg, batches)
+    assert row["subbatches"] == len(batches) > 1
+    per_batch = [analyze_group(cfg, b.requests, 1, placement(cfg, batches))["rounds"] for b in batches]
+    assert row["batch_rounds"] == sum(per_batch) > row["rounds"]
+
+
+def test_first_touch_offsets_without_writes():
+    cfg = tiny()
+    # Without a write, MQSim gives each plane's pages compact offsets in first-read order.
+    batches = [Batch(0, 0, 0, 0, (Request(8), Request(13))), Batch(1, 0, 0, 10, (Request(0), Request(9)))]
+    offsets = placement(cfg, batches)
+    assert offsets == {8: 0, 13: 0, 0: 1, 9: 1}
+    writes = [Batch(-1, 0, 0, 0, tuple(Request(lpa, "W") for lpa in range(16)))] + batches
+    assert placement(cfg, writes) == {lpa: lpa // 4 for lpa in range(16)}
+
+
+def test_prefill_rejects_user_writes_and_cli_checks_groups(tmp_path, monkeypatch):
+    cfg = load("16x64")
+    with pytest.raises(ValueError, match="must not contain writes"):
+        pipeline(cfg, Shape(1, 1, 128, 64), "layer_contiguous", tmp_path / "w", None,
+                 mode="write_then_read", prefill_layout=True)
+    monkeypatch.setattr("sys.argv", ["hbf", "--analysis-only", "--plane-group", "3",
+                                     "--output", str(tmp_path / "g")])
+    with pytest.raises(SystemExit):
+        main()
+    assert not (tmp_path / "g").exists()

@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .access import (LAYOUTS, MODES, Shape, generate, parse_tensors, prefill, read_access, tensors_meta,
                      write_access)
-from .analysis import analyze
+from .analysis import analyze, check_group
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule
 from .simulator import build, dump, simulate, write_table
@@ -33,6 +33,12 @@ def analysis_report(layer_rows, step_rows):
     return report
 
 
+def reject_write(access):
+    if access.op == "W":
+        raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
+    return access
+
+
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None."""
@@ -45,7 +51,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     access_path = directory / "access.csv"
     accesses = generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv)
     if prefill_layout:
-        accesses = chain(prefill(layout), (access for access in accesses if access.op == "R"))
+        accesses = chain(prefill(layout), (reject_write(access) for access in accesses))
     write_access(access_path, accesses)
     dump(directory / "meta.json", {"shape": asdict(shape), "layout": layout_name,
                                    "tensors": tensors_meta(layout),
@@ -125,6 +131,8 @@ def main():
         cfg = load(args.topology, batch_pages=args.batch_pages, planes=args.planes,
                    plane_rule=args.plane_rule, dbsy_ns=args.dbsy_ns)
         tensors = parse_tensors(args.tensors)
+        for group in args.plane_groups or (1,):
+            check_group(cfg, group)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     shape = Shape(args.layers, args.heads, args.head_dim, args.context)
