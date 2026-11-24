@@ -1,44 +1,303 @@
-# HBF 模拟链路 · 第 0 阶段
+# MQSim-HBF：面向 KV cache 的 HBF 页级模拟链路
 
-把 KV token 区间转换为 4 KiB 页请求，经固定版本的 MQSim 模拟，再还原为子批、层和 decode 步时延。使用原版 CWDP FTL 与一 chip 对应一 HBF plane 的拓扑。实测、偏差和源码位置见 [REPORT.md](REPORT.md)。
+本项目研究：KV cache 存进 **HBF（High Bandwidth Flash）** 后，每生成一个 token 要读多少页，这些页能否整页、均匀地铺满各个 plane，又会出现哪些读放大、plane 冲突和排队。HBF 是放在 GPU 旁边、接口类似 HBM 的 NAND 闪存堆栈。项目做法是"现成的 NAND 器件模拟器 + 自己写的上层"：
 
-## 运行
+- **器件层**：固定版本的 [MQSim](https://github.com/CMU-SAFARI/MQSim)（FAST 2018），使用它的事务调度、ONFI 通道和闪存芯片时序。对 MQSim 的修改全部以可开关的补丁形式保存。
+- **中间件**：本仓库的 Python 包 `hbf`。它把"每步、每层、每个 KV 头读写哪些 token"翻译成 4 KiB 页请求和 MQSim 轨迹，跑完后还原出子批、层和 decode 步的时延与负载指标，并与两个解析估算器对照。
 
-Linux 上需要 Python 3.10+、g++、make、git 和 GNU time。核心包只使用 Python 标准库。仓库直接包含固定版本的 MQSim 上游源码及许可证，构建无需网络。构建时逐文件校验 SHA-256，将源码复制到 `.build/`，再应用项目补丁并编译。 [MQSim 源码](hbf/mqsim/src) · [上游许可证](hbf/mqsim/LICENSE) · [版本](hbf/mqsim.commit) · [校验清单](hbf/mqsim.sha256) · [补丁](hbf/patches)
+> **当前状态：第 0 阶段已完成。** MQSim 与中间件已经贯通，T0–T10 验证项全部写成测试，最近一次全量运行 58 项通过、3 项 xfail。xfail 是如实记录的已知偏差，见[验证状态](#验证状态)。下一阶段将接入真实模型的决策数据和各类 KV 压缩方法。详细实测、源码依据和偏差分析见 [REPORT.md](REPORT.md)。
+
+---
+
+## 架构
+
+### 数据流
+
+```mermaid
+flowchart LR
+    subgraph IN["输入"]
+        GEN["随机生成器<br/>7 种模式，固定种子"]
+        CSV["access.csv<br/>真实模型或压缩方法产出"]
+        TS["张量规格 TensorSpec<br/>name · bits · dims"]
+    end
+
+    subgraph MW["中间件 hbf/"]
+        ACC["access.py<br/>访问记录校验"]
+        LAY["布局<br/>layer_contiguous / vllm_interleaved<br/>(层, 张量, 头, 块) → LPA"]
+        CTL["controller.py<br/>按 (step, layer) 分批、去重<br/>≤ 8,192 页子批、间隔 100 ms"]
+        SIM["simulator.py<br/>GC 预算检查 · 写轨迹 · 运行<br/>完整性与重叠断言"]
+        EST["估算器与指标<br/>MQSim 一致估算 · 理想 HBF 下界<br/>读放大 · 不均衡度"]
+    end
+
+    subgraph DEV["器件层：MQSim + 补丁"]
+        MQ["NVMe 主机接口 → FTL(CWDP)<br/>→ TSU → ONFI 通道 → 闪存芯片"]
+    end
+
+    subgraph OUT["运行目录 runs/…"]
+        RES["batches / layers / steps.csv<br/>report.md · meta.json · version.json"]
+    end
+
+    GEN --> ACC
+    CSV --> ACC
+    TS --> LAY
+    ACC --> LAY --> CTL --> SIM
+    SIM -- "trace.txt<br/>时间 0 扇区 8 读写" --> MQ
+    MQ -- "I1 逐请求完成日志<br/>I2 物理时间线<br/>统计 XML" --> SIM
+    SIM --> EST --> RES
+```
+
+### HBF 到 MQSim 的映射
+
+MQSim 的 TSU 只在整颗 chip 空闲时才下发命令，同一 chip 上不同 die 的读实际是串行的（报告中 T0 实测确认）。所以**每颗 MQSim chip 只放 1 个 die、1 个 plane，代表 HBF 的一个 plane**。1,024 个并行单元按"通道数 × 每通道 chip 数"组织，这个拓扑是扫描变量：
+
+```mermaid
+flowchart TB
+    HBF["HBF 单个 stack<br/>1,024 个 plane · 标称 1 TB/s"] --> T1 & T2 & T3
+    T1["16 通道 × 64 chip<br/>每通道 64 GB/s"]
+    T2["64 通道 × 16 chip<br/>每通道 16 GB/s"]
+    T3["256 通道 × 4 chip<br/>每通道 4 GB/s"]
+    T1 & T2 & T3 --> U["单元号 u = lpa mod 1024<br/>通道 = lpa mod C，chip = (lpa / C) mod W<br/>（原版 CWDP 静态映射）"]
+```
+
+一次页读在 MQSim 中依次经过：发命令（约 290 ns）→ 感测 tR（4,096 ns）→ R/B 就绪（20 ns）→ 通道传输（4096 B ÷ 每通道带宽）→ 主机接口（约 1 ns）。同一 chip 上感测和传输不能重叠，同一通道上的命令和数据传输共享总线。
+
+### 模块一览
+
+| 模块 | 作用 |
+|---|---|
+| [`hbf/access.py`](hbf/access.py) | 访问记录格式与校验、张量规格 `TensorSpec`、两种布局、7 种随机生成模式 |
+| [`hbf/controller.py`](hbf/controller.py) | token 区间到页的转换、批内去重、有用字节按区间并集计算、子批划分、两个估算器和负载指标 |
+| [`hbf/simulator.py`](hbf/simulator.py) | 校验源码散列、打补丁、编译 MQSim；GC 预算检查；写轨迹；运行并对回逐请求完成日志；聚合结果 |
+| [`hbf/config.py`](hbf/config.py) | 参数文件、三套拓扑、设备与 workload XML 的生成和互相校验、CWDP 正反映射、逻辑容量上界 |
+| [`hbf/cli.py`](hbf/cli.py) | 一键入口：生成或导入 → 轨迹 → MQSim → 解析 → 简报 |
+| [`hbf/mqsim/`](hbf/mqsim) | MQSim 上游原版源码，逐文件 SHA-256 校验，不直接修改 |
+| [`hbf/patches/`](hbf/patches) | I1–I4 仪表与修复补丁，T-SUSP、T-ONFI 时序对照补丁 |
+| [`hbf/configs/`](hbf/configs) | 参数 JSON、设备模板、三种拓扑的设备和 workload XML |
+| [`tests/`](tests) | T0–T10 验证测试、上游行为探针、规模测试 |
+| [`evidence/`](evidence) | 随仓库保存的实测摘要和测试日志 |
+
+---
+
+## 能力范围
+
+### 已支持
+
+| 能力 | 说明 |
+|---|---|
+| 页级读时序 | 逐请求的到达、入队、完成时间；可选物理时间线，精确到每条命令的通道、chip、块、页 |
+| 拓扑扫描 | 16×64、64×16、256×4 三种配置共 1,024 个单元，每种都按 1 TB/s 标称带宽配置 |
+| 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照） |
+| 压缩后的存储格式 | 用 `TensorSpec(name, bits, dims)` 声明，例如 KIVI 的 2 bit K 加量化参数张量、ThinK 的静态通道裁剪、低秩 latent。每页 token 数和有用字节按各张量计算 |
+| 选择类方法 | StreamingLLM、SnapKV、动态选页等：访问记录本身就能表达读哪些 token 区间，部分覆盖的页按整页读并统计读放大 |
+| 指标 | 读页数、有用字节、读放大、最忙单元和最忙通道的页数、不均衡度、MQSim makespan、两个估算值及比值，按子批、层、步输出 |
+| prefill 写与写读干扰 | 整页写入；写读干扰对照（T6，配合 T-SUSP 补丁） |
+| 敏感性分析 | T-ONFI 改命令时序，T-SUSP 打开 program 挂起，结果都只作为对照 |
+| 安全保护 | 运行前检查 GC 预算和逻辑容量；运行后断言请求数、读写命令数一致，擦除数和 GC 数为 0，子批之间不重叠 |
+| 可复现 | 每次运行保存输入、配置、补丁开关与散列、两个仓库的 commit、种子和命令行 |
+
+### 尚不支持（计划在下一阶段处理）
+
+| 项目 | 现状 |
+|---|---|
+| 真实模型数据和方法适配器 | 接口已就绪：任何能产出访问记录和张量规格的前端都可以接入。KIVI、Quest 等适配器尚未编写 |
+| decode 逐 token 追加写 | 只支持 prefill 整页写。MQSim 中非整页写会触发 update read，建议先在 HBM 攒满一页再写 |
+| 层间依赖与 GPU 计算 | 每步时延等于各层时延直接相加；读页和计算的交叠、预取都没有建模 |
+| 读一个张量的部分通道 | 需要通道主序的布局，目前不支持 |
+| 同一张量分段使用不同位宽 | 例如 KIVI 的全精度残差窗口，目前要声明成两个张量 |
+| 按块存的元数据 | 例如 Quest 的页摘要，它每块一行而不是每 token 一行，需要单独的块索引维度 |
+| HBF 专有器件行为 | cache read、感测与传输重叠、die 级共享资源、刷新、读扰动、热，均未建模 |
+
+### 建模假设（解读结果前请先看）
+
+- 主结果使用**原版 MQSim 时序**：chip 级门控、每条命令约 290 ns 的 ONFI 开销、没有 cache read。这些都是按 SSD 做的假设，未必符合 HBF，所以用拓扑扫描和 T-ONFI 做敏感性分析。
+- **FTL 用原版**，作为"未做 HBF 专门设计"的基线。CWDP 按 LPA 轮转到各单元，所以稠密读天然均衡；稀疏读是否均衡，取决于选中了哪些页。
+- **理想 HBF 下界**假设感测与传输可以完全重叠、没有命令开销。它与 MQSim 一致估算之差，就是 MQSim 建模假设带来的额外开销。
+- **估算器 1 有适用范围**：当最忙单元的串行时间和最忙通道的总线时间接近时，它会明显低估。T8 中有两组越界，T9 的 256×4 低估 57%。原因分析见报告。
+
+---
+
+## 关键结果一览
+
+### 单页读时延拆解（T0）
+
+| 阶段 | 实测 |
+|---|---:|
+| 发命令 | 290 ns |
+| 感测 + R/B 就绪 | 4,096 + 20 ns |
+| 通道传输（64 GB/s） | 64 ns |
+| 主机接口 | 1 ns |
+| **单页合计** | **4,471 ns** |
+
+同一单元连续读，每多一页增加 4,470 ns，而不是只增加 tR。
+
+### 稠密基线（T9）
+
+工作负载：Llama-3.1-8B 形状，即 32 层、8 个 KV 头、head_dim 128、BF16，上下文 32K，每层读 32,768 页。
+
+| 拓扑 | layer_contiguous µs/层（不拆分 / 8K 子批） | vllm_interleaved ms/层 | 理想下界 µs/层 |
+|---|---:|---:|---:|
+| 16×64 | 728 / 738 | 4.58 | 131 |
+| 64×16 | 282 / 288 | 4.78 | 131 |
+| 256×4 | 272 / 273 | 6.61 | 131 |
+
+在 MQSim 中，"每通道挂多少个 chip"对时延的影响远大于标称带宽。`vllm_interleaved` 的布局与 CWDP 映射相互作用，每层只用到 1,024 个单元中的 32 个，时延高出 6–24 倍。
+
+---
+
+## 快速开始
+
+环境：Linux，Python 3.10+、g++、make、git、GNU time（`/usr/bin/time`）。核心包只依赖 Python 标准库，测试另需 pytest。仓库自带固定版本的 MQSim 源码，构建不需要联网；首次运行会在当前目录的 `.build/` 下校验源码、打补丁并编译，约 10–30 秒。
 
 ```bash
 python3 -m hbf.cli --topology 64x16 --mode uniform_pages --seed 234 --fraction 0.1
+```
+
+```bash
 python3 -m hbf.cli --topology 256x4 --mode dense --layers 32 --heads 8 --context 32768
 ```
 
-若需安装命令行工具，运行 `python3 -m pip install .`，再用 `hbf-stage0` 运行相同参数。测试可用以下命令。
-
-```bash
-python3 -m pip install -r requirements-dev.txt
-python3 -m pytest -q -m 'not scale' --evidence-dir runs/validation
-python3 -m pytest -q -m scale --evidence-dir runs/scale
-```
-
-每次用一个新目录。省略 `--output` 时，命令在 `runs/` 下生成目录。首次运行会在当前目录的 `.build/` 编译。全量稠密矩阵共提交约 629 万个读请求，通常需要数分钟，单进程设备模拟峰值约 575 MiB。
-
-## 输入和输出
-
-`access.csv` 的表头为 `step,layer,kv_head,kind,op,token_start,token_end,bits`。层和头从 0 开始，prefill 用 step −1，token 区间左闭右开。`kind` 是张量名，`bits` 必须等于该张量的存储位宽。
-
-默认张量为 BF16 的 `K`、`V`，每 token 有 head_dim 个通道，每页 16 个 token，旧的访问记录可以直接使用。压缩方法用 `--tensors` 声明自己的存储格式，例如 KIVI 式的 2 bit K 加 16 bit 量化参数：
+用 KIVI 式的存储格式（2 bit K 加 16 bit 量化参数）：
 
 ```bash
 python3 -m hbf.cli --topology 64x16 --mode dense --tensors '[{"name":"K","bits":2,"dims":128},{"name":"K_scale","bits":16,"dims":2},{"name":"V","bits":16,"dims":128}]'
 ```
 
-每个张量的每页 token 数为 `页字节 × 8 ÷ (dims × bits)`，每 token 须为整字节。`layer_contiguous` 按 (层, 张量, 头) 依次预留连续区域。`vllm_interleaved` 要求所有张量每页 token 数相同。张量规格写入运行目录的 `meta.json`。读同一张量的部分通道（动态通道选择）尚不支持，需要通道主序的布局。用 `--access-csv PATH` 导入已有记录，并通过 `--layers`、`--heads`、`--head-dim`、`--context` 指定形状。默认上下文及预留范围相同。读区间重叠时，有用字节按并集计。写仅支持 prefill 的满页 token 写入。
+导入已有的访问记录：
 
-可选布局为 `layer_contiguous`、`vllm_interleaved`。生成模式包括 `dense`、`uniform_pages`、`same_unit`、`distinct_units`、`same_channel_distinct_units`、`hot_unit` 和 `write_then_read`。定向模式受地址空间约束，形状应覆盖所需页面。生成参数见 `--help`。
+```bash
+python3 -m hbf.cli --access-csv my_access.csv --layers 32 --heads 8 --head-dim 128 --context 32768
+```
 
-运行目录保存输入、形状、种子、参数和版本，MQSim 轨迹、设备和 workload XML、原始 XML 和 stdout、逐请求完成日志，以及子批、层、步指标 CSV 和简报。`--physical` 另外保存物理事件 CSV。层、步的时延是子批服务时间之和，结果表同时保留拆分和未拆分估算。
+命令最后会打印运行目录；省略 `--output` 时，目录建在 `runs/` 下。也可以先 `python3 -m pip install .`，然后用 `hbf-stage0` 代替 `python3 -m hbf.cli`。全部参数见 `--help`。
 
-`--batch-pages` 接受 1–8,192。每个 plane 在一次运行中新分配的物理页（写，以及首次读某个 LPA）不得超过 GC 预算，默认配置为 13,311 页，超出时在写轨迹前报错。超过这个量后，存在失效页（重写）时 MQSim 会执行 GC；全是有效页时，再多写一些就会陷入死循环。运行结束后，中间件还断言擦除数和 GC 入队数都为 0。T10 的大批性能探针通过底层接口提交显式批次。
+运行测试：
 
-## 补丁开关
+```bash
+python3 -m pip install -r requirements-dev.txt
+```
 
-I1 和 I2 的环境变量 `HBF_I1`、`HBF_I2` 指定 CSV 路径。I3 和 I4 由 `HBF_I3`、`HBF_I4` 的存在启用。主链路设置 I1、I3、I4，按需设置 I2。T6 和 ONFI 对照用 Python 接口设置 `simulate(..., suspension=True)` 或 `onfi=True`，分别对应 `HBF_T_SUSP`、`HBF_T_ONFI`。T-ONFI 可通过 XML 覆盖 `ONFI_t_CS`、`ONFI_t_WC`、`ONFI_t_WB`、`ONFI_t_RR`。关闭环境开关时应取消设置变量。
+```bash
+python3 -m pytest -q -m 'not scale' --evidence-dir runs/validation
+```
+
+```bash
+python3 -m pytest -q -m scale --evidence-dir runs/scale
+```
+
+非规模测试约 1 分钟。规模测试包括 T9 的六组稠密矩阵、T9 不拆分对照和 T10，约 13 分钟，单进程内存峰值约 600 MiB。每次请用一个新的 `--evidence-dir`。
+
+---
+
+## 输入与输出
+
+### 访问记录 `access.csv`
+
+这是中间件唯一的输入格式，表头为：
+
+```
+step,layer,kv_head,kind,op,token_start,token_end,bits
+```
+
+| 字段 | 含义 |
+|---|---|
+| `step` | decode 步号，prefill 用 −1 |
+| `layer`、`kv_head` | 从 0 开始 |
+| `kind` | 张量名，必须是已声明的张量规格之一，默认 `K` 或 `V` |
+| `op` | `R` 读，`W` 写（只支持 prefill 的整页写） |
+| `token_start`、`token_end` | 左闭右开的 token 区间 |
+| `bits` | 必须等于该张量规格的位宽 |
+
+### 张量规格
+
+用 `--tensors` 传入 JSON（或 JSON 文件路径），默认是 BF16 的 `K` 和 `V`，dims 等于 head_dim，每页 16 个 token。每页 token 数 = 页字节 × 8 ÷ (dims × bits)，要求每个 token 是整字节。
+
+- `layer_contiguous` 按 (层, 张量, 头) 依次预留连续区域，各张量的块数可以不同。
+- `vllm_interleaved` 要求所有张量每页 token 数相同。
+- 使用默认规格时，两种布局的 LPA 与早期版本逐位相同。
+
+### 运行目录
+
+| 文件 | 内容 |
+|---|---|
+| `access.csv`、`meta.json` | 输入、模型形状、张量规格、生成器参数、种子、命令行 |
+| `parameters.json`、`device.xml`、`workload.xml`、`trace.txt` | 实际使用的配置和 MQSim 轨迹 |
+| `version.json` | MQSim commit、本仓库 commit、补丁开关与散列、二进制散列 |
+| `stdout.log`、`workload_scenario_1.xml`、`completions.csv` | MQSim 原始输出和逐请求完成日志（I1） |
+| `physical.csv` | 物理时间线（I2），需要加 `--physical` |
+| `batches.csv`、`layers.csv`、`steps.csv`、`report.md` | 子批、层、步的指标，以及简报 |
+
+### 运行约束
+
+- 子批上限为 8,192 页（`--batch-pages` 可以设更小）。更大的单批在 MQSim 中耗时会超线性增长，见报告 T10。
+- **GC 预算**：一次运行中，每个 plane 新分配的物理页数（每次写，加上首次读的 LPA 数）不得超过 13,311 页，超出时在写轨迹之前报错。原因是上游 MQSim 超过这个量后，有失效页时会执行 GC，全是有效页时会陷入死循环。
+- 所有 LPA 必须在 MQSim 的逻辑容量之内，保证不发生地址取模回绕。
+
+---
+
+## MQSim 补丁
+
+| 补丁 | 类别 | 作用 | 开关 |
+|---|---|---|---|
+| I1 | 仪表 | 逐请求完成日志，在 `delete request` 之前缓冲写出 | `HBF_I1=<csv 路径>` |
+| I2 | 仪表 | 物理时间线：命令下发、命令完成、就绪、数据传输 | `HBF_I2=<csv 路径>` |
+| I3 | 修复 | 修复 ID 列表的 1000 字节截断 | `HBF_I3` 存在即开启 |
+| I4 | 修复 | 去掉结尾的 `cin.get()`，便于批量运行 | `HBF_I4` 存在即开启 |
+| T-SUSP | 时序对照 | 补上 program 挂起缺少的 `break`，修正 TSU 构造函数传参错序，以及单 die 挂起和恢复的记账 | `HBF_T_SUSP` |
+| T-ONFI | 时序对照 | 把 t_CS、t_WC、t_WB、t_RR 暴露到 XML，默认值与原版一致 | `HBF_T_ONFI` |
+
+主链路默认开启 I1、I3、I4，需要时开启 I2；T 类补丁默认关闭。已实测确认：所有开关都关闭时，输出与未打补丁的原版**逐位一致**；只开 I 类补丁时，统计输出不变。
+
+---
+
+## 验证状态
+
+| 编号 | 内容 | 结果 |
+|---|---|---|
+| T0 | 校准微基准：拆解单页读时延，验证 chip、die、通道的并行特性 | 通过 |
+| T1 | 物理位置核实（含高编号的通道和 chip） | 通过 |
+| T2 | 单页读，与估算一致 | 通过 |
+| T3 | 同一单元读，线性增长，斜率 4,470 ns/页 | 通过 |
+| T4 | 跨通道基本平坦；同通道随 chip 数出现阶梯 | 通过 |
+| T5 | 带宽与队列参数 | 通过；"PCIe 翻倍后结果严格不变"记为 xfail，差 64 ns/批，原因是整数 ns 截断 |
+| T6 | 写读干扰与 program 挂起 | 通过 |
+| T7 | 无擦除、无 GC、无映射页读 | 通过 |
+| T8 | 随机选页（3 拓扑 × 3 档），MQSim 与估算器 1 的比值应在 0.8–1.25 | 7/9 通过；16×64@1% 和 256×4@50% 越界，记为 xfail |
+| T9 | 稠密基线（3 拓扑 × 2 布局），另加不拆分对照 | 通过；256×4 估算器 1 低估 57%，保留为已知偏差 |
+| T10 | 墙钟时间与内存摸底，推荐子批大小 | 通过；推荐每批 8,192 页 |
+
+另有上游行为探针（传输率取整、队列参数溢出、ID 列表截断、轨迹解析、首次读分配、SLC 只用 LSB、PCIe 效率）、GC 预算边界、访问接口扩展和进程清理等测试。完整数据见 [REPORT.md](REPORT.md) 和 [evidence/](evidence)。
+
+---
+
+## 目录结构
+
+```
+.
+├── README.md            项目介绍（本文件）
+├── REPORT.md            第 0 阶段验证报告：配置、实测、偏差、源码依据
+├── hbf/                 中间件 Python 包
+│   ├── access.py        访问记录、张量规格、布局、生成器
+│   ├── controller.py    分批、去重、估算器、指标
+│   ├── simulator.py     构建、GC 预算、运行、结果对回与聚合
+│   ├── config.py        参数、XML 生成与校验、地址映射
+│   ├── cli.py           命令行入口
+│   ├── configs/         参数 JSON、设备模板、三种拓扑的 XML
+│   ├── patches/         I1–I4、T-SUSP、T-ONFI
+│   ├── mqsim/           MQSim 上游源码（固定 commit）
+│   ├── mqsim.commit     固定的上游 commit
+│   └── mqsim.sha256     逐文件校验清单
+├── tests/               pytest：验证项、上游行为探针、规模测试
+└── evidence/            随仓库保存的实测摘要和日志
+```
+
+## 路线图
+
+1. **真实模型前端**：在 GPU 上用 HF transformers 跑 Llama-3.1-8B（RULER、LongBench、PG-19），逐步记录选择决策，导出访问记录和张量规格。
+2. **方法适配器**：KIVI、StreamingLLM、SnapKV、Quest、ThinK、Quest + 4-bit。KIVI 和 StreamingLLM 读哪些位置是确定的，不需要 GPU 就能先跑。
+3. **接口补全**：decode 追加写、分段位宽、按块存的元数据、读部分通道所需的通道主序布局。
+4. **系统组合**：GPU 计算、HBM 带宽和层间依赖，给出端到端 tokens/s；必要时绕过主机接口直接接入 TSU，以建模预取和交叠。
+5. **交叉验证**：用 SSDsim 交叉验证；用 NANDFlashSim 核对单 die 时序；考虑加入考虑耦合的估算器。
+
+## 致谢与许可
+
+器件层使用 CMU SAFARI 的 [MQSim](https://github.com/CMU-SAFARI/MQSim)，许可证见 [hbf/mqsim/LICENSE](hbf/mqsim/LICENSE)。HBF 器件参数取自 SPLASH 论文的表 1（单个 stack）。
