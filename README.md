@@ -5,7 +5,7 @@
 - **器件层**：固定版本的 [MQSim](https://github.com/CMU-SAFARI/MQSim)（FAST 2018），使用它的事务调度、ONFI 通道和闪存芯片时序。对 MQSim 的修改全部以可开关的补丁形式保存。
 - **中间件**：本仓库的 Python 包 `hbf`。它把"每步、每层、每个 KV 头读写哪些 token"翻译成 4 KiB 页请求和 MQSim 轨迹，跑完后还原出子批、层和 decode 步的时延与负载指标，并与两个解析估算器对照。
 
-> **当前状态：第 0 阶段已完成。** MQSim 与中间件已经贯通，T0–T10 验证项全部写成测试，最近一次全量运行 58 项通过、3 项 xfail。xfail 是如实记录的已知偏差，见[验证状态](#验证状态)。下一阶段将接入真实模型的决策数据和各类 KV 压缩方法。详细实测、源码依据和偏差分析见 [REPORT.md](REPORT.md)。
+> **当前状态：第 0 阶段已完成，第 1 阶段的模拟器改进已在开发分支上。** 第 1 阶段新增：容量扩到每 plane 512 块、不跑 MQSim 的机制分析模式、真实 die/plane 层级（T-PLANE）、HBF 命令模型（T-CMD）、cache read（T-CACHE）和 SPLASH 式条带布局。最近一次全量运行 116 项通过、3 项 xfail，xfail 是如实记录的已知偏差，见[验证状态](#验证状态)。详细实测、源码依据和偏差分析见 [REPORT.md](REPORT.md)。
 
 ---
 
@@ -219,7 +219,7 @@ python3 -m pytest -q -m 'not scale' --evidence-dir runs/validation
 python3 -m pytest -q -m scale --evidence-dir runs/scale
 ```
 
-非规模测试约 1 分钟。规模测试包括 T9 的六组稠密矩阵、T9 不拆分对照和 T10，约 13 分钟，单进程内存峰值约 600 MiB。每次请用一个新的 `--evidence-dir`。
+非规模测试约 1 分钟。规模测试包括 T9 的六组稠密矩阵、T9 不拆分对照和 T10，约 13 分钟。默认每 plane 512 块时，1,024 plane 的单次 MQSim 运行内存峰值约 4.2 GB，请不要并行跑多个规模测试。每次请用一个新的 `--evidence-dir`。
 
 ---
 
@@ -304,7 +304,7 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 | T9 | 稠密基线（3 拓扑 × 2 布局），另加不拆分对照 | 通过；256×4 估算器 1 低估 57%，保留为已知偏差 |
 | T10 | 墙钟时间与内存摸底，推荐子批大小 | 通过；推荐每批 8,192 页 |
 
-另有上游行为探针（传输率取整、队列参数溢出、ID 列表截断、轨迹解析、首次读分配、SLC 只用 LSB、PCIe 效率）、GC 预算边界、访问接口扩展和进程清理等测试。完整数据见 [REPORT.md](REPORT.md) 和 [evidence/](evidence)。
+第 1 阶段另有机制分析测试（`tests/test_analysis.py`）和 T-PLANE、T-CMD、T-CACHE 测试（`tests/test_plane.py`），包括命令时延的逐 ns 核对、MQSim 命令数与分析轮数的逐层逐 die 核对，以及随机读写混合下的物理不变量检查。另有上游行为探针（传输率取整、队列参数溢出、ID 列表截断、轨迹解析、首次读分配、SLC 只用 LSB、PCIe 效率）、GC 预算边界、访问接口扩展和进程清理等测试。完整数据见 [REPORT.md](REPORT.md) 和 [evidence/](evidence)。
 
 ---
 

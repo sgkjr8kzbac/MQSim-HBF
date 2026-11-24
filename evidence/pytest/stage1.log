@@ -1,0 +1,7 @@
+........................................................................ [ 60%]
+...............x..x.......x....................                          [100%]
+=========================== short test summary info ============================
+XFAIL tests/test_validation.py::test_t5_bandwidth_and_t7_stats - PCIe double changes makespan by 64 ns/batch; strict equality in the task is not reproduced
+XFAIL tests/test_validation.py::test_t8_uniform[16x64-0.01-21] - T8 0.8-1.25 not met, channel/unit term ratio 0.82: coupled bus wait, MQSim/estimate 1.259
+XFAIL tests/test_validation.py::test_t8_uniform[256x4-0.5-1024] - T8 0.8-1.25 not met, channel/unit term ratio 0.71-0.73: coupled bus wait, MQSim/estimate 1.31
+116 passed, 3 xfailed in 859.92s (0:14:19)
