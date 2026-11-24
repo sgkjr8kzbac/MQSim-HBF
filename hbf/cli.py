@@ -7,13 +7,33 @@ from pathlib import Path
 from uuid import uuid4
 
 from .access import LAYOUTS, MODES, Shape, generate, parse_tensors, read_access, tensors_meta, write_access
+from .analysis import analyze
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule
-from .simulator import build, dump, simulate
+from .simulator import build, dump, simulate, write_table
+
+
+def analysis_report(layer_rows, step_rows):
+    report = ["## 机制分析", "",
+              "| 并行组 | Step | 层数 | 读页 | 轮数 | 最少轮数 | plane 利用率 | 均衡损失 | 感测放大 | 读放大 | 传输放大 |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    amplification = {}
+    for row in layer_rows:
+        key = row["group"], row["step"]
+        page, useful, burst = amplification.get(key, (0, 0, 0))
+        amplification[key] = page + row["page_bytes"], useful + row["useful_bytes"], burst + row["burst_bytes"]
+    for row in step_rows:
+        page, useful, burst = amplification[row["group"], row["step"]]
+        report.append(
+            f"| {row['group']} | {row['step']} | {row['layers']} | {row['pages']} | {row['rounds']} | "
+            f"{row['min_rounds']} | {row['utilization']:.3f} | {row['balance_loss']:.2f} | "
+            f"{row['sense_amplification']:.2f} | {page / useful:.2f} | {burst / useful:.2f} |")
+    return report
 
 
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
-             input_csv=None, physical=False, tensors=None):
+             input_csv=None, physical=False, tensors=None, plane_groups=(1,)):
+    """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None."""
     directory.mkdir(parents=True, exist_ok=False)
     generation = {
         "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
@@ -31,22 +51,33 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                    "input_csv": str(input_csv) if input_csv else None,
                                    "argv": sys.argv})
     batches = schedule(cfg, layout, read_access(access_path))
-    result = simulate(cfg, batches, directory, binary, physical=physical)
-    _, _, steps, stats = result
-    report = ["# 本次运行", "", f"布局 `{layout_name}`，子批 {len(batches)} 个。",
-              f"MQSim 用时 {stats['wall_seconds']:.3f} s，峰值 RSS {stats['peak_rss_kib']} KiB。", "",
-              "| Step | 读页 | MQSim ns | MQSim 估算 ns | 理想 HBF ns |",
-              "|---:|---:|---:|---:|---:|"]
-    for row in steps:
-        report.append(f"| {row['step']} | {row['read_pages']} | {row['mqsim_ns']} | "
-                      f"{row['mq_est_ns']} | {row['ideal_ns']:.0f} |")
+    layer_rows, step_rows = analyze(cfg, batches, plane_groups)
+    if layer_rows:
+        write_table(directory / "analysis_layers.csv", layer_rows)
+        write_table(directory / "analysis_steps.csv", step_rows)
+    report = ["# 本次运行", "", f"布局 `{layout_name}`，拓扑 {cfg.channels}×{cfg.chips}，"
+              f"子批 {len(batches)} 个。", ""]
+    if layer_rows:
+        report += analysis_report(layer_rows, step_rows) + [""]
+    result = None
+    if binary is not None:
+        result = simulate(cfg, batches, directory, binary, physical=physical)
+        _, _, steps, stats = result
+        report += ["## MQSim", "",
+                   f"MQSim 用时 {stats['wall_seconds']:.3f} s，峰值 RSS {stats['peak_rss_kib']} KiB。", "",
+                   "| Step | 读页 | MQSim ns | MQSim 估算 ns | 理想 HBF ns |",
+                   "|---:|---:|---:|---:|---:|"]
+        for row in steps:
+            report.append(f"| {row['step']} | {row['read_pages']} | {row['mqsim_ns']} | "
+                          f"{row['mq_est_ns']} | {row['ideal_ns']:.0f} |")
     (directory / "report.md").write_text("\n".join(report) + "\n")
     return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--topology", choices=("16x64", "64x16", "256x4"), default="64x16")
+    parser.add_argument("--topology", default="64x16",
+                        help="16x64, 64x16, 256x4 or any <channels>x<chips per channel>")
     parser.add_argument("--layout", choices=LAYOUTS, default="layer_contiguous")
     parser.add_argument("--mode", choices=MODES, default="dense")
     parser.add_argument("--layers", type=int, default=1)
@@ -67,6 +98,11 @@ def main():
     parser.add_argument("--tensors", help="JSON list or file of stored tensor formats, "
                         'e.g. \'[{"name":"K","bits":2,"dims":128},{"name":"V","bits":16,"dims":128}]\'; '
                         "default BF16 K and V with head_dim channels")
+    parser.add_argument("--plane-group", type=int, action="append", dest="plane_groups",
+                        help="planes per lock-step group for the mechanism analysis; repeat to compare "
+                             "(1 = independent planes, the default)")
+    parser.add_argument("--analysis-only", action="store_true",
+                        help="write the mechanism analysis without building or running MQSim")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
@@ -80,8 +116,10 @@ def main():
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     shape = Shape(args.layers, args.heads, args.head_dim, args.context)
-    pipeline(cfg, shape, args.layout, directory, build(), mode=args.mode, generation=generation,
-             input_csv=args.access_csv, physical=args.physical, tensors=tensors)
+    binary = None if args.analysis_only else build()
+    pipeline(cfg, shape, args.layout, directory, binary, mode=args.mode, generation=generation,
+             input_csv=args.access_csv, physical=args.physical, tensors=tensors,
+             plane_groups=tuple(args.plane_groups or (1,)))
     print(directory.resolve())
 
 

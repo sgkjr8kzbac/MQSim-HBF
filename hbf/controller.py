@@ -8,6 +8,7 @@ class Request:
     lpa: int
     op: str = "R"
     useful_bytes: int = 4096
+    burst_bytes: int = 4096
 
 
 @dataclass(frozen=True)
@@ -19,12 +20,27 @@ class Batch:
     requests: tuple[Request, ...]
 
 
+BURST_BYTES = 64
+
+
 def union_size(intervals):
     end = total = 0
     for lo, hi in sorted(intervals):
         total += max(0, hi - max(lo, end))
         end = max(hi, end)
     return total
+
+
+def burst_bytes(intervals, start, token_bytes, burst=BURST_BYTES):
+    """Bytes moved when a page read returns only the 64 B bursts covering the wanted tokens.
+
+    The OCP HBF base-die spec v0.7.0 (section 4.1) allows read bursts of 64 B to 4 KiB in
+    multiples of 64 B within one NAND page, so the transfer can be smaller than the page while
+    the sensing is always a whole page.
+    """
+    chunks = [((lo - start) * token_bytes // burst, -(-(hi - start) * token_bytes // burst))
+              for lo, hi in intervals]
+    return union_size(chunks) * burst
 
 
 def schedule(cfg, layout, accesses):
@@ -39,7 +55,7 @@ def schedule(cfg, layout, accesses):
         for block in range(access.token_start // tokens, (access.token_end - 1) // tokens + 1):
             start = block * tokens
             lpa = layout.lpa(access.layer, access.kv_head, t, block)
-            group.setdefault(lpa, (t, []))[1].append((
+            group.setdefault(lpa, (t, start, []))[2].append((
                 max(access.token_start, start), min(access.token_end, start + tokens)
             ))
     batches = []
@@ -47,11 +63,11 @@ def schedule(cfg, layout, accesses):
     limit = cfg.batch_pages
     for (step, layer, op), pages in sorted(logical.items(), key=lambda item: (*item[0][:2], item[0][2] == "R")):
         requests = []
-        for lpa, (t, intervals) in sorted(pages.items()):
+        for lpa, (t, start, intervals) in sorted(pages.items()):
             useful = union_size(intervals) * layout.token_bytes(t)
             if op == "W" and useful != layout.tokens(t) * layout.token_bytes(t):
                 raise ValueError("Partial-page prefill write would cause an update read")
-            requests.append(Request(lpa, op, useful))
+            requests.append(Request(lpa, op, useful, burst_bytes(intervals, start, layout.token_bytes(t))))
         for start in range(0, len(requests), limit):
             serial = serials[step, layer]
             serials[step, layer] += 1

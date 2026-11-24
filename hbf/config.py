@@ -159,9 +159,20 @@ class Config:
         return self.unit_lpa(unit, k, base)
 
 
+def parse_topology(topology, named=None):
+    """Channels and chips per channel of a named topology or of any ``<channels>x<chips>``."""
+    if named and topology in named:
+        return tuple(named[topology])
+    try:
+        channels, chips = map(int, topology.split("x"))
+    except (AttributeError, ValueError):
+        raise ValueError(f"Topology {topology!r} is neither named nor <channels>x<chips>") from None
+    return channels, chips
+
+
 def load(topology="64x16", **overrides):
     params = json.loads(PARAMETERS.read_text())
-    channels, chips = params.pop("topologies")[topology]
+    channels, chips = parse_topology(topology, params.pop("topologies"))
     reference = params.pop("calibration_reference")
     if reference["width_gb_s"] * reference["xfer_ns"] != params["page_bytes"]:
         raise ValueError("Reference NAND transfer calibration disagrees with the page size")
