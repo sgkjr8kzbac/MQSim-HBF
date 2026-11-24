@@ -122,8 +122,14 @@ def version(patches):
             "patch_sha256": {p.name: sha256(p) for p in sorted((PACKAGE / "patches").glob("*.patch"))}}
 
 
+GNU_TIME = "/usr/bin/time"
+
+
 def run_timed(command, directory, env, timeout):
-    timed_command = ["/usr/bin/time", "-f", "%M", "-o", "rss_kib.txt", *command]
+    if not os.access(GNU_TIME, os.X_OK):
+        raise RuntimeError(f"GNU time is required at {GNU_TIME} to record peak RSS "
+                           "(install the 'time' package)")
+    timed_command = [GNU_TIME, "-f", "%M", "-o", "rss_kib.txt", *command]
     process = None
     terminated = False
 
@@ -169,6 +175,26 @@ def run_timed(command, directory, env, timeout):
         raise subprocess.CalledProcessError(returncode, timed_command)
 
 
+def check_gc_budget(cfg, batches):
+    """Reject runs whose fresh page allocations could reach MQSim's GC threshold.
+
+    Every write and every first read of an LPA (online_create_entry_for_reads) consumes one
+    free physical page on its plane. Upstream MQSim livelocks instead of finishing once the
+    free block pool falls below the GC threshold with only fully valid blocks.
+    """
+    seen, used = set(), [0] * cfg.units
+    for batch in batches:
+        for req in batch.requests:
+            if req.op == "W" or req.lpa not in seen:
+                used[req.lpa % cfg.units] += 1
+                seen.add(req.lpa)
+    worst = max(range(cfg.units), key=used.__getitem__)
+    if used[worst] > cfg.gc_page_budget:
+        raise ValueError(f"Unit {worst} would allocate {used[worst]} fresh pages, above the "
+                         f"GC-free budget of {cfg.gc_page_budget} pages per plane")
+    return used[worst]
+
+
 def simulate(cfg, batches, directory, binary, *, physical=False, suspension=False, onfi=False,
              overlap=False, timeout=1200):
     directory.mkdir(parents=True, exist_ok=True)
@@ -185,8 +211,9 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     workload_xml(cfg, directory / "workload.xml")
     if not batches or not all(batch.requests for batch in batches):
         raise ValueError("At least one nonempty batch is required")
+    check_gc_budget(cfg, batches)
     expected = {}
-    reads = 0
+    reads = writes = 0
     with (directory / "trace.txt").open("w") as stream:
         previous = -1
         for idx, batch in enumerate(batches):
@@ -200,6 +227,7 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
                     raise ValueError(f"Invalid or duplicate request {key}")
                 expected[key] = idx, req.op
                 reads += req.op == "R"
+                writes += req.op == "W"
                 stream.write(f"{batch.arrival_ns} 0 {lba} {cfg.spp} {int(req.op == 'R')}\n")
 
     flags = {"I1": "completions.csv", "I2": "physical.csv" if physical else None,
@@ -219,8 +247,11 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     stats = flash_stats(directory / "workload_scenario_1.xml")
     stats.update(wall_seconds=elapsed, peak_rss_kib=int((directory / "rss_kib.txt").read_text()))
     dump(directory / "statistics.json", stats)
-    if stats["request_count"] != len(expected) or stats["Issued_Flash_Read_CMD"] != reads:
-        raise ValueError(f"MQSim statistics do not match trace request/read counts: {stats}")
+    if (stats["request_count"] != len(expected) or stats["Issued_Flash_Read_CMD"] != reads
+            or stats["Issued_Flash_Program_CMD"] != writes):
+        raise ValueError(f"MQSim statistics do not match trace request/read/write counts: {stats}")
+    if stats["Issued_Flash_Erase_CMD"] or stats["gc_enqueued"]:
+        raise ValueError(f"Garbage collection ran during the experiment: {stats}")
 
     last = [0] * len(batches)
     for done in completions(directory / "completions.csv"):

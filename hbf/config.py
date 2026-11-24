@@ -111,6 +111,17 @@ class Config:
         # MQSim multiplies in double precision and truncates each plane before summing.
         return self.units * int(plane * (1.0 - self.op_ratio))
 
+    @property
+    def gc_threshold_blocks(self):
+        # GC_and_WL_Unit_Base::GC_and_WL_Unit_Base: max(floor(gc * B), 1), then at least the
+        # 10 in-flight GC requests per plane that SSD_Device::SSD_Device passes in.
+        return max(int(self.gc_threshold * self.blocks_per_plane), 1, 10)
+
+    @property
+    def gc_page_budget(self):
+        """Fresh pages one plane may allocate before the free block pool reaches the threshold."""
+        return max(self.blocks_per_plane - self.gc_threshold_blocks, 0) * self.pages_per_block
+
     def lba(self, lpa):
         if not 0 <= lpa < self.capacity_sectors // self.spp:
             raise ValueError(f"LPA {lpa} exceeds logical capacity")

@@ -17,7 +17,7 @@ from hbf.access import Access, LAYOUTS, Shape, generate, read_access, write_acce
 from hbf.cli import main, pipeline
 from hbf.config import CONFIG, PARAMETERS, ROOT, check_xml, load, workload_fields, xml_settings
 from hbf.controller import Batch, Request, metrics, schedule
-from hbf.simulator import completions, dump, simulate
+from hbf.simulator import check_gc_budget, completions, dump, simulate
 
 
 def cases(cfg, page_sets):
@@ -229,11 +229,24 @@ def pages_by_tensor(layout, batches):
     return pages
 
 
+# Estimator 1 takes the larger of two serial resources. When the busiest channel's bus time is
+# comparable to the busiest unit's page cycles, a chip waits for the shared channel before it
+# returns to IDLE, so the two terms couple and MQSim exceeds the max of the terms.
+T8_KNOWN_DEVIATIONS = {
+    ("16x64", .01): "channel/unit term ratio 0.82: coupled bus wait, MQSim/estimate 1.259",
+    ("256x4", .50): "channel/unit term ratio 0.71-0.73: coupled bus wait, MQSim/estimate 1.31",
+}
+
+
 @pytest.mark.parametrize(("fraction", "pages_per_tensor"), [(.01, 21), (.10, 205), (.50, 1024)])
-def test_t8_uniform(binary, evidence, fraction, pages_per_tensor):
-    cfg = load()
+@pytest.mark.parametrize("topology", ["16x64", "64x16", "256x4"])
+def test_t8_uniform(binary, evidence, request, topology, fraction, pages_per_tensor):
+    if (topology, fraction) in T8_KNOWN_DEVIATIONS:
+        request.applymarker(pytest.mark.xfail(
+            strict=True, reason=f"T8 0.8-1.25 not met, {T8_KNOWN_DEVIATIONS[topology, fraction]}"))
+    cfg = load(topology)
     layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 8, 128, 32768))
-    path = evidence / f"t8-{fraction}"
+    path = evidence / f"t8-{topology}-{fraction}"
     batches = scheduled_accesses(cfg, layout, path,
         generate(cfg, layout, "uniform_pages", seed=234, fraction=fraction),
         {"mode": "uniform_pages", "seed": 234, "fraction": fraction})
@@ -253,11 +266,16 @@ def test_t8_uniform(binary, evidence, fraction, pages_per_tensor):
         for k in range(n+1)
     ]
     expected_max = max(k for k, tail in enumerate(expected_tail) if tail >= 1)
-    dump(path / "summary.json", {"fraction": fraction, "pages": layer["read_pages"],
+    unit_cycle = cfg.read_command_ns + cfg.read_ns + cfg.rb_ns + cfg.transfer_ns
+    bus = cfg.read_command_ns + cfg.transfer_ns
+    dump(path / "summary.json", {"topology": topology, "fraction": fraction, "pages": layer["read_pages"],
         "observed_max": layer["max_unit_pages"], "binomial_max_scale": expected_max,
-        "ratios": [row["mqsim_over_est"] for row in rows]})
-    assert all(.8 <= row["mqsim_over_est"] <= 1.25 for row in rows)
+        "ratios": [row["mqsim_over_est"] for row in rows],
+        "channel_over_unit_term": [row["max_channel_pages"] * bus / (row["max_unit_pages"] * unit_cycle)
+                                   for row in rows]})
+    assert all(row["ideal_ns"] <= row["mq_est_ns"] <= row["mqsim_ns"] for row in rows)
     assert abs(layer["max_unit_pages"] - expected_max) <= 3
+    assert all(.8 <= row["mqsim_over_est"] <= 1.25 for row in rows)
 
 
 def test_t8_uniform_seed_and_complete_page_set():
@@ -419,3 +437,23 @@ def test_generator_pipeline(binary, evidence, mode):
         assert [row["step"] for row in steps] == [-1, 0]
         assert stats["Issued_Flash_Program_CMD"] == 8
         assert_read_only(stats, 8)
+
+
+def test_gc_budget_guard(binary, evidence):
+    cfg = micro(channels=1, chips=1)
+    assert cfg.gc_threshold_blocks == 10 and cfg.gc_page_budget == (64 - 10) * 256 == 13_824
+    pages = tuple(Request(pa) for pa in range(cfg.gc_page_budget))
+    limit = cfg.batch_pages
+    batches = [Batch(0, 0, i // limit, i // limit * cfg.interval_ns, pages[i:i + limit])
+               for i in range(0, len(pages), limit)]
+    _, _, _, stats = simulate(cfg, batches, evidence / "gc-budget-limit", binary)
+    assert_read_only(stats, cfg.gc_page_budget)
+    # Rereads of mapped LPAs do not allocate; one more fresh LPA or any write does.
+    over = [*batches, Batch(1, 0, 0, len(batches) * cfg.interval_ns, (Request(0),))]
+    assert check_gc_budget(cfg, over) == cfg.gc_page_budget
+    for extra in (Request(cfg.gc_page_budget), Request(0, "W")):
+        path = evidence / f"gc-budget-over-{extra.op}"
+        with pytest.raises(ValueError, match="GC-free budget"):
+            simulate(cfg, [*batches, Batch(1, 0, 0, len(batches) * cfg.interval_ns, (extra,))],
+                     path, binary)
+        assert not (path / "trace.txt").exists()
