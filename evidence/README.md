@@ -3,3 +3,5 @@
 `t9.csv` 汇总六个稠密实验。`t10.csv` 和 `t10-split-summary.json` 来自独立的连续性能测试。`validation/` 保留微基准和原版行为探针的主要数值，`pytest/` 保留测试结束状态。`versions.json` 记录代表性测试运行实际使用的源码和二进制版本。
 
 完整记录保存在当前工作区的 `runs/checks/`、`runs/final-t9-*/`、`runs/performance-final/` 和 `runs/diagnostic-*/`。克隆仓库后可用 README 中的命令在本地重建这些记录。
+
+第二轮审查修改：`t8-topologies.csv` 是三种拓扑 × 三档的 T8 时延比与通道项/单元项之比，`t9-unsplit.csv` 是单层一次提交与 4×8K 拆分的对照，`pytest/review-round2.log` 是对应的测试日志。
