@@ -3,10 +3,10 @@ from statistics import mean
 
 import pytest
 
-from hbf.access import Shape
+from hbf.access import LAYOUTS, Shape, generate
 from hbf.cli import pipeline
 from hbf.config import load
-from hbf.controller import Batch, Request
+from hbf.controller import Batch, Request, schedule
 from hbf.simulator import dump, simulate
 
 
@@ -34,6 +34,10 @@ def run_dense_case(binary, evidence, topology, layout, expected_mq_est_ns):
     assert all(row["read_pages"] == 32768 for row in layers)
     assert steps[0]["read_pages"] == 1048576
     assert stats["gc_enqueued"] == stats["Issued_Flash_Erase_CMD"] == 0
+    # Independent checks: each estimator-1 term is a serial resource MQSim must respect, and
+    # the ideal bound drops the command and transfer overheads, so ideal <= estimate <= MQSim.
+    for row in (*batches, *layers, *steps):
+        assert row["ideal_ns"] <= row["mq_est_ns"] <= row["mqsim_ns"]
     if layout == "layer_contiguous":
         assert all(row["active_units"] == 1024 and row["max_unit_pages"] == 32 for row in layers)
         ideal_layer_ns = 131_072
@@ -70,7 +74,7 @@ def test_t9_dense_matrix(binary, evidence, topology, contiguous_baseline, interl
     interleaved_ns, interleaved_est_ns = interleaved_baseline
     contiguous = run_dense_case(binary, evidence, topology, "layer_contiguous", contiguous_est_ns)
     interleaved = run_dense_case(binary, evidence, topology, "vllm_interleaved", interleaved_est_ns)
-    # The pinned baseline reproduced these service times. Use tolerance for regressions.
+    # Regression baseline only: these values were measured on the pinned build, not derived.
     for summary, expected_ns in ((contiguous, contiguous_ns), (interleaved, interleaved_ns)):
         assert summary["min_layer_ns"] == pytest.approx(expected_ns, rel=.05)
         assert summary["max_layer_ns"] == pytest.approx(expected_ns, rel=.05)
@@ -105,3 +109,34 @@ def test_t10_64k_split_comparison(binary, evidence):
                          "reconstructed_service_ns": layers[0]["mqsim_ns"]}
     dump(evidence / "t10-split-summary.json", result)
     assert all(value["wall_seconds"] > 0 for value in result.values())
+
+
+# Pre-review reference values for one unsplit 32,768-page layer (context summary, section 4.4).
+PRE_REVIEW_UNSPLIT_NS = {("16x64", "layer_contiguous"): 728_000, ("256x4", "layer_contiguous"): 272_000}
+
+
+@pytest.mark.scale
+@pytest.mark.parametrize("layout", ["layer_contiguous", "vllm_interleaved"])
+@pytest.mark.parametrize("topology", ["16x64", "64x16", "256x4"])
+def test_t9_unsplit_layer(binary, evidence, topology, layout):
+    """Submit layer 0 as one open-loop burst to quantify the cost of 8K sub-batching."""
+    cfg = load(topology)
+    pages = LAYOUTS[layout](cfg, Shape(32, 8, 128, 32768))
+    split = schedule(cfg, pages, (a for a in generate(cfg, pages, "dense") if a.layer == 0))
+    requests = tuple(req for batch in split for req in batch.requests)
+    assert len(split) == 4 and len(requests) == 32768
+    directory = evidence / f"t9-unsplit-{topology}-{layout}"
+    rows, _, _, stats = simulate(cfg, [Batch(0, 0, 0, 0, requests)], directory, binary, timeout=1800)
+    split_rows, _, _, _ = simulate(cfg, split, evidence / f"t9-split-{topology}-{layout}", binary)
+    unsplit_ns = rows[0]["mqsim_ns"]
+    split_ns = sum(row["mqsim_ns"] for row in split_rows)
+    dump(directory / "summary.json", {
+        "topology": topology, "layout": layout, "unsplit_ns": unsplit_ns, "split_ns": split_ns,
+        "split_over_unsplit": split_ns / unsplit_ns, "mq_est_unsplit_ns": rows[0]["mq_est_ns"],
+        "ideal_unsplit_ns": rows[0]["ideal_ns"], "wall_seconds": stats["wall_seconds"],
+        "peak_rss_kib": stats["peak_rss_kib"],
+    })
+    assert rows[0]["ideal_ns"] <= rows[0]["mq_est_ns"] <= unsplit_ns
+    reference = PRE_REVIEW_UNSPLIT_NS.get((topology, layout))
+    if reference is not None:
+        assert unsplit_ns == pytest.approx(reference, rel=.05)
