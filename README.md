@@ -78,6 +78,8 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 - `--read-plane-ns δ`：n plane 读命令改为单 plane 命令加 (n−1)·δ，对应 base die 并行或广播地址；
 - `--coalesce-ns W`：新到的事务先等 W 再下发，同一批中到达同一 die 的页合成一条命令，去掉"第一页到达空闲 die 时单独下发"的现象。此时每层每 die 的读命令数正好等于机制分析的轮数。
 
+`--cache-read`（T-CACHE 补丁）给每个 plane 两个缓冲：感测完成后数据移入 cache，die 立即可以开始下一轮感测，同时传出上一轮的数据；最多允许一批数据在等待传出时再发新命令，控制器让命令优先于排队的数据传输。OCP 规范要求每个 bank 至少两个缓冲。
+
 ### 模块一览
 
 | 模块 | 作用 |
@@ -126,7 +128,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | 读一个张量的部分通道 | 需要通道主序的布局，目前不支持 |
 | 同一张量分段使用不同位宽 | 例如 KIVI 的全精度残差窗口，目前要声明成两个张量 |
 | 按块存的元数据 | 例如 Quest 的页摘要，它每块一行而不是每 token 一行，需要单独的块索引维度 |
-| HBF 专有器件行为 | cache read、感测与传输重叠、刷新、读扰动、热，均未建模 |
+| HBF 专有器件行为 | 刷新、读扰动、热，均未建模；cache read 由 T-CACHE 提供，但只覆盖用户读 |
 
 ### 建模假设（解读结果前请先看）
 
@@ -192,7 +194,7 @@ python3 -m hbf.cli --analysis-only --topology 16x64 --layers 32 --context 32768 
 真实层级（16 die × 64 plane），先整体写入再读，plane 独立寻址，使用 HBF 命令模型（每多一个 plane 10 ns，合并窗口 1 µs）：
 
 ```bash
-python3 -m hbf.cli --topology 16x1 --planes 64 --plane-rule independent --read-plane-ns 10 --coalesce-ns 1000 --prefill --mode uniform_pages --fraction 0.05 --context 8192
+python3 -m hbf.cli --topology 16x1 --planes 64 --plane-rule independent --read-plane-ns 10 --coalesce-ns 1000 --cache-read --prefill --mode uniform_pages --fraction 0.05 --context 8192
 ```
 
 导入已有的访问记录：
@@ -278,10 +280,11 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 | I4 | 修复 | 去掉结尾的 `cin.get()`，便于批量运行 | `HBF_I4` 存在即开启 |
 | T-SUSP | 时序对照 | 补上 program 挂起缺少的 `break`，修正 TSU 构造函数传参错序，以及单 die 挂起和恢复的记账 | `HBF_T_SUSP` |
 | T-ONFI | 时序对照 | 把 t_CS、t_WC、t_WB、t_RR 暴露到 XML，默认值与原版一致 | `HBF_T_ONFI` |
+| T-CACHE | 器件扩展 | cache read：用户读感测完成后数据进入 cache，die 可立即开始下一轮感测；双缓冲约束；命令优先于排队的数据传出 | `HBF_T_CACHE` |
 | T-CMD | 器件扩展 | HBF 命令模型：读命令的逐 plane 步长可设；TSU 合并窗口，新事务等待窗口结束再统一下发 | `HBF_T_READ_PLANE_NS`、`HBF_T_COALESCE_NS` |
 | T-PLANE | 器件扩展 | 命令时间表从 1–4 个 plane 扩展到 64 个（原版超过 4 个 plane 会越界读）；plane 掩码改为 64 位（原版 32 位溢出）；multi-plane 合并规则可选 `independent` / `lockstep`；t_DBSY 可在 XML 中设置 | `HBF_T_PLANE=independent\|lockstep` |
 
-补丁按 `hbf/patches/series` 的顺序应用。主链路默认开启 I1、I3、I4，需要时开启 I2；T 类补丁默认关闭，T-PLANE 在指定 `--plane-rule` 时开启，T-CMD 在指定 `--read-plane-ns` 或 `--coalesce-ns` 时开启。T-PLANE 对 1–4 个 plane 的命令时间不变，64 位掩码在 32 个 plane 以内结果相同。已实测确认：所有开关都关闭时，输出与未打补丁的原版**逐位一致**；只开 I 类补丁时，统计输出不变。
+补丁按 `hbf/patches/series` 的顺序应用。主链路默认开启 I1、I3、I4，需要时开启 I2；T 类补丁默认关闭，T-PLANE 在指定 `--plane-rule` 时开启，T-CMD 在指定 `--read-plane-ns` 或 `--coalesce-ns` 时开启，T-CACHE 在指定 `--cache-read` 时开启。T-PLANE 对 1–4 个 plane 的命令时间不变，64 位掩码在 32 个 plane 以内结果相同。已实测确认：所有开关都关闭时，输出与未打补丁的原版**逐位一致**；只开 I 类补丁时，统计输出不变。
 
 ---
 
@@ -319,7 +322,7 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 │   ├── config.py        参数、XML 生成与校验、地址映射
 │   ├── cli.py           命令行入口
 │   ├── configs/         参数 JSON、设备模板、三种拓扑的 XML
-│   ├── patches/         I1–I4、T-SUSP、T-ONFI、T-PLANE、T-CMD；series 规定应用顺序
+│   ├── patches/         I1–I4、T-SUSP、T-ONFI、T-PLANE、T-CMD、T-CACHE；series 规定应用顺序
 │   ├── mqsim/           MQSim 上游源码（固定 commit）
 │   ├── mqsim.commit     固定的上游 commit
 │   └── mqsim.sha256     逐文件校验清单

@@ -121,6 +121,9 @@ def main():
     parser.add_argument("--read-plane-ns", type=int,
                         help="T-CMD: a read command for n planes costs the single-plane command plus (n-1) "
                              "times this step, instead of ONFI's 6*t_WC + t_DBSY per extra plane")
+    parser.add_argument("--cache-read", action="store_true",
+                        help="T-CACHE: two buffers per plane, so a die senses the next read while the "
+                             "previous pages are transferred")
     parser.add_argument("--coalesce-ns", type=int,
                         help="T-CMD: hold newly received transactions this long before dispatching, so that "
                              "a batch leaves as full multi-plane commands")
@@ -136,7 +139,7 @@ def main():
     try:
         cfg = load(args.topology, batch_pages=args.batch_pages, planes=args.planes,
                    plane_rule=args.plane_rule, dbsy_ns=args.dbsy_ns, coalesce_ns=args.coalesce_ns,
-                   read_plane_ns=args.read_plane_ns)
+                   read_plane_ns=args.read_plane_ns, cache_read=args.cache_read)
         tensors = parse_tensors(args.tensors)
         for group in args.plane_groups or (1,):
             check_group(cfg, group)

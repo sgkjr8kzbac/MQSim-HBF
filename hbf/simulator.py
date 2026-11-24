@@ -244,7 +244,8 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
              "I3": "1", "I4": "1", "T_SUSP": "1" if suspension else None,
              "T_ONFI": "1" if onfi else None, "T_PLANE": cfg.plane_rule,
              "T_COALESCE_NS": None if cfg.coalesce_ns is None else str(cfg.coalesce_ns),
-             "T_READ_PLANE_NS": None if cfg.read_plane_ns is None else str(cfg.read_plane_ns)}
+             "T_READ_PLANE_NS": None if cfg.read_plane_ns is None else str(cfg.read_plane_ns),
+             "T_CACHE": "1" if cfg.cache_read else None}
     env = {key: value for key, value in os.environ.items() if not key.startswith("HBF_")}
     env.update({f"HBF_{key}": value for key, value in flags.items() if value is not None})
     command = [str(binary), "-i", "device.xml", "-w", "workload.xml"]

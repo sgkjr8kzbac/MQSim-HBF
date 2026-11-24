@@ -52,6 +52,7 @@ class Config:
     dbsy_ns: int | None = None
     coalesce_ns: int | None = None
     read_plane_ns: int | None = None
+    cache_read: bool = False
 
     def __post_init__(self):
         if any(type(n) is not int or not 1 <= n <= 65535 for n in self.geometry):
@@ -69,6 +70,9 @@ class Config:
         if self.coalesce_ns is not None and (type(self.coalesce_ns) is not int or self.coalesce_ns <= 0
                                              or self.scheduler != "PRIORITY_OUT_OF_ORDER"):
             raise ValueError("A coalescing window must be a positive integer with PRIORITY_OUT_OF_ORDER")
+        if type(self.cache_read) is not bool or self.cache_read and (
+                self.scheduler != "PRIORITY_OUT_OF_ORDER" or self.suspend != "NONE"):
+            raise ValueError("Cache read (T-CACHE) needs PRIORITY_OUT_OF_ORDER and no suspension")
         for name in ("page_bytes", "sector_bytes", "pages_per_block", "blocks_per_plane"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be a positive integer")

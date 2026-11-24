@@ -12,11 +12,11 @@ from hbf.controller import Batch, Request, schedule
 from hbf.simulator import completions, simulate
 
 
-def die_rounds(cfg, requests, group):
+def die_rounds(cfg, requests, group, placed=None):
     """Sum over dies of the rounds each die needs (independent: group 1; lock-step: whole die)."""
     offsets = defaultdict(set)
     for req in requests:
-        die, plane, offset = locate(cfg, req.lpa)
+        die, plane, offset = locate(cfg, req.lpa, placed)
         offsets[die, plane // group].add(offset)
     rounds = defaultdict(int)
     for (die, _), values in offsets.items():
@@ -164,4 +164,58 @@ def test_coalesced_command_time(binary, evidence, planes, step, window):
 def test_patch_series_lists_every_patch():
     from hbf.simulator import patch_series
     names = [path.name for path in patch_series()]
-    assert names[-2:] == ["T-SUSP.patch", "T-CMD.patch"] and len(names) == len(set(names)) == 8
+    assert names[-3:] == ["T-SUSP.patch", "T-CMD.patch", "T-CACHE.patch"] and len(names) == len(set(names)) == 9
+
+
+def cache_cfg(**overrides):
+    return load("16x64", **({"channels": 1, "chips": 1, "planes": 64, "aggregate_gb_s": 64,
+                             "plane_rule": "independent", "read_plane_ns": 10, "coalesce_ns": 500}
+                            | overrides))
+
+
+@pytest.mark.parametrize("name, overrides, pages, plain, cached", [
+    # One plane: the next sensing hides only the 64 ns transfer of the previous page.
+    ("chip", {"planes": 1, "plane_rule": None, "read_plane_ns": None, "coalesce_ns": None}, 4, 17_881, 17_689),
+    # 64 planes, sensing-bound: 500 + 920 + 4 x 4116 + 3 x 920 + 64 x 64 + 1.
+    ("sense-bound", {}, 256, 37_029, 24_741),
+    # 64 planes at 16 GB/s, transfer-bound: the third sensing waits until the first batch left the cache.
+    ("transfer-bound", {"aggregate_gb_s": 16}, 192, 64_761, 56_529),
+])
+def test_cache_read_timing(binary, evidence, name, overrides, pages, plain, cached):
+    observed = []
+    for cache in (False, True):
+        cfg = cache_cfg(cache_read=cache, **overrides)
+        batches = [Batch(0, 0, 0, 0, tuple(Request(p) for p in range(pages)))]
+        path = evidence / f"t-cache-{name}-{cache}"
+        rows, _, _, stats = simulate(cfg, batches, path, binary, physical=True)
+        observed.append(rows[0]["mqsim_ns"])
+        assert stats["Issued_Flash_Read_CMD"] + stats["Issued_Flash_Multiplane_Read_CMD"] == pages // cfg.planes
+    assert observed == [plain, cached]
+    if name == "transfer-bound":
+        issues = sorted({int(row[0]) for row in csv.reader((path / "physical.csv").open()) if row[1] == "issue"})
+        assert issues == [500, 5_536, 22_840]
+
+
+def test_cache_read_keeps_rounds(binary, evidence):
+    """Cache read changes when rounds start, not how many there are."""
+    shape = Shape(2, 8, 128, 8192)
+    counts = {}
+    for cache in (False, True):
+        cfg = load("16x1", planes=64, blocks_per_plane=64, plane_rule="lockstep", read_plane_ns=10,
+                   coalesce_ns=1000, cache_read=cache)
+        path = evidence / f"t-cache-rounds-{cache}"
+        _, layers, _, stats = pipeline(cfg, shape, "layer_contiguous", path, binary, mode="uniform_pages",
+                                       generation={"fraction": .1, "seed": 3}, prefill_layout=True)
+        batches = schedule(cfg, LAYOUTS["layer_contiguous"](cfg, shape), read_access(path / "access.csv"))
+        offsets = placement(cfg, batches)
+        rounds = sum(die_rounds(cfg, [r for r in b.requests if r.op == "R"], 64, offsets)[0]
+                     for b in batches if any(r.op == "R" for r in b.requests))
+        counts[cache] = (stats["Issued_Flash_Read_CMD"] + stats["Issued_Flash_Multiplane_Read_CMD"], rounds,
+                         sum(row["mqsim_ns"] for row in layers if row["step"] == 0))
+    assert counts[False][0] == counts[False][1] == counts[True][0]
+    assert counts[True][2] < counts[False][2]
+
+
+def test_cache_read_rejects_suspension():
+    with pytest.raises(ValueError, match="T-CACHE"):
+        load("16x64", cache_read=True, suspend="PROGRAM")
