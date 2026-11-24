@@ -6,26 +6,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from .access import LAYOUTS, MODES, Shape, read_access, write_access, generate
+from .access import LAYOUTS, MODES, Shape, generate, parse_tensors, read_access, tensors_meta, write_access
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule
 from .simulator import build, dump, simulate
 
 
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
-             input_csv=None, physical=False):
+             input_csv=None, physical=False, tensors=None):
     directory.mkdir(parents=True, exist_ok=False)
     generation = {
         "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
         "hot_fraction": .5, "hot_units": 1,
     } | (generation or {})
-    layout = LAYOUTS[layout_name](cfg, shape)
+    layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
     access_path = directory / "access.csv"
     if input_csv is None:
         write_access(access_path, generate(cfg, layout, mode, **generation))
     else:
         write_access(access_path, read_access(input_csv))
     dump(directory / "meta.json", {"shape": asdict(shape), "layout": layout_name,
+                                   "tensors": tensors_meta(layout),
                                    "generator": {"mode": mode, **generation} if input_csv is None else None,
                                    "input_csv": str(input_csv) if input_csv else None,
                                    "argv": sys.argv})
@@ -63,6 +64,9 @@ def main():
                         help=f"maximum pages per sub-batch (1–{MAX_BATCH_PAGES})")
     parser.add_argument("--physical", action="store_true")
     parser.add_argument("--access-csv", type=Path)
+    parser.add_argument("--tensors", help="JSON list or file of stored tensor formats, "
+                        'e.g. \'[{"name":"K","bits":2,"dims":128},{"name":"V","bits":16,"dims":128}]\'; '
+                        "default BF16 K and V with head_dim channels")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
@@ -72,11 +76,12 @@ def main():
     )}
     try:
         cfg = load(args.topology, batch_pages=args.batch_pages)
-    except ValueError as error:
+        tensors = parse_tensors(args.tensors)
+    except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     shape = Shape(args.layers, args.heads, args.head_dim, args.context)
     pipeline(cfg, shape, args.layout, directory, build(), mode=args.mode, generation=generation,
-             input_csv=args.access_csv, physical=args.physical)
+             input_csv=args.access_csv, physical=args.physical, tensors=tensors)
     print(directory.resolve())
 
 

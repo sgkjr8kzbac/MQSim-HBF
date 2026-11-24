@@ -23,13 +23,21 @@ python3 -m pytest -q -m scale --evidence-dir runs/scale
 
 ## 输入和输出
 
-`access.csv` 的表头为 `step,layer,kv_head,kind,op,token_start,token_end,bits`。层和头从 0 开始，prefill 用 step −1，token 区间左闭右开，位宽为 16。用 `--access-csv PATH` 导入已有记录，并通过 `--layers`、`--heads`、`--head-dim`、`--context` 指定形状。默认上下文及预留范围相同。读区间重叠时，有用字节按并集计。写仅支持 prefill 的满页 token 写入。
+`access.csv` 的表头为 `step,layer,kv_head,kind,op,token_start,token_end,bits`。层和头从 0 开始，prefill 用 step −1，token 区间左闭右开。`kind` 是张量名，`bits` 必须等于该张量的存储位宽。
+
+默认张量为 BF16 的 `K`、`V`，每 token 有 head_dim 个通道，每页 16 个 token，旧的访问记录可以直接使用。压缩方法用 `--tensors` 声明自己的存储格式，例如 KIVI 式的 2 bit K 加 16 bit 量化参数：
+
+```bash
+python3 -m hbf.cli --topology 64x16 --mode dense --tensors '[{"name":"K","bits":2,"dims":128},{"name":"K_scale","bits":16,"dims":2},{"name":"V","bits":16,"dims":128}]'
+```
+
+每个张量的每页 token 数为 `页字节 × 8 ÷ (dims × bits)`，每 token 须为整字节。`layer_contiguous` 按 (层, 张量, 头) 依次预留连续区域。`vllm_interleaved` 要求所有张量每页 token 数相同。张量规格写入运行目录的 `meta.json`。读同一张量的部分通道（动态通道选择）尚不支持，需要通道主序的布局。用 `--access-csv PATH` 导入已有记录，并通过 `--layers`、`--heads`、`--head-dim`、`--context` 指定形状。默认上下文及预留范围相同。读区间重叠时，有用字节按并集计。写仅支持 prefill 的满页 token 写入。
 
 可选布局为 `layer_contiguous`、`vllm_interleaved`。生成模式包括 `dense`、`uniform_pages`、`same_unit`、`distinct_units`、`same_channel_distinct_units`、`hot_unit` 和 `write_then_read`。定向模式受地址空间约束，形状应覆盖所需页面。生成参数见 `--help`。
 
 运行目录保存输入、形状、种子、参数和版本，MQSim 轨迹、设备和 workload XML、原始 XML 和 stdout、逐请求完成日志，以及子批、层、步指标 CSV 和简报。`--physical` 另外保存物理事件 CSV。层、步的时延是子批服务时间之和，结果表同时保留拆分和未拆分估算。
 
-`--batch-pages` 接受 1–8,192。T10 的大批性能探针通过底层接口提交显式批次。
+`--batch-pages` 接受 1–8,192。每个 plane 在一次运行中新分配的物理页（写，以及首次读某个 LPA）不得超过 GC 预算，默认配置为 13,824 页，超出时在写轨迹前报错。上游 MQSim 超过这个量后会陷入死循环，而不是执行 GC。T10 的大批性能探针通过底层接口提交显式批次。
 
 ## 补丁开关
 

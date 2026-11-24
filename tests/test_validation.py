@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from hbf.access import Access, LAYOUTS, Shape, generate, read_access, write_access
+from hbf.access import Access, LAYOUTS, Shape, TensorSpec, generate, parse_tensors, read_access, write_access
 from hbf.cli import main, pipeline
 from hbf.config import CONFIG, PARAMETERS, ROOT, check_xml, load, workload_fields, xml_settings
 from hbf.controller import Batch, Request, metrics, schedule
@@ -457,3 +457,68 @@ def test_gc_budget_guard(binary, evidence):
             simulate(cfg, [*batches, Batch(1, 0, 0, len(batches) * cfg.interval_ns, (extra,))],
                      path, binary)
         assert not (path / "trace.txt").exists()
+
+
+def test_default_tensors_keep_legacy_lpas():
+    cfg = load()
+    shape = Shape(3, 2, 128, 535)  # 34 blocks, the last one partial
+    blocks = 34
+    contiguous = LAYOUTS["layer_contiguous"](cfg, shape, base=7)
+    interleaved = LAYOUTS["vllm_interleaved"](cfg, shape, base=7)
+    for layer in range(3):
+        for head in range(2):
+            for kind in (0, 1):
+                for block in range(blocks):
+                    legacy_contiguous = 7 + ((layer * 2 + kind) * 2 + head) * blocks + block
+                    legacy_interleaved = 7 + (((block * 3 + layer) * 2 + head) * 2 + kind)
+                    assert contiguous.lpa(layer, head, kind, block) == legacy_contiguous
+                    assert interleaved.lpa(layer, head, kind, block) == legacy_interleaved
+                    assert contiguous.decode(legacy_contiguous) == (layer, head, kind, block)
+                    assert interleaved.decode(legacy_interleaved) == (layer, head, kind, block)
+
+
+KIVI_LIKE = (TensorSpec("K", 2, 128), TensorSpec("K_scale", 16, 2), TensorSpec("V", 16, 64))
+
+
+def test_tensor_specs_layout_and_useful_bytes():
+    cfg = load()
+    shape = Shape(2, 2, 128, 2000)
+    layout = LAYOUTS["layer_contiguous"](cfg, shape, base=5, tensors=KIVI_LIKE)
+    assert layout.tokens_per_page == (128, 1024, 32)
+    assert layout.block_counts == (16, 2, 63)
+    lpas = [layout.lpa(layer, head, t, block)
+            for layer in range(2) for t in range(3) for head in range(2)
+            for block in range(layout.blocks(t))]
+    assert lpas == list(range(5, 5 + layout.pages))
+    assert all(layout.lpa(*layout.decode(pa)) == pa for pa in lpas)
+    accesses = [Access(0, 1, 1, "K", "R", 0, 100, 2), Access(0, 1, 1, "K_scale", "R", 0, 100, 16),
+                Access(0, 1, 1, "V", "R", 30, 40, 16)]
+    requests = schedule(cfg, layout, accesses)[0].requests
+    assert [req.useful_bytes for req in requests] == [100 * 32, 100 * 4, 2 * 128, 8 * 128]
+    assert metrics(cfg, requests)["read_amplification"] == 4 * 4096 / (3200 + 400 + 256 + 1024)
+    for bad in (replace(accesses[0], bits=16), replace(accesses[0], kind="Q")):
+        with pytest.raises(ValueError, match="Invalid logical access"):
+            schedule(cfg, layout, [bad])
+    with pytest.raises(ValueError, match="same tokens per page"):
+        LAYOUTS["vllm_interleaved"](cfg, shape, tensors=KIVI_LIKE)
+    uniform = LAYOUTS["vllm_interleaved"](cfg, shape, tensors=(
+        TensorSpec("K", 8, 128), TensorSpec("V", 8, 128), TensorSpec("R", 4, 256)))
+    assert uniform.lpa(1, 1, 2, 3) == ((3 * 2 + 1) * 2 + 1) * 3 + 2
+    assert uniform.decode(uniform.lpa(1, 1, 2, 3)) == (1, 1, 2, 3)
+    for spec in ({"name": "K", "bits": 3, "dims": 5}, {"name": "K-1", "bits": 8, "dims": 1},
+                 {"name": "K", "bits": 0, "dims": 8}):
+        with pytest.raises(ValueError, match="Invalid tensor spec"):
+            TensorSpec(**spec)
+
+
+def test_tensor_specs_pipeline_and_meta(binary, evidence):
+    cfg = micro()
+    text = json.dumps([asdict(spec) for spec in KIVI_LIKE])
+    assert parse_tensors(text) == KIVI_LIKE
+    directory = evidence / "tensor-specs"
+    _, _, steps, stats = pipeline(cfg, Shape(1, 1, 128, 256), "layer_contiguous", directory, binary,
+                                  tensors=parse_tensors(text))
+    assert json.loads((directory / "meta.json").read_text())["tensors"] == json.loads(text)
+    assert steps[0]["read_pages"] == 2 + 1 + 8 == stats["Issued_Flash_Read_CMD"]
+    assert steps[0]["useful_bytes"] == 256 * (32 + 4 + 128)
+    assert {row["kind"] for row in csv.DictReader((directory / "access.csv").open())} == {"K", "K_scale", "V"}
