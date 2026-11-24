@@ -94,6 +94,9 @@ def test_hierarchy_commands_follow_rounds(hierarchy_runs):
     ({"planes": 65}, "at most 64"),
     ({"plane_rule": "free"}, "plane_rule"),
     ({"dbsy_ns": 0}, "t_DBSY"),
+    ({"read_plane_ns": 10}, "per-plane read command step"),
+    ({"coalesce_ns": 0}, "coalescing window"),
+    ({"coalesce_ns": 100, "scheduler": "OUT_OF_ORDER"}, "coalescing window"),
 ])
 def test_plane_config_validation(overrides, message):
     with pytest.raises(ValueError, match=message):
@@ -109,11 +112,16 @@ READ_COMMANDS = {"48", "50"}  # CMD_READ_PAGE, CMD_READ_PAGE_MULTIPLANE
     ("vllm_interleaved", Shape(3, 5, 128, 1000), "uniform_pages", False),
 ])
 @pytest.mark.parametrize("rule, group", [("independent", 1), ("lockstep", 8)])
+@pytest.mark.parametrize("coalesce", [None, 1000])
 def test_analysis_offsets_follow_mqsim_allocation(binary, evidence, layout_name, shape, mode, prefill,
-                                                 rule, group):
-    """Per layer and die, MQSim issues the analysed rounds plus at most one lone first page."""
-    cfg = load("2x1", planes=8, blocks_per_plane=16, plane_rule=rule, aggregate_gb_s=128)
-    path = evidence / f"t-plane-align-{layout_name}-{shape.context}-{prefill}-{rule}"
+                                                 rule, group, coalesce):
+    """Per layer and die, MQSim issues the analysed rounds plus at most one lone first page.
+
+    With the T-CMD coalescing window the lone first page disappears and the counts are equal.
+    """
+    cfg = load("2x1", planes=8, blocks_per_plane=16, plane_rule=rule, aggregate_gb_s=128,
+               coalesce_ns=coalesce)
+    path = evidence / f"t-plane-align-{layout_name}-{shape.context}-{prefill}-{rule}-{coalesce}"
     pipeline(cfg, shape, layout_name, path, binary, mode=mode, generation={"fraction": .3, "seed": 5},
              physical=True, prefill_layout=prefill)
     batches = schedule(cfg, LAYOUTS[layout_name](cfg, shape), read_access(path / "access.csv"))
@@ -134,4 +142,26 @@ def test_analysis_offsets_follow_mqsim_allocation(binary, evidence, layout_name,
         for (die, _), values in needed.items():
             rounds[die] = max(rounds[die], len(values))
         for die, count in rounds.items():
-            assert count <= len(issued[batch.step, batch.layer, die]) <= count + 1
+            commands = len(issued[batch.step, batch.layer, die])
+            assert commands == count if coalesce else count <= commands <= count + 1
+
+
+@pytest.mark.parametrize("planes, step, window", [(8, 10, 500), (64, 0, 2000), (64, 10, 300), (4, None, 1000)])
+def test_coalesced_command_time(binary, evidence, planes, step, window):
+    """T-CMD: after the window the whole die leaves as one command of cmd(1) + (n-1) * step."""
+    cfg = load("16x64", channels=1, chips=1, planes=planes, aggregate_gb_s=64, plane_rule="independent",
+               read_plane_ns=step, coalesce_ns=window)
+    batches = [Batch(0, 0, 0, 0, tuple(Request(p) for p in range(planes)))]
+    rows, _, _, stats = simulate(cfg, batches, evidence / f"t-cmd-{planes}-{step}-{window}", binary)
+    expected = (window + cfg.multiplane_read_command_ns(planes) + cfg.read_ns + cfg.rb_ns
+                + planes * cfg.transfer_ns + cfg.host_ns)
+    assert rows[0]["mqsim_ns"] == expected
+    assert (stats["Issued_Flash_Read_CMD"], stats["Issued_Flash_Multiplane_Read_CMD"]) == (0, 1)
+    if step is not None:
+        assert cfg.multiplane_read_command_ns(planes) == 290 + (planes - 1) * step
+
+
+def test_patch_series_lists_every_patch():
+    from hbf.simulator import patch_series
+    names = [path.name for path in patch_series()]
+    assert names[-2:] == ["T-SUSP.patch", "T-CMD.patch"] and len(names) == len(set(names)) == 8

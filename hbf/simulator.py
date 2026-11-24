@@ -44,9 +44,19 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def patch_series():
+    """Patches in the order of patches/series; every patch file must be listed exactly once."""
+    directory = PACKAGE / "patches"
+    names = [line.strip() for line in (directory / "series").read_text().splitlines()
+             if line.strip() and not line.startswith("#")]
+    if sorted(names) != sorted(p.name for p in directory.glob("*.patch")) or len(set(names)) != len(names):
+        raise ValueError("patches/series must list every patch file exactly once")
+    return [directory / name for name in names]
+
+
 def build(cache=None):
     cache = Path(cache or Path.cwd() / ".build").resolve()
-    patches = sorted((PACKAGE / "patches").glob("*.patch"))
+    patches = patch_series()
     manifest = MQSIM_MANIFEST.read_bytes()
     source_files = []
     for line in manifest.decode().splitlines():
@@ -232,7 +242,9 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
 
     flags = {"I1": "completions.csv", "I2": "physical.csv" if physical else None,
              "I3": "1", "I4": "1", "T_SUSP": "1" if suspension else None,
-             "T_ONFI": "1" if onfi else None, "T_PLANE": cfg.plane_rule}
+             "T_ONFI": "1" if onfi else None, "T_PLANE": cfg.plane_rule,
+             "T_COALESCE_NS": None if cfg.coalesce_ns is None else str(cfg.coalesce_ns),
+             "T_READ_PLANE_NS": None if cfg.read_plane_ns is None else str(cfg.read_plane_ns)}
     env = {key: value for key, value in os.environ.items() if not key.startswith("HBF_")}
     env.update({f"HBF_{key}": value for key, value in flags.items() if value is not None})
     command = [str(binary), "-i", "device.xml", "-w", "workload.xml"]

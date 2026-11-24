@@ -118,6 +118,12 @@ def main():
     parser.add_argument("--planes", type=int, default=1,
                         help="planes per MQSim die (with --topology Cx1 this gives the real die/plane hierarchy)")
     parser.add_argument("--dbsy-ns", type=int, help="t_DBSY between planes of a multi-plane command (T-PLANE)")
+    parser.add_argument("--read-plane-ns", type=int,
+                        help="T-CMD: a read command for n planes costs the single-plane command plus (n-1) "
+                             "times this step, instead of ONFI's 6*t_WC + t_DBSY per extra plane")
+    parser.add_argument("--coalesce-ns", type=int,
+                        help="T-CMD: hold newly received transactions this long before dispatching, so that "
+                             "a batch leaves as full multi-plane commands")
     parser.add_argument("--analysis-only", action="store_true",
                         help="write the mechanism analysis without building or running MQSim")
     parser.add_argument("--output", type=Path)
@@ -129,7 +135,8 @@ def main():
     )}
     try:
         cfg = load(args.topology, batch_pages=args.batch_pages, planes=args.planes,
-                   plane_rule=args.plane_rule, dbsy_ns=args.dbsy_ns)
+                   plane_rule=args.plane_rule, dbsy_ns=args.dbsy_ns, coalesce_ns=args.coalesce_ns,
+                   read_plane_ns=args.read_plane_ns)
         tensors = parse_tensors(args.tensors)
         for group in args.plane_groups or (1,):
             check_group(cfg, group)

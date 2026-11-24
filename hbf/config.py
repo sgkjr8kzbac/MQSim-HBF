@@ -50,6 +50,8 @@ class Config:
     onfi: tuple[int, int, int, int] | None = None
     plane_rule: str | None = None
     dbsy_ns: int | None = None
+    coalesce_ns: int | None = None
+    read_plane_ns: int | None = None
 
     def __post_init__(self):
         if any(type(n) is not int or not 1 <= n <= 65535 for n in self.geometry):
@@ -61,6 +63,12 @@ class Config:
         if self.dbsy_ns is not None and (self.plane_rule is None or type(self.dbsy_ns) is not int
                                          or not 0 <= self.dbsy_ns < 2**32):
             raise ValueError("A t_DBSY override needs a T-PLANE rule and a uint32 value")
+        if self.read_plane_ns is not None and (self.plane_rule is None or type(self.read_plane_ns) is not int
+                                               or not 0 <= self.read_plane_ns < 2**32):
+            raise ValueError("A per-plane read command step needs a T-PLANE rule and a uint32 value")
+        if self.coalesce_ns is not None and (type(self.coalesce_ns) is not int or self.coalesce_ns <= 0
+                                             or self.scheduler != "PRIORITY_OUT_OF_ORDER"):
+            raise ValueError("A coalescing window must be a positive integer with PRIORITY_OUT_OF_ORDER")
         for name in ("page_bytes", "sector_bytes", "pages_per_block", "blocks_per_plane"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -119,6 +127,8 @@ class Config:
     def multiplane_read_command_ns(self, planes):
         """Bus time of one read command for ``planes`` planes (ONFI_Channel_NVDDR2, T-PLANE)."""
         cs, wc, wb, rr = self.onfi or (20, 25, 100, 20)
+        if self.read_plane_ns is not None:
+            return cs + 6 * wc + wb + rr + (planes - 1) * self.read_plane_ns
         dbsy = DEFAULT_DBSY_NS if self.dbsy_ns is None else self.dbsy_ns
         return cs + planes * 6 * wc + (planes - 1) * dbsy + wb + rr
 

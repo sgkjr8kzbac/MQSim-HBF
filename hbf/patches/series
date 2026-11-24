@@ -1,0 +1,9 @@
+# Order in which build() applies the patches; later patches assume the earlier ones.
+I1-completions.patch
+I2-physical.patch
+I3-id-lists.patch
+I4-batch.patch
+T-ONFI.patch
+T-PLANE.patch
+T-SUSP.patch
+T-CMD.patch
