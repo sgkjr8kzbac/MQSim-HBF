@@ -205,6 +205,22 @@ class VllmInterleaved(Layout):
 
 
 LAYOUTS = {"layer_contiguous": LayerContiguous, "vllm_interleaved": VllmInterleaved}
+
+
+def prefill(layout):
+    """Write every page of the layout once, in LPA order, before the reads (step -1).
+
+    MQSim assigns a physical page to an LPA when it is first written or, without a write, when it
+    is first read. A prefill therefore fixes each page's offset in its plane to its rank among the
+    plane's LPAs (``lpa // units`` for a layout at base 0), the placement that the lock-step
+    analysis and the T-PLANE lockstep rule assume. Without it, sparse reads get compact offsets
+    in first-touch order.
+    """
+    shape = layout.shape
+    for layer in range(shape.layers):
+        for head in range(shape.kv_heads):
+            for spec in layout.tensors:
+                yield Access(-1, layer, head, spec.name, "W", 0, shape.context, spec.bits)
 MODES = (
     "dense", "uniform_pages", "same_unit", "distinct_units", "same_channel_distinct_units",
     "hot_unit", "write_then_read",

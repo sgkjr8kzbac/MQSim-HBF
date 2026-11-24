@@ -232,7 +232,7 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
 
     flags = {"I1": "completions.csv", "I2": "physical.csv" if physical else None,
              "I3": "1", "I4": "1", "T_SUSP": "1" if suspension else None,
-             "T_ONFI": "1" if onfi else None}
+             "T_ONFI": "1" if onfi else None, "T_PLANE": cfg.plane_rule}
     env = {key: value for key, value in os.environ.items() if not key.startswith("HBF_")}
     env.update({f"HBF_{key}": value for key, value in flags.items() if value is not None})
     command = [str(binary), "-i", "device.xml", "-w", "workload.xml"]
@@ -247,9 +247,20 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     stats = flash_stats(directory / "workload_scenario_1.xml")
     stats.update(wall_seconds=elapsed, peak_rss_kib=int((directory / "rss_kib.txt").read_text()))
     dump(directory / "statistics.json", stats)
-    if (stats["request_count"] != len(expected) or stats["Issued_Flash_Read_CMD"] != reads
-            or stats["Issued_Flash_Program_CMD"] != writes):
+    # A multi-plane command serves 2..planes pages; MQSim counts commands, not pages, for it.
+    multi = cfg.planes > 1
+    read_cmds = stats["Issued_Flash_Read_CMD"] + stats["Issued_Flash_Multiplane_Read_CMD"]
+    program_cmds = stats["Issued_Flash_Program_CMD"] + stats["Issued_Flash_Multiplane_Program_CMD"]
+    if (stats["request_count"] != len(expected)
+            or not (multi or stats["Issued_Flash_Read_CMD"] == reads and stats["Issued_Flash_Program_CMD"] == writes)
+            or multi and not (stats["Issued_Flash_Read_CMD"] + 2 * stats["Issued_Flash_Multiplane_Read_CMD"]
+                              <= reads <= stats["Issued_Flash_Read_CMD"]
+                              + cfg.planes * stats["Issued_Flash_Multiplane_Read_CMD"])
+            or multi and not (stats["Issued_Flash_Program_CMD"] + 2 * stats["Issued_Flash_Multiplane_Program_CMD"]
+                              <= writes <= stats["Issued_Flash_Program_CMD"]
+                              + cfg.planes * stats["Issued_Flash_Multiplane_Program_CMD"])):
         raise ValueError(f"MQSim statistics do not match trace request/read/write counts: {stats}")
+    stats["read_commands"], stats["program_commands"] = read_cmds, program_cmds
     if stats["Issued_Flash_Erase_CMD"] or stats["gc_enqueued"]:
         raise ValueError(f"Garbage collection ran during the experiment: {stats}")
 

@@ -1,0 +1,175 @@
+diff --git a/src/exec/Device_Parameter_Set.cpp b/src/exec/Device_Parameter_Set.cpp
+index cd8dbc1..70a25a3 100644
+--- a/src/exec/Device_Parameter_Set.cpp
++++ b/src/exec/Device_Parameter_Set.cpp
+@@ -44,6 +44,7 @@ unsigned int Device_Parameter_Set::ONFI_t_CS = 20;
+ unsigned int Device_Parameter_Set::ONFI_t_WC = 25;
+ unsigned int Device_Parameter_Set::ONFI_t_WB = 100;
+ unsigned int Device_Parameter_Set::ONFI_t_RR = 20;
++unsigned int Device_Parameter_Set::ONFI_t_DBSY = 500;
+ unsigned int Device_Parameter_Set::Channel_Transfer_Rate = 300;//MT/s
+ unsigned int Device_Parameter_Set::Chip_No_Per_Channel = 4;
+ SSD_Components::ONFI_Protocol Device_Parameter_Set::Flash_Comm_Protocol = SSD_Components::ONFI_Protocol::NVDDR2;
+@@ -625,6 +626,8 @@ void Device_Parameter_Set::XML_deserialize(rapidxml::xml_node<> *node)
+ 				ONFI_t_WB = std::stoul(param->value());
+ 			} else if (std::getenv("HBF_T_ONFI") && strcmp(param->name(), "ONFI_t_RR") == 0) {
+ 				ONFI_t_RR = std::stoul(param->value());
++			} else if (std::getenv("HBF_T_PLANE") && strcmp(param->name(), "ONFI_t_DBSY") == 0) {
++				ONFI_t_DBSY = std::stoul(param->value());
+ 			} else if (strcmp(param->name(), "Channel_Transfer_Rate") == 0) {
+ 				std::string val = param->value();
+ 				Channel_Transfer_Rate = std::stoul(val);
+diff --git a/src/exec/Device_Parameter_Set.h b/src/exec/Device_Parameter_Set.h
+index e97fdf8..3f6326e 100644
+--- a/src/exec/Device_Parameter_Set.h
++++ b/src/exec/Device_Parameter_Set.h
+@@ -51,7 +51,7 @@ public:
+ 	static sim_time_type Preferred_suspend_write_time_for_read;//in nano-seconds, if the remaining time of the ongoing write is smaller than Prefered_suspend_write_time_for_read, then the ongoing erase operation will be suspended
+ 	static unsigned int Flash_Channel_Count;
+ 	static unsigned int Flash_Channel_Width;//Channel width in byte
+-	static unsigned int ONFI_t_CS, ONFI_t_WC, ONFI_t_WB, ONFI_t_RR;
++	static unsigned int ONFI_t_CS, ONFI_t_WC, ONFI_t_WB, ONFI_t_RR, ONFI_t_DBSY;
+ 	static unsigned int Channel_Transfer_Rate;//MT/s
+ 	static unsigned int Chip_No_Per_Channel;
+ 	static SSD_Components::ONFI_Protocol Flash_Comm_Protocol;
+diff --git a/src/exec/SSD_Device.cpp b/src/exec/SSD_Device.cpp
+index 6a0430e..8040b36 100644
+--- a/src/exec/SSD_Device.cpp
++++ b/src/exec/SSD_Device.cpp
+@@ -95,7 +95,7 @@ SSD_Device::SSD_Device(Device_Parameter_Set *parameters, std::vector<IO_Flow_Par
+ 				channels[channel_cntr] = new SSD_Components::ONFI_Channel_NVDDR2(channel_cntr, parameters->Chip_No_Per_Channel,
+ 																				 chips, parameters->Flash_Channel_Width,
+ 																				 (sim_time_type)((double)1000 / parameters->Channel_Transfer_Rate) * 2, (sim_time_type)((double)1000 / parameters->Channel_Transfer_Rate) * 2,
+-																				 500, parameters->ONFI_t_CS, parameters->ONFI_t_RR,
++																				 parameters->ONFI_t_DBSY, parameters->ONFI_t_CS, parameters->ONFI_t_RR,
+ 																				 parameters->ONFI_t_WB, parameters->ONFI_t_WC);
+ 				device->Channels.push_back(channels[channel_cntr]); //Channels should not be added to the simulator core, they are passive object that do not handle any simulation event
+ 			}
+diff --git a/src/ssd/ONFI_Channel_NVDDR2.cpp b/src/ssd/ONFI_Channel_NVDDR2.cpp
+index 114b4c2..54b8654 100644
+--- a/src/ssd/ONFI_Channel_NVDDR2.cpp
++++ b/src/ssd/ONFI_Channel_NVDDR2.cpp
+@@ -35,5 +35,13 @@ namespace SSD_Components
+ 		EraseCommandTime[3] = t_CS + t_WC * 4 + t_WB + (t_DBSY + t_WC * 4 + t_WB) + (t_DBSY + t_WC * 4 + t_WB);
+ 		EraseCommandTime[4] = t_CS + t_WC * 4 + t_WB + (t_DBSY + t_WC * 4 + t_WB) + (t_DBSY + t_WC * 4 + t_WB) + (t_DBSY + t_WC * 4 + t_WB);
+ 		EraseSuspendCommandTime = t_CS + t_WC * 3;
++
++		//HBF T-PLANE: upstream fills the tables for 1-4 planes only, so a multi-plane command with
++		//more planes read past the arrays. Extend each table with the same per-plane increment.
++		for (int planes = 5; planes <= 64; planes++) {
++			ReadCommandTime[planes] = ReadCommandTime[planes - 1] + t_DBSY + 6 * t_WC;
++			ProgramCommandTime[planes] = ProgramCommandTime[planes - 1] + (t_WC * 5 + t_ADL + t_WPST + t_CALS + t_WB) + t_DBSY;
++			EraseCommandTime[planes] = EraseCommandTime[planes - 1] + (t_DBSY + t_WC * 4 + t_WB);
++		}
+ 	}
+ }
+diff --git a/src/ssd/ONFI_Channel_NVDDR2.h b/src/ssd/ONFI_Channel_NVDDR2.h
+index d753d11..8847b90 100644
+--- a/src/ssd/ONFI_Channel_NVDDR2.h
++++ b/src/ssd/ONFI_Channel_NVDDR2.h
+@@ -23,14 +23,14 @@ namespace SSD_Components
+ 
+ 
+ 		sim_time_type TwoUnitDataOutTime; //The DDR delay for two-unit device data out
+-		sim_time_type ReadCommandTime[5];//Read command transfer time for different number of planes
++		sim_time_type ReadCommandTime[65];//Read command transfer time for different number of planes (HBF T-PLANE: up to 64)
+ 		sim_time_type ReadDataOutSetupTime, ReadDataOutSetupTime_TwoPlane, ReadDataOutSetupTime_ThreePlane, ReadDataOutSetupTime_FourPlane;
+ 
+ 		sim_time_type TwoUnitDataInTime; //The DDR delay for two-unit device data in
+-		sim_time_type ProgramCommandTime[5];//Program command transfer time for different number of planes
++		sim_time_type ProgramCommandTime[65];//Program command transfer time for different number of planes (HBF T-PLANE: up to 64)
+ 		sim_time_type ProgramSuspendCommandTime;
+ 
+-		sim_time_type EraseCommandTime[5];
++		sim_time_type EraseCommandTime[65];
+ 		sim_time_type EraseSuspendCommandTime;
+ 
+ 		unsigned int ChannelWidth; //channel width in bytes
+diff --git a/src/ssd/TSU_Base.cpp b/src/ssd/TSU_Base.cpp
+index 5d19956..7616554 100644
+--- a/src/ssd/TSU_Base.cpp
++++ b/src/ssd/TSU_Base.cpp
+@@ -1,3 +1,7 @@
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
+ #include <string>
+ #include "TSU_Base.h"
+ 
+@@ -5,6 +9,31 @@
+ 
+ namespace SSD_Components
+ {
++	//HBF T-PLANE: rule for the transactions that may join one multi-plane command.
++	//Unset keeps upstream (same page index, any block); "independent" accepts any address on each
++	//plane, as the OCP HBF spec allows per-bank reads; "lockstep" requires the same block and page.
++	static int hbf_plane_rule()
++	{
++		static const int rule = [] {
++			const char* value = std::getenv("HBF_T_PLANE");
++			if (value == NULL) return 0;
++			if (std::strcmp(value, "independent") == 0) return 1;
++			if (std::strcmp(value, "lockstep") == 0) return 2;
++			std::cerr << "ERROR:HBF_T_PLANE must be independent or lockstep" << std::endl;
++			exit(1);
++		}();
++		return rule;
++	}
++
++	static bool hbf_joins_command(const NVM_Transaction_Flash* tr, flash_block_ID_type blockID, flash_page_ID_type pageID)
++	{
++		switch (hbf_plane_rule()) {
++			case 1: return true;
++			case 2: return tr->Address.PageID == pageID && tr->Address.BlockID == blockID;
++			default: return tr->Address.PageID == pageID;
++		}
++	}
++
+ 	TSU_Base* TSU_Base::_my_instance = NULL;
+ 
+ 	TSU_Base::TSU_Base(const sim_object_id_type& id, FTL* ftl, NVM_PHY_ONFI_NVDDR2* NVMController, Flash_Scheduling_Type Type,
+@@ -73,7 +102,8 @@ namespace SSD_Components
+ 	{
+ 		flash_die_ID_type dieID = sourceQueue1->front()->Address.DieID;
+ 		flash_page_ID_type pageID = sourceQueue1->front()->Address.PageID;
+-		unsigned int planeVector = 0;
++		flash_block_ID_type blockID = sourceQueue1->front()->Address.BlockID;
++		uint64_t planeVector = 0;//HBF T-PLANE: 64 bits, upstream's unsigned int overflows past 32 planes
+ 		static int issueCntr = 0;
+ 		
+ 		for (unsigned int i = 0; i < die_no_per_chip; i++)
+@@ -83,13 +113,13 @@ namespace SSD_Components
+ 
+ 			for (Flash_Transaction_Queue::iterator it = sourceQueue1->begin(); it != sourceQueue1->end();)
+ 			{
+-				if (transaction_is_ready(*it) && (*it)->Address.DieID == dieID && !(planeVector & 1 << (*it)->Address.PlaneID))
++				if (transaction_is_ready(*it) && (*it)->Address.DieID == dieID && !(planeVector & (uint64_t)1 << (*it)->Address.PlaneID))
+ 				{
+ 					//Check for identical pages when running multiplane command
+-					if (planeVector == 0 || (*it)->Address.PageID == pageID)
++					if (planeVector == 0 || hbf_joins_command(*it, blockID, pageID))
+ 					{
+ 						(*it)->SuspendRequired = suspensionRequired;
+-						planeVector |= 1 << (*it)->Address.PlaneID;
++						planeVector |= (uint64_t)1 << (*it)->Address.PlaneID;
+ 						transaction_dispatch_slots.push_back(*it);
+ 						DEBUG(issueCntr++ << ": " << Simulator->Time() <<" Issueing Transaction - Type:" << TRTOSTR((*it)) << ", PPA:" << (*it)->PPA << ", LPA:" << (*it)->LPA << ", Channel: " << (*it)->Address.ChannelID << ", Chip: " << (*it)->Address.ChipID);
+ 						sourceQueue1->remove(it++);
+@@ -103,13 +133,13 @@ namespace SSD_Components
+ 			{
+ 				for (Flash_Transaction_Queue::iterator it = sourceQueue2->begin(); it != sourceQueue2->end();)
+ 				{
+-					if (transaction_is_ready(*it) && (*it)->Address.DieID == dieID && !(planeVector & 1 << (*it)->Address.PlaneID))
++					if (transaction_is_ready(*it) && (*it)->Address.DieID == dieID && !(planeVector & (uint64_t)1 << (*it)->Address.PlaneID))
+ 					{
+ 						//Check for identical pages when running multiplane command
+-						if (planeVector == 0 || (*it)->Address.PageID == pageID)
++						if (planeVector == 0 || hbf_joins_command(*it, blockID, pageID))
+ 						{
+ 							(*it)->SuspendRequired = suspensionRequired;
+-							planeVector |= 1 << (*it)->Address.PlaneID;
++							planeVector |= (uint64_t)1 << (*it)->Address.PlaneID;
+ 							transaction_dispatch_slots.push_back(*it);
+ 							DEBUG(issueCntr++ << ": " << Simulator->Time() << " Issueing Transaction - Type:" << TRTOSTR((*it)) << ", PPA:" << (*it)->PPA << ", LPA:" << (*it)->LPA << ", Channel: " << (*it)->Address.ChannelID << ", Chip: " << (*it)->Address.ChipID);
+ 							sourceQueue2->remove(it++);

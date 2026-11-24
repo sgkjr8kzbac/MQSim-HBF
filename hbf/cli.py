@@ -3,10 +3,12 @@ import argparse
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
 from uuid import uuid4
 
-from .access import LAYOUTS, MODES, Shape, generate, parse_tensors, read_access, tensors_meta, write_access
+from .access import (LAYOUTS, MODES, Shape, generate, parse_tensors, prefill, read_access, tensors_meta,
+                     write_access)
 from .analysis import analyze
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule
@@ -32,7 +34,7 @@ def analysis_report(layer_rows, step_rows):
 
 
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
-             input_csv=None, physical=False, tensors=None, plane_groups=(1,)):
+             input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None."""
     directory.mkdir(parents=True, exist_ok=False)
     generation = {
@@ -41,14 +43,15 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     } | (generation or {})
     layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
     access_path = directory / "access.csv"
-    if input_csv is None:
-        write_access(access_path, generate(cfg, layout, mode, **generation))
-    else:
-        write_access(access_path, read_access(input_csv))
+    accesses = generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv)
+    if prefill_layout:
+        accesses = chain(prefill(layout), (access for access in accesses if access.op == "R"))
+    write_access(access_path, accesses)
     dump(directory / "meta.json", {"shape": asdict(shape), "layout": layout_name,
                                    "tensors": tensors_meta(layout),
                                    "generator": {"mode": mode, **generation} if input_csv is None else None,
                                    "input_csv": str(input_csv) if input_csv else None,
+                                   "prefill": prefill_layout,
                                    "argv": sys.argv})
     batches = schedule(cfg, layout, read_access(access_path))
     layer_rows, step_rows = analyze(cfg, batches, plane_groups)
@@ -101,6 +104,14 @@ def main():
     parser.add_argument("--plane-group", type=int, action="append", dest="plane_groups",
                         help="planes per lock-step group for the mechanism analysis; repeat to compare "
                              "(1 = independent planes, the default)")
+    parser.add_argument("--prefill", action="store_true",
+                        help="write the whole KV layout before the reads so that each page's physical "
+                             "offset follows its LPA (needed for lock-step comparisons)")
+    parser.add_argument("--plane-rule", choices=("independent", "lockstep"),
+                        help="T-PLANE multi-plane rule; without it MQSim keeps its upstream same-page rule")
+    parser.add_argument("--planes", type=int, default=1,
+                        help="planes per MQSim die (with --topology Cx1 this gives the real die/plane hierarchy)")
+    parser.add_argument("--dbsy-ns", type=int, help="t_DBSY between planes of a multi-plane command (T-PLANE)")
     parser.add_argument("--analysis-only", action="store_true",
                         help="write the mechanism analysis without building or running MQSim")
     parser.add_argument("--output", type=Path)
@@ -111,7 +122,8 @@ def main():
         "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units"
     )}
     try:
-        cfg = load(args.topology, batch_pages=args.batch_pages)
+        cfg = load(args.topology, batch_pages=args.batch_pages, planes=args.planes,
+                   plane_rule=args.plane_rule, dbsy_ns=args.dbsy_ns)
         tensors = parse_tensors(args.tensors)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
@@ -119,7 +131,7 @@ def main():
     binary = None if args.analysis_only else build()
     pipeline(cfg, shape, args.layout, directory, binary, mode=args.mode, generation=generation,
              input_csv=args.access_csv, physical=args.physical, tensors=tensors,
-             plane_groups=tuple(args.plane_groups or (1,)))
+             plane_groups=tuple(args.plane_groups or (1,)), prefill_layout=args.prefill)
     print(directory.resolve())
 
 
