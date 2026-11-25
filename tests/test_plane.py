@@ -225,6 +225,22 @@ def test_cache_read_keeps_rounds(binary, evidence):
     assert counts[True][2] < counts[False][2]
 
 
+def test_cache_read_does_not_starve_idle_chips(binary, evidence):
+    """Chip as plane with 64 chips per channel: cache read must not be slower than without it.
+
+    The cache-priority pass used to admit only cache-ready chips, so idle chips waited until all
+    queued data left the channel: a dense 8K layer on 16x64 took 200,778 ns with cache read and
+    184,612 ns without it. Idle chips may now be issued in that pass too.
+    """
+    shape = Shape(1, 8, 128, 8192)
+    latency = {}
+    for cache in (False, True):
+        cfg = load("16x64", blocks_per_plane=64, cache_read=cache)
+        _, layers, _, _ = pipeline(cfg, shape, "layer_contiguous", evidence / f"t-cache-idle-{cache}", binary)
+        latency[cache] = layers[0]["mqsim_ns"]
+    assert latency[True] <= latency[False]
+
+
 def test_cache_read_rejects_suspension():
     with pytest.raises(ValueError, match="T-CACHE"):
         load("16x64", cache_read=True, suspend="PROGRAM")

@@ -257,6 +257,11 @@ MODES = (
 )
 
 
+def share(count, fraction):
+    """ceil(count * fraction), ignoring float noise (100 * 0.07 is 7.000000000000001)."""
+    return ceil(round(count * fraction, 9))
+
+
 def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0,
              hot_fraction=.5, hot_units=1, select_tokens=16):
     """Seeded accesses of one workload mode.
@@ -280,7 +285,7 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
         for step in range(steps):
             for layer in range(shape.layers):
                 for head in range(shape.kv_heads):
-                    for block in sorted(rng.sample(range(blocks), ceil(blocks * fraction))):
+                    for block in sorted(rng.sample(range(blocks), share(blocks, fraction))):
                         lo, hi = block * select_tokens, min((block + 1) * select_tokens, shape.context)
                         for spec in layout.tensors:
                             yield Access(step, layer, head, spec.name, "R", lo, hi, spec.bits)
@@ -307,7 +312,7 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
                             yield Access(step, layer, head, spec.name, "R", 0, shape.context, spec.bits)
                         else:
                             blocks = layout.blocks(t)
-                            for block in sorted(rng.sample(range(blocks), ceil(blocks * fraction))):
+                            for block in sorted(rng.sample(range(blocks), share(blocks, fraction))):
                                 yield layout.page_access(layout.lpa(layer, head, t, block), step)
         return
 
@@ -333,12 +338,18 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
     addresses = []
     for target in targets:
         k = used.get(target, 0)
-        used[target] = k + 1
-        pa = cfg.unit_lpa(target, k, layout.base)
-        if pa >= layout.base + layout.span:
-            raise ValueError(f"{mode}: unit {target} needs its page {k}, beyond the layout's {layout.span} pages; "
-                             "use fewer pages per unit or a larger shape")
-        access = layout.page_access(pa)
+        while True:  # the unit's next page that belongs to the layout (striped layouts have padding)
+            pa = cfg.unit_lpa(target, k, layout.base)
+            if pa >= layout.base + layout.span:
+                raise ValueError(f"{mode}: unit {target} needs its page {k}, beyond the layout's {layout.span} "
+                                 "pages; use fewer pages per unit or a larger shape")
+            k += 1
+            try:
+                access = layout.page_access(pa)
+                break
+            except ValueError:  # a padding page
+                continue
+        used[target] = k
         access.validate(layout)
         addresses.append(pa)
     if mode == "write_then_read":

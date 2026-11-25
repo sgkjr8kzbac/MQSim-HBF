@@ -253,6 +253,8 @@ class Config:
     def unit_lpa(self, unit, k, base=0):
         if not 0 <= unit < self.units or k < 0 or base < 0:
             raise ValueError("Invalid unit or page index")
+        if self.address_map != "cwdp" and base % self.units:
+            raise ValueError("unit_lpa with the ocp address map needs a base that is a multiple of the unit count")
         lpa = self.host_lpa(base + (unit - base) % self.units + k * self.units)
         self.lba(lpa)
         return lpa

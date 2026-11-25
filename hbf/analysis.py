@@ -127,8 +127,9 @@ class Protocol:
     """Host protocol limits on read concurrency (OCP HBF v0.7.0).
 
     * ``mocs`` - Maximum Outstanding Commands Selected of a host channel's base-die command queue
-      (capability register of the Base Die UCIe Channel, section 5.9.2.1: 1 or a power of two
-      from 256 to 16,384).
+      (MOCS Selected in the BUCC register, section 5.9.2.3; the supported values in section 5.9.2.1
+      are 1 or a power of two from 256 to 16,384). ``None`` (the default) sets no credit limit, so
+      the link bound or the other options can be studied alone.
     * ``read_burst`` - burst reads supported (product option, BCS bit). Without them every read is
       one 64 B command, so a whole 4 KiB page takes 64 commands (section 5.3.1, item 1); with them
       one command reads a contiguous run of up to 64 units of 64 B inside one page (section 4.1).
@@ -149,7 +150,7 @@ class Protocol:
     * ``ucie_grade`` - optional speed grade 1-3 for a link bound: a host channel moves at most
       48, 94 or 188 GB/s of read data, so a round of tR carries at most that much.
     """
-    mocs: int = 256
+    mocs: int | None = None
     read_burst: bool = False
     read_unit: str = "page"
     host_order: str = "fcfs"
@@ -157,7 +158,7 @@ class Protocol:
     group_sense: str = "arrived"
 
     def __post_init__(self):
-        if self.mocs not in MOCS_VALUES:
+        if self.mocs is not None and self.mocs not in MOCS_VALUES:
             raise ValueError(f"MOCS must be one of {MOCS_VALUES} (OCP capability register)")
         if self.read_unit not in READ_UNITS or type(self.read_burst) is not bool:
             raise ValueError(f"read_unit must be one of {READ_UNITS}")
@@ -224,14 +225,15 @@ def protocol_rounds(cfg, reads, group, offsets, protocol):
                     items[offset] = [1 if protocol.host_order == "trigger" else sum(pages)]
         costs = sorted(cost for items in groups.values() for pages in items.values() for cost in pages)
         spent = per_round = 0
-        while per_round < len(costs) and spent < protocol.mocs:
+        limit = float("inf") if protocol.mocs is None else protocol.mocs
+        while per_round < len(costs) and spent < limit:
             spent += costs[per_round]
             per_round += 1
         credit = max(credit, -(-len(costs) // per_round))
         pending = {key: [list(pages) for _, pages in sorted(items.items())] for key, items in groups.items()}
         count = 0
         while pending:
-            budget = protocol.mocs
+            budget = limit
             for key in sorted(pending, key=lambda k: -len(pending[k])):
                 if budget == 0:
                     break

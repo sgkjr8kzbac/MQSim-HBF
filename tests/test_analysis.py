@@ -472,3 +472,37 @@ def test_per_page_estimate_is_withheld_for_multi_plane_dies(tmp_path):
     pipeline(cfg, Shape(1, 8, 128, 8192), "layer_contiguous", tmp_path / "b", None)
     report = (tmp_path / "b" / "report.md").read_text()
     assert "| 子批轮数 |" in report and "| 1 | 0 | 1 | 8192 | 8 | 82 | 8 |" in report
+
+
+def test_generator_and_cli_edge_cases(tmp_path, monkeypatch):
+    from hbf.access import share
+    from hbf.controller import prefill_batches
+    assert share(100, .07) == 7 and share(100, .071) == 8 and share(3, 1) == 3
+    cfg = load("ocp")
+    shape = Shape(1, 1, 128, 1600)
+    for mode in ("uniform_pages", "uniform_tokens"):  # 100 blocks x 7 % is 7 blocks, not 8
+        layout = LAYOUTS["layer_contiguous"](cfg, shape)
+        accesses = list(generate(cfg, layout, mode, fraction=.07, select_tokens=16))
+        assert len({(a.kind, a.token_start) for a in accesses}) == 2 * 7
+    striped = LAYOUTS["striped_contiguous"](cfg, Shape(1, 8, 128, 4096))
+    pages = [a for a in generate(cfg, striped, "same_unit", count=3, unit=0)]  # skips padding pages
+    assert len({striped.lpa(a.layer, a.kv_head, striped.tensor_index(a.kind), a.token_start // 16)
+                for a in pages}) == 3
+    shifted = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 64), base=100)
+    with pytest.raises(ValueError, match="multiple of the unit count"):
+        prefill_batches(cfg, shifted)
+    with pytest.raises(ValueError, match="multiple of the unit count"):
+        cfg.unit_lpa(512, 0, 512)
+    # A link grade alone sets no credit limit: rounds stay at the bank bound.
+    monkeypatch.setattr("sys.argv", ["hbf", "--analysis-only", "--topology", "ocp", "--context", "32768",
+                                     "--ucie-grade", "3", "--output", str(tmp_path / "u")])
+    main()
+    (row,) = csv.DictReader((tmp_path / "u" / "analysis_steps.csv").open())
+    assert row["protocol_rounds"] == row["rounds"] == "32" and "MOCS = 不限" in (tmp_path / "u" / "report.md").read_text()
+    monkeypatch.setattr("sys.argv", ["hbf", "--analysis-only", "--layers", "0", "--output", str(tmp_path / "z")])
+    with pytest.raises(SystemExit):
+        main()
+    with pytest.raises(ValueError):  # a generator error leaves no output directory behind
+        pipeline(cfg, Shape(1, 8, 128, 8192), "layer_contiguous", tmp_path / "x", None, mode="same_unit",
+                 generation={"count": 99})
+    assert not (tmp_path / "x").exists() and not (tmp_path / "z").exists()

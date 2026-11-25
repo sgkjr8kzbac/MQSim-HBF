@@ -103,6 +103,9 @@ def prefill_batches(cfg, layout):
     plane at offset k, which equals the spec's static offset ``lpa // units`` for a layout at a
     base that is a multiple of the unit count.
     """
+    if layout.base % cfg.units:
+        raise ValueError("A prefill needs a layout base that is a multiple of the unit count; otherwise MQSim's "
+                         "offsets differ per plane from the static offsets lpa // units")
     lpas = range(layout.base, layout.base + layout.span)
     limit = cfg.batch_pages
     return [Batch(-1, -1, index, 0, tuple(Request(lpa, "W") for lpa in lpas[start:start + limit]))

@@ -15,7 +15,7 @@ from .simulator import build, dump, simulate, write_table
 
 def protocol_report(step_rows, protocol):
     report = ["## 协议约束（每主机通道命令额度）", "",
-              f"MOCS = {protocol.mocs}，读突发：{'支持' if protocol.read_burst else '不支持（每条读 64 B）'}，"
+              f"MOCS = {protocol.mocs or '不限'}，读突发：{'支持' if protocol.read_burst else '不支持（每条读 64 B）'}，"
               f"读取单位：{'整页' if protocol.read_unit == 'page' else '只读需要的 64 B 段'}，"
               f"主机发送顺序：{'整页命令一起排队（fcfs）' if protocol.host_order == 'fcfs' else '先发一条触发感测（trigger）'}，"
               f"链路档位：{protocol.ucie_grade or '不计'}，"
@@ -26,6 +26,10 @@ def protocol_report(step_rows, protocol):
         report.append(f"| {row['group']} | {row['step']} | {row['commands']} | {row['credit_rounds']} | "
                       f"{row['link_rounds']} | {row['protocol_rounds']} | {row['protocol_utilization']:.3f} |")
     return report
+
+
+def topology_name(cfg):
+    return "ocp" if cfg.address_map == "ocp" else f"{cfg.channels}x{cfg.chips}"
 
 
 def analysis_report(layer_rows, step_rows):
@@ -51,14 +55,14 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
              placement="static", protocol=None):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None."""
-    directory.mkdir(parents=True, exist_ok=False)
     generation = {
         "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
         "hot_fraction": .5, "hot_units": 1, "select_tokens": 16,
     } | (generation or {})
     layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
+    accesses = list(generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv))
+    directory.mkdir(parents=True, exist_ok=False)  # after the inputs are known to be valid
     access_path = directory / "access.csv"
-    accesses = generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv)
     write_access(access_path, accesses)
     dump(directory / "meta.json", {"shape": asdict(shape), "layout": layout_name,
                                    "tensors": tensors_meta(layout),
@@ -75,9 +79,17 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         write_table(directory / "analysis_layers.csv", layer_rows)
         write_table(directory / "analysis_steps.csv", step_rows)
     unwritten = unwritten_reads(batches)
-    report = ["# 本次运行", "", f"布局 `{layout_name}`，拓扑 {cfg.channels}×{cfg.chips}，"
-              f"子批 {len(batches)} 个。机制分析的页位置：{placement}。", ""]
-    if unwritten:
+    hierarchy = (f"{cfg.channels} 通道 × {cfg.chips} chip × {cfg.dies} die × {cfg.planes} plane"
+                 f"（地址映射 {cfg.address_map}）")
+    switches = [f"核心通道合计 {cfg.aggregate_gb_s} GB/s", f"plane 规则 {cfg.plane_rule or '上游'}"]
+    switches += [f"{name} {value}" for name, value in (
+        ("T-CMD 每 plane 步长 ns", cfg.read_plane_ns), ("合并窗口 ns", cfg.coalesce_ns), ("t_DBSY ns", cfg.dbsy_ns))
+        if value is not None]
+    if cfg.cache_read:
+        switches.append("T-CACHE 开")
+    report = ["# 本次运行", "", f"布局 `{layout_name}`，拓扑 `{topology_name(cfg)}`：{hierarchy}；"
+              f"{'，'.join(switches)}。子批 {len(batches)} 个。机制分析的页位置：{placement}。", ""]
+    if unwritten and (binary is not None or placement == "mqsim"):
         report += [f"有 {unwritten} 次读的页在本次运行中没有写过。OCP 规范对这种读返回错误 0x7（表 12）；"
                    "机制分析按静态位置计算时假定数据已在 HBF 中。需要 MQSim 按规范放置时请加 `--prefill`。", ""]
     if layer_rows:
@@ -93,6 +105,9 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                    "| Step | 读页 | MQSim ns | MQSim 估算 ns | 理想 HBF ns |",
                    "|---:|---:|---:|---:|---:|"]
         for row in steps:
+            if row["step"] == -1:
+                report.append(f"| −1（prefill 写，不计入读） | 0 | {row['mqsim_ns']} | — | — |")
+                continue
             report.append(f"| {row['step']} | {row['read_pages']} | {row['mqsim_ns']} | "
                           f"{'—' if row['mq_est_ns'] is None else row['mq_est_ns']} | {row['ideal_ns']:.0f} |")
     (directory / "report.md").write_text("\n".join(report) + "\n")
@@ -102,7 +117,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", default="64x16",
-                        help="16x64, 64x16, 256x4 or any <channels>x<chips per channel>")
+                        help="ocp (the spec's Figure 4 example), 16x64, 64x16, 256x4 or any "
+                             "<channels>x<chips per channel>")
     parser.add_argument("--layout", choices=LAYOUTS, default="layer_contiguous")
     parser.add_argument("--mode", choices=MODES, default="dense")
     parser.add_argument("--layers", type=int, default=1)
@@ -143,8 +159,8 @@ def main():
                         help="T-CMD: a read command for n planes costs the single-plane command plus (n-1) "
                              "times this step, instead of ONFI's 6*t_WC + t_DBSY per extra plane")
     parser.add_argument("--cache-read", action="store_true",
-                        help="T-CACHE: two buffers per plane, so a die senses the next read while the "
-                             "previous pages are transferred")
+                        help="T-CACHE: a die senses the next read while at most one earlier batch waits "
+                             "for transfer (buffers are accounted per die; the OCP spec has two per bank)")
     parser.add_argument("--coalesce-ns", type=int,
                         help="T-CMD: hold newly received transactions this long before dispatching, so that "
                              "a batch leaves as full multi-plane commands")
@@ -153,7 +169,8 @@ def main():
                              "(address decides bank and page); mqsim follows MQSim's allocation order")
     parser.add_argument("--mocs", type=int,
                         help="analysis: outstanding commands per host channel (OCP MOCS: 1 or 256-16384, power "
-                             "of two); enables the protocol-limited rounds")
+                             "of two); enables the protocol-limited rounds. Any protocol flag enables them; "
+                             "without --mocs there is no credit limit")
     parser.add_argument("--read-burst", action="store_true",
                         help="analysis: the product supports burst reads (one command per contiguous run)")
     parser.add_argument("--read-unit", choices=READ_UNITS, default="page",
@@ -188,11 +205,11 @@ def main():
         protocol = None
         if (args.mocs is not None or args.read_burst or args.read_unit != "page" or args.host_order != "fcfs"
                 or args.ucie_grade is not None or args.group_sense != "arrived"):
-            protocol = Protocol(256 if args.mocs is None else args.mocs, args.read_burst, args.read_unit,
+            protocol = Protocol(args.mocs, args.read_burst, args.read_unit,
                                 args.host_order, args.ucie_grade, args.group_sense)
+        shape = Shape(args.layers, args.heads, args.head_dim, args.context)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
-    shape = Shape(args.layers, args.heads, args.head_dim, args.context)
     binary = None if args.analysis_only else build()
     pipeline(cfg, shape, args.layout, directory, binary, mode=args.mode, generation=generation,
              input_csv=args.access_csv, physical=args.physical, tensors=tensors,

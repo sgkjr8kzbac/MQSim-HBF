@@ -169,7 +169,7 @@ index be51ac2..4c36e70 100644
  		bool HasSuspendedCommand(NVM::FlashMemory::Flash_Chip* chip);
  		ChipStatus GetChipStatus(NVM::FlashMemory::Flash_Chip* chip);
 +		bool Hbf_cache_read_ready(NVM::FlashMemory::Flash_Chip* chip);//HBF T-CACHE
-+		bool Hbf_cache_priority_pass();//HBF T-CACHE: only cache-ready reads may be issued now
++		bool Hbf_cache_priority_pass();//HBF T-CACHE: only reads to idle or cache-ready chips may be issued now
  		sim_time_type Expected_finish_time(NVM::FlashMemory::Flash_Chip* chip);
  		sim_time_type Expected_finish_time(NVM_Transaction_Flash* transaction);
  		sim_time_type Expected_transfer_time(NVM_Transaction_Flash* transaction);
@@ -185,18 +185,19 @@ diff --git a/src/ssd/TSU_Priority_OutOfOrder.cpp b/src/ssd/TSU_Priority_OutOfOrd
 index be40fa6..3d272db 100644
 --- a/src/ssd/TSU_Priority_OutOfOrder.cpp
 +++ b/src/ssd/TSU_Priority_OutOfOrder.cpp
-@@ -379,6 +379,10 @@ Flash_Transaction_Queue *TSU_Priority_OutOfOrder::get_next_read_service_queue(NV
+@@ -379,6 +379,11 @@ Flash_Transaction_Queue *TSU_Priority_OutOfOrder::get_next_read_service_queue(NV
  
  bool TSU_Priority_OutOfOrder::service_read_transaction(NVM::FlashMemory::Flash_Chip *chip)
  {
-+    if (_NVMController->Hbf_cache_priority_pass() && !_NVMController->Hbf_cache_read_ready(chip))
++    if (_NVMController->Hbf_cache_priority_pass() && _NVMController->GetChipStatus(chip) != ChipStatus::IDLE
++        && !_NVMController->Hbf_cache_read_ready(chip))
 +    {
-+        return false;//HBF T-CACHE: this pass only issues reads to cache-ready chips
++        return false;//HBF T-CACHE: this pass only issues reads to idle or cache-ready chips
 +    }
      Flash_Transaction_Queue *sourceQueue1 = NULL, *sourceQueue2 = NULL;
  
      //Flash transactions that are related to FTL mapping data have the highest priority
-@@ -446,6 +450,10 @@ bool TSU_Priority_OutOfOrder::service_read_transaction(NVM::FlashMemory::Flash_C
+@@ -446,6 +451,10 @@ bool TSU_Priority_OutOfOrder::service_read_transaction(NVM::FlashMemory::Flash_C
  
      bool suspensionRequired = false;
      ChipStatus cs = _NVMController->GetChipStatus(chip);
@@ -207,7 +208,7 @@ index be40fa6..3d272db 100644
      switch (cs)
      {
      case ChipStatus::IDLE:
-@@ -516,6 +524,10 @@ Flash_Transaction_Queue *TSU_Priority_OutOfOrder::get_next_write_service_queue(N
+@@ -516,6 +525,10 @@ Flash_Transaction_Queue *TSU_Priority_OutOfOrder::get_next_write_service_queue(N
  
  bool TSU_Priority_OutOfOrder::service_write_transaction(NVM::FlashMemory::Flash_Chip *chip)
  {
@@ -218,7 +219,7 @@ index be40fa6..3d272db 100644
      Flash_Transaction_Queue *sourceQueue1 = NULL, *sourceQueue2 = NULL;
  
      //If flash transactions related to GC are prioritzed (non-preemptive execution mode of GC), then GC queues are checked first
-@@ -583,6 +595,10 @@ bool TSU_Priority_OutOfOrder::service_write_transaction(NVM::FlashMemory::Flash_
+@@ -583,6 +596,10 @@ bool TSU_Priority_OutOfOrder::service_write_transaction(NVM::FlashMemory::Flash_
  
  bool TSU_Priority_OutOfOrder::service_erase_transaction(NVM::FlashMemory::Flash_Chip *chip)
  {
