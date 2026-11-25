@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .access import LAYOUTS, MODES, Shape, generate, parse_tensors, read_access, tensors_meta, write_access
-from .analysis import HOST_ORDERS, READ_UNITS, Protocol, analyze, check_group
+from .analysis import GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze, check_group
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule_run, unwritten_reads
 from .simulator import build, dump, simulate, write_table
@@ -18,7 +18,8 @@ def protocol_report(step_rows, protocol):
               f"MOCS = {protocol.mocs}，读突发：{'支持' if protocol.read_burst else '不支持（每条读 64 B）'}，"
               f"读取单位：{'整页' if protocol.read_unit == 'page' else '只读需要的 64 B 段'}，"
               f"主机发送顺序：{'整页命令一起排队（fcfs）' if protocol.host_order == 'fcfs' else '先发一条触发感测（trigger）'}，"
-              f"链路档位：{protocol.ucie_grade or '不计'}。", "",
+              f"链路档位：{protocol.ucie_grade or '不计'}，"
+              f"联动组感测：{'只感测命令已到的页（arrived）' if protocol.group_sense == 'arrived' else '一次感测整组（whole）'}。", "",
               "| 并行组 | Step | 读命令 | 只受额度限制的轮数 | 只受链路限制的轮数 | 全部约束下的轮数 | 利用率 |",
               "|---:|---:|---:|---:|---:|---:|---:|"]
     for row in step_rows:
@@ -160,6 +161,9 @@ def main():
     parser.add_argument("--host-order", choices=HOST_ORDERS, default="fcfs",
                         help="analysis: fcfs queues a page's commands together (they hold credits during the "
                              "sense); trigger sends one 64 B read first and the rest as cache hits")
+    parser.add_argument("--group-sense", choices=GROUP_SENSES, default="arrived",
+                        help="analysis, lock-step groups: arrived senses only pages whose commands arrived; "
+                             "whole senses the group's offset at the first command (an assumption)")
     parser.add_argument("--ucie-grade", type=int, choices=(1, 2, 3),
                         help="analysis: bound rounds by the host link (48/94/188 GB/s per channel)")
     parser.add_argument("--analysis-only", action="store_true",
@@ -183,9 +187,9 @@ def main():
             check_group(cfg, group)
         protocol = None
         if (args.mocs is not None or args.read_burst or args.read_unit != "page" or args.host_order != "fcfs"
-                or args.ucie_grade is not None):
+                or args.ucie_grade is not None or args.group_sense != "arrived"):
             protocol = Protocol(256 if args.mocs is None else args.mocs, args.read_burst, args.read_unit,
-                                args.host_order, args.ucie_grade)
+                                args.host_order, args.ucie_grade, args.group_sense)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     shape = Shape(args.layers, args.heads, args.head_dim, args.context)

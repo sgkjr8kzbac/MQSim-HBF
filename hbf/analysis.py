@@ -117,6 +117,7 @@ BURST_BYTES = 64
 MOCS_VALUES = (1,) + tuple(2 ** k for k in range(8, 15))  # OCP register: 1 or 256 ... 16,384
 READ_UNITS = ("page", "wanted")
 HOST_ORDERS = ("fcfs", "trigger")
+GROUP_SENSES = ("arrived", "whole")
 # System read throughput per UCIe module and direction, OCP sections 5.1.2.1-5.1.2.3 (GB/s).
 UCIE_GRADES = {1: 48, 2: 94, 3: 188}
 
@@ -139,6 +140,12 @@ class Protocol:
       read per page to start the sense and the rest after the data reached the bank's cache
       buffer, where they are served at once as cache hits (section 5.3.1, items 5a, 7 and 8).
       The spec allows both; ``trigger`` needs only one credit per page during the sense.
+    * ``group_sense`` - lock-step groups only (``group > 1``), a modelling assumption that neither
+      the spec nor HBF-EventLab settles: ``arrived`` (default) senses the pages of an offset whose
+      commands have arrived, so pages whose commands did not fit wait for another group sense of
+      that offset; ``whole`` senses every plane of the group at that offset as soon as one command
+      arrives (a megaplane), so the other pages are cache hits and a ``trigger`` host needs one
+      command per offset. With independent planes both give the same rounds.
     * ``ucie_grade`` - optional speed grade 1-3 for a link bound: a host channel moves at most
       48, 94 or 188 GB/s of read data, so a round of tR carries at most that much.
     """
@@ -147,6 +154,7 @@ class Protocol:
     read_unit: str = "page"
     host_order: str = "fcfs"
     ucie_grade: int | None = None
+    group_sense: str = "arrived"
 
     def __post_init__(self):
         if self.mocs not in MOCS_VALUES:
@@ -155,6 +163,8 @@ class Protocol:
             raise ValueError(f"read_unit must be one of {READ_UNITS}")
         if self.host_order not in HOST_ORDERS:
             raise ValueError(f"host_order must be one of {HOST_ORDERS}")
+        if self.group_sense not in GROUP_SENSES:
+            raise ValueError(f"group_sense must be one of {GROUP_SENSES}")
         if self.ucie_grade is not None and self.ucie_grade not in UCIE_GRADES:
             raise ValueError("ucie_grade must be 1, 2 or 3 (OCP section 5.1.2)")
 
@@ -176,12 +186,14 @@ def protocol_rounds(cfg, reads, group, offsets, protocol):
     """Read rounds when each host channel can hold at most ``mocs`` outstanding commands.
 
     A round senses at most one offset per lock-step group (one page per bank for ``group = 1``) and,
-    per host channel, admits at most ``mocs`` credits; a page holds ``sensing_credits`` credits in
-    the round that senses it. An item (a page, or a lock-step offset with all its pages) starts its
-    sense as soon as one of its commands is admitted; when only part of its commands fit, the rest
-    enter after the sense and are served from the bank's cache buffer (section 5.3.1, items 5a and 7),
-    which takes no sensing round. HBF-EventLab with MOCS = 1 confirms it: eight pages of one host
-    channel took eight senses and 504 cache hits (33.2 us), not 512 rounds.
+    per host channel, admits at most ``mocs`` credits. A page whose commands are admitted, even only
+    some of them, is sensed in that round and takes min(its sensing credits, credits left); the
+    commands that did not fit enter after the sense and are served from the bank's cache buffer
+    (section 5.3.1, items 5a and 7), which takes no sensing round. HBF-EventLab confirms it for
+    single pages: with MOCS = 1, eight pages of one host channel took eight senses and 504 cache
+    hits (33.2 us), not 512 rounds; with MOCS 256, seven pages of 40 commands each took one wave.
+    Lock-step groups follow ``Protocol.group_sense``. Cache hits are taken as free: their round
+    trips (63 per page at MOCS 1) are not counted.
 
     Rounds are scheduled greedily per host channel, longest group queue first: with equal credits
     ``c`` per item this reaches max(longest queue, ceil(items / ceil(MOCS / c))); otherwise it is an
@@ -190,36 +202,46 @@ def protocol_rounds(cfg, reads, group, offsets, protocol):
     fits slightly more pages per wave under ``fcfs``.
 
     Returns (rounds, credit-bound rounds, total commands, link-bound rounds). The credit bound is
-    ceil(items / k), where k is the most items one round can start: one more than the number of the
-    cheapest items whose credits sum to less than MOCS.
+    ceil(units / k) for the units a credit admits (pages, or whole offsets with ``whole``), where k
+    is one more than the number of the cheapest units whose credits sum to less than MOCS.
     """
-    queues = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    whole = group > 1 and protocol.group_sense == "whole"
+    queues = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     commands = 0
     data = defaultdict(int)
     for req in reads:
         die, plane, offset = locate(cfg, req.lpa, offsets)
         host = cfg.host_channel(req.lpa)
-        queues[host][die, plane // group][offset] += protocol.sensing_credits(cfg, req)
+        queues[host][die, plane // group][offset].append(
+            protocol.commands(cfg, req) if whole else protocol.sensing_credits(cfg, req))
         commands += protocol.commands(cfg, req)
         data[host] += protocol.read_bytes(cfg, req)
     rounds = credit = 0
     for groups in queues.values():
-        costs = sorted(cost for items in groups.values() for cost in items.values())
+        for items in groups.values():
+            for offset, pages in items.items():
+                if whole:  # one sense covers the offset: a single unit (one trigger command)
+                    items[offset] = [1 if protocol.host_order == "trigger" else sum(pages)]
+        costs = sorted(cost for items in groups.values() for pages in items.values() for cost in pages)
         spent = per_round = 0
         while per_round < len(costs) and spent < protocol.mocs:
             spent += costs[per_round]
             per_round += 1
         credit = max(credit, -(-len(costs) // per_round))
-        pending = {key: [cost for _, cost in sorted(items.items())] for key, items in groups.items()}
+        pending = {key: [list(pages) for _, pages in sorted(items.items())] for key, items in groups.items()}
         count = 0
         while pending:
             budget = protocol.mocs
             for key in sorted(pending, key=lambda k: -len(pending[k])):
                 if budget == 0:
                     break
-                budget -= min(pending[key].pop(0), budget)  # the sense starts; the rest are cache hits
-                if not pending[key]:
-                    del pending[key]
+                pages = pending[key][0]  # this round senses the head offset of the group
+                while pages and budget:
+                    budget -= min(pages.pop(0), budget)  # sensed; commands that did not fit are cache hits
+                if not pages:
+                    pending[key].pop(0)
+                    if not pending[key]:
+                        del pending[key]
             count += 1
         rounds = max(rounds, count)
     link = 0

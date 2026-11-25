@@ -264,8 +264,10 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
     ``uniform_pages`` picks ``fraction`` of each tensor's storage pages, independently per tensor, so
     the selection unit grows with compression (a 2-bit page holds 128 tokens, a BF16 page 16) and K
     and V pages of one head cover different tokens. ``uniform_tokens`` picks ``fraction`` of the
-    blocks of ``select_tokens`` tokens per (step, layer, head), as Quest-style methods do, and reads
-    every tensor of the head for the same tokens.
+    blocks of ``select_tokens`` tokens per (step, layer, KV head), as Quest-style methods do, and
+    reads every tensor of the head for the same tokens. Quest selects per query head; under GQA a
+    KV head serves the union of its query heads' blocks, which this mode does not model (use a
+    higher fraction).
     """
     shape = layout.shape
     if (mode not in MODES or steps <= 0 or not 0 < fraction <= 1 or count <= 0

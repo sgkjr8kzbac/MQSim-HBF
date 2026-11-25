@@ -200,7 +200,7 @@ python3 -m hbf.cli --topology 64x16 --mode dense --tensors '[{"name":"K","bits":
 python3 -m hbf.cli --analysis-only --topology 16x64 --layers 32 --context 32768 --mode uniform_pages --fraction 0.05 --plane-group 1 --plane-group 32
 ```
 
-按固定 token 块选择（每个头选 5% 的 16-token 块，K、V 读同一批 token），比较 BF16 与 2 bit：`uniform_pages` 按存储页抽样，选择单位会随压缩变大，`uniform_tokens` 不会：
+按固定 token 块选择（每个 KV 头选 5% 的 16-token 块，K、V 读同一批 token），这里是 2 bit 的 K、V；去掉 `--tensors` 即为 BF16，可对比两者。`uniform_pages` 按存储页抽样，选择单位会随压缩变大，`uniform_tokens` 不会：
 
 ```bash
 python3 -m hbf.cli --analysis-only --topology ocp --layers 32 --context 32768 --mode uniform_tokens --select-tokens 16 --fraction 0.05 --tensors '[{"name":"K","bits":2,"dims":128},{"name":"V","bits":2,"dims":128}]'

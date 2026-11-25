@@ -307,14 +307,17 @@ def test_greedy_credit_schedule_reaches_the_bound(seed):
     rng = random.Random(seed)
     cfg = load("ocp")
     reads = [Request(lpa) for lpa in rng.sample(range(16 * 1024), 3000)]
-    for protocol in (Protocol(256), Protocol(512), Protocol(16384), Protocol(256, read_burst=True)):
-        per_page = protocol.commands(cfg, reads[0])
+    forty = [Request(req.lpa, useful_bytes=2560, burst_bytes=2560, burst_runs=1) for req in reads]
+    for protocol, pages in ((Protocol(256), reads), (Protocol(512), reads), (Protocol(16384), reads),
+                            (Protocol(256, read_burst=True), reads), (Protocol(1), reads),
+                            (Protocol(256, read_unit="wanted"), forty)):  # 40 commands: MOCS / c is not whole
+        per_page = protocol.commands(cfg, pages[0])
         bound = 0
         for host in range(cfg.host_channels):
-            mine = [req for req in reads if cfg.host_channel(req.lpa) == host]
+            mine = [req for req in pages if cfg.host_channel(req.lpa) == host]
             banks = Counter(locate(cfg, req.lpa)[:2] for req in mine)
-            bound = max(bound, max(banks.values()), -(-len(mine) // (protocol.mocs // per_page)))
-        rounds, credit, commands, _ = protocol_rounds(cfg, reads, 1, None, protocol)
+            bound = max(bound, max(banks.values()), -(-len(mine) // -(-protocol.mocs // per_page)))
+        rounds, credit, commands, _ = protocol_rounds(cfg, pages, 1, None, protocol)
         assert rounds == bound and commands == 3000 * per_page and credit <= rounds
     lockstep, _, _, _ = protocol_rounds(cfg, reads, 16, None, Protocol(16384))
     assert lockstep == analyze_group(cfg, reads, 16)["rounds"]  # ample credits: only the groups limit
@@ -334,23 +337,49 @@ def test_protocol_columns_in_pipeline(tmp_path):
 
 
 def test_items_larger_than_mocs_start_their_sense_once():
-    """An item whose commands do not all fit is sensed once; the rest are cache hits.
+    """A page whose commands do not all fit is sensed once; the rest are cache hits.
 
     HBF-EventLab, ocp geometry, MOCS 1, burst4096 prefill, 64 B reads: eight pages on eight banks
     of host channel 0 finished in 33.17 us with 8 senses and 504 cache hits (8 x 4.096 us plus
-    hits), against 8.31 us (two rounds) at MOCS 256.
+    hits), against 8.31 us (two rounds) at MOCS 256. With MOCS 256, seven pages of 2,560 B (40
+    commands each, 280 in all) took one wave of 4.22 us, thirteen took 8.31 us.
     """
     from hbf.analysis import Protocol, protocol_rounds
     cfg = load("ocp")
     eight = [Request(16 * bank) for bank in range(8)]
     assert protocol_rounds(cfg, eight, 1, None, Protocol(1))[:2] == (8, 8)
     assert protocol_rounds(cfg, eight, 1, None, Protocol(256))[:2] == (2, 2)
-    die0 = [Request(16 * bank) for bank in range(16)]  # host channel 0, die 0, banks 0-15, offset 0
-    # A lock-step offset that gathers 16 pages needs 1,024 commands but one group sense.
-    assert protocol_rounds(cfg, die0, 16, None, Protocol(256))[:3] == (1, 1, 1024)
-    assert protocol_rounds(cfg, die0, 16, None, Protocol(256, host_order="trigger"))[0] == 1
     mocs1 = protocol_rounds(cfg, [Request(lpa) for lpa in range(128)], 1, None, Protocol(1))
     assert mocs1[:2] == (8, 8)  # 8 pages per host channel, one sense at a time
+    wanted = Protocol(256, read_unit="wanted")
+    for banks, expected in ((7, 1), (13, 2)):
+        pages = [Request(16 * bank, useful_bytes=2560, burst_bytes=2560) for bank in range(banks)]
+        assert protocol_rounds(cfg, pages, 1, None, wanted)[0] == expected
+
+
+def test_lock_step_group_sense_is_an_explicit_assumption():
+    """16 pages at one lock-step offset need 1,024 commands; MOCS 256 admits four pages per round.
+
+    ``arrived`` senses only those four, so the offset is sensed four times; ``whole`` senses the
+    whole group at the first command, and then a trigger host needs one command per offset.
+    """
+    from hbf.analysis import Protocol, protocol_rounds
+    cfg = load("ocp")
+    die0 = [Request(16 * bank) for bank in range(16)]  # host channel 0, die 0, banks 0-15, offset 0
+    rounds = {(sense, order, mocs): protocol_rounds(cfg, die0, 16, None, Protocol(mocs, host_order=order,
+                                                                                  group_sense=sense))[:3]
+              for sense in ("arrived", "whole") for order in ("fcfs", "trigger") for mocs in (1, 256)}
+    assert rounds["arrived", "fcfs", 256] == (4, 4, 1024)
+    assert rounds["arrived", "trigger", 256][:2] == (1, 1)
+    assert rounds["arrived", "fcfs", 1][:2] == rounds["arrived", "trigger", 1][:2] == (16, 16)
+    assert {rounds["whole", order, mocs][:2] for order in ("fcfs", "trigger") for mocs in (1, 256)} == {(1, 1)}
+    assert Protocol().group_sense == "arrived"
+    with pytest.raises(ValueError, match="group_sense"):
+        Protocol(group_sense="all")
+    reads = [Request(lpa) for lpa in range(0, 4096, 3)]
+    for protocol in (Protocol(1), Protocol(256)):  # independent planes: the option has no effect
+        assert protocol_rounds(cfg, reads, 1, None, protocol) == protocol_rounds(
+            cfg, reads, 1, None, Protocol(protocol.mocs, group_sense="whole"))
 
 
 @pytest.mark.parametrize("seed", range(5))
@@ -365,7 +394,8 @@ def test_credit_bound_never_exceeds_rounds(seed):
         reads.append(Request(lpa, useful_bytes=64 * wanted, burst_bytes=64 * wanted, burst_runs=rng.randint(1, wanted)))
     for group in (1, 4, 16):
         for protocol in (Protocol(1), Protocol(256), Protocol(256, read_unit="wanted"),
-                         Protocol(256, read_burst=True, read_unit="wanted"), Protocol(1, host_order="trigger")):
+                         Protocol(256, read_burst=True, read_unit="wanted"), Protocol(1, host_order="trigger"),
+                         Protocol(256, group_sense="whole"), Protocol(1, host_order="trigger", group_sense="whole")):
             rounds, credit, _, _ = protocol_rounds(cfg, reads, group, None, protocol)
             assert analyze_group(cfg, reads, group)["rounds"] <= rounds and credit <= rounds
 
@@ -412,7 +442,18 @@ def test_uniform_tokens_reads_the_same_tokens_of_every_tensor():
     k_pages = {req.lpa for req in reads if layout.decode(req.lpa)[2] == 0}
     tokens = 13 * 16 * 2 * 2  # blocks x tokens x heads x layers, for each tensor
     assert sum(req.useful_bytes for req in reads) == tokens * 32 + tokens * 256
-    assert len(k_pages) < 13 * 2 * 2 < len(reads) - len(k_pages) + 1  # 128-token K pages are shared
+    assert len(reads) - len(k_pages) == 13 * 2 * 2  # one 16-token V page per block
+    assert len(k_pages) < 13 * 2 * 2  # 128-token K pages are shared by blocks
+    # A last partial block, blocks not aligned with pages, and the vLLM layout.
+    odd = Shape(1, 2, 128, 1000)
+    for name, block in (("layer_contiguous", 24), ("vllm_interleaved", 24), ("layer_contiguous", 7)):
+        layout = LAYOUTS[name](cfg, odd)
+        accesses = list(generate(cfg, layout, "uniform_tokens", fraction=1, select_tokens=block))
+        assert {(a.token_start, a.token_end) for a in accesses} == {
+            (lo, min(lo + block, 1000)) for lo in range(0, 1000, block)}
+        (batch,) = schedule(cfg, layout, accesses)
+        assert len(batch.requests) == 2 * 2 * 63  # every page of both tensors and heads, once
+        assert sum(req.useful_bytes for req in batch.requests) == 2 * 2 * 1000 * 256
     with pytest.raises(ValueError, match="generator"):
         list(generate(cfg, layout, "uniform_tokens", select_tokens=0))
 
