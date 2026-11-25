@@ -395,6 +395,8 @@ cache read 不改变轮数：16 die × 64 plane、lockstep、10% 选页时，开
 
 ## 结果文件
 
+**规范一致性修正后（提交 `873b8f1`）**：全量 pytest 共 **126 项通过，3 项 xfail**，用时 14 min 27 s，[测试日志](evidence/pytest/spec-review.log)。3 项 xfail 不变。比第 1 阶段多 10 项：静态位置与 MQSim 物理位置核对（含条带布局）、多 plane 拒绝读未写页、`ocp` 地址映射与 MQSim 运行、三档带宽的单页时延。
+
 **第 1 阶段（提交 `970c2b8`）**：全量 pytest 共 **116 项通过，3 项 xfail**，用时 14 min 19 s，[测试日志](evidence/pytest/stage1.log)。3 项 xfail 与第 0 阶段相同。新增测试 58 项（含参数化），其中 `tests/test_analysis.py` 17 项、`tests/test_plane.py` 41 项；两项 GC 边界测试改为显式使用 64 块。
 
 
