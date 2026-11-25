@@ -21,3 +21,12 @@ evidence/eventlab/run.sh /path/to/hbf_eventlab_cli /tmp/eventlab-out > summary.c
 
 - `summarize.py`：从统计 JSON 计算读时间、感测次数、感测波次和 cache 命中数。感测波次的计法：某次感测与本波第一次感测相隔不到半个 tR，就算入同一波。
 - `summary.csv`：本仓库保存的那次重跑结果。
+
+重跑结果与测试中的轮数一致：
+
+- 128 页：MOCS 256 为 2 波（80 + 48），MOCS 1024 或先发触发命令为 1 波。
+- 每 bank 4 页：MOCS 256 自然顺序为 7 波，先发触发命令或 MOCS 1024 为 4 波。
+- 8 个 bank：MOCS 1 为 8 波，MOCS 256 为 2 波。
+- 读部分页：7 页为 1 波，13 页为 2 波。
+
+128 页的读时间为 8.31 µs 和 4.32 µs，比 REPORT 表中的 8.43 µs、4.54 µs 略短。原因是当时的探针有一部分用的是档位 2，这里统一用档位 3。波次没有变化。
