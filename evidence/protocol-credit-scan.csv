@@ -1,0 +1,43 @@
+format,mode,layout,protocol,pages,commands,rounds,credit_rounds,utilization
+bf16,uniform_pages,layer_contiguous,none,52736,,215,,0.2395
+bf16,uniform_pages,layer_contiguous,mocs256,52736,3375104,971,971,0.053
+bf16,uniform_pages,layer_contiguous,mocs1024,52736,3375104,256,255,0.2012
+bf16,uniform_pages,layer_contiguous,mocs16384,52736,3375104,215,32,0.2395
+bf16,uniform_pages,layer_contiguous,mocs256+burst,52736,52736,215,32,0.2395
+bf16,uniform_pages,layer_contiguous,mocs256 wanted,52736,3375104,971,971,0.053
+bf16,uniform_pages,layer_contiguous,mocs256+burst wanted,52736,52736,215,32,0.2395
+bf16,uniform_pages,striped_contiguous,none,52736,,213,,0.2418
+bf16,uniform_pages,striped_contiguous,mocs256,52736,3375104,971,971,0.053
+bf16,uniform_pages,striped_contiguous,mocs1024,52736,3375104,255,255,0.202
+bf16,uniform_pages,striped_contiguous,mocs16384,52736,3375104,213,32,0.2418
+bf16,uniform_pages,striped_contiguous,mocs256+burst,52736,52736,213,32,0.2418
+bf16,uniform_pages,striped_contiguous,mocs256 wanted,52736,3375104,971,971,0.053
+bf16,uniform_pages,striped_contiguous,mocs256+burst wanted,52736,52736,213,32,0.2418
+bf16,sink_recent,layer_contiguous,none,16896,,512,,0.0322
+bf16,sink_recent,layer_contiguous,mocs256,16896,1081344,512,384,0.0322
+bf16,sink_recent,layer_contiguous,mocs1024,16896,1081344,512,96,0.0322
+bf16,sink_recent,layer_contiguous,mocs16384,16896,1081344,512,32,0.0322
+bf16,sink_recent,layer_contiguous,mocs256+burst,16896,16896,512,32,0.0322
+bf16,sink_recent,layer_contiguous,mocs256 wanted,16896,1056768,512,288,0.0322
+bf16,sink_recent,layer_contiguous,mocs256+burst wanted,16896,16896,512,32,0.0322
+bf16,sink_recent,striped_contiguous,none,16896,,32,,0.5156
+bf16,sink_recent,striped_contiguous,mocs256,16896,1081344,384,384,0.043
+bf16,sink_recent,striped_contiguous,mocs1024,16896,1081344,96,96,0.1719
+bf16,sink_recent,striped_contiguous,mocs16384,16896,1081344,32,32,0.5156
+bf16,sink_recent,striped_contiguous,mocs256+burst,16896,16896,32,32,0.5156
+bf16,sink_recent,striped_contiguous,mocs256 wanted,16896,1056768,288,288,0.0573
+bf16,sink_recent,striped_contiguous,mocs256+burst wanted,16896,16896,32,32,0.5156
+2bit,uniform_pages,layer_contiguous,none,6656,,75,,0.0867
+2bit,uniform_pages,layer_contiguous,mocs256,6656,425984,166,166,0.0392
+2bit,uniform_pages,layer_contiguous,mocs1024,6656,425984,75,64,0.0867
+2bit,uniform_pages,layer_contiguous,mocs16384,6656,425984,75,32,0.0867
+2bit,uniform_pages,layer_contiguous,mocs256+burst,6656,6656,75,32,0.0867
+2bit,uniform_pages,layer_contiguous,mocs256 wanted,6656,425984,166,166,0.0392
+2bit,uniform_pages,layer_contiguous,mocs256+burst wanted,6656,6656,75,32,0.0867
+2bit,uniform_pages,striped_contiguous,none,6656,,74,,0.0878
+2bit,uniform_pages,striped_contiguous,mocs256,6656,425984,166,166,0.0392
+2bit,uniform_pages,striped_contiguous,mocs1024,6656,425984,74,64,0.0878
+2bit,uniform_pages,striped_contiguous,mocs16384,6656,425984,74,32,0.0878
+2bit,uniform_pages,striped_contiguous,mocs256+burst,6656,6656,74,32,0.0878
+2bit,uniform_pages,striped_contiguous,mocs256 wanted,6656,425984,166,166,0.0392
+2bit,uniform_pages,striped_contiguous,mocs256+burst wanted,6656,6656,74,32,0.0878

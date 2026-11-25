@@ -9,6 +9,7 @@ class Request:
     op: str = "R"
     useful_bytes: int = 4096
     burst_bytes: int = 4096
+    burst_runs: int = 1  # contiguous runs of wanted 64 B units: one burst read command each
 
 
 @dataclass(frozen=True)
@@ -39,9 +40,22 @@ def burst_bytes(intervals, start, token_bytes, burst=BURST_BYTES):
     base die and the core dies the minimum is still 4 KiB (section 4.6, device logical unit), so
     this counts host-side bytes only; sensing and the NAND-side transfer stay whole pages.
     """
-    chunks = [((lo - start) * token_bytes // burst, -(-(hi - start) * token_bytes // burst))
-              for lo, hi in intervals]
-    return union_size(chunks) * burst
+    return union_size(burst_chunks(intervals, start, token_bytes, burst)) * burst
+
+
+def burst_chunks(intervals, start, token_bytes, burst=BURST_BYTES):
+    return [((lo - start) * token_bytes // burst, -(-(hi - start) * token_bytes // burst))
+            for lo, hi in intervals]
+
+
+def burst_runs(intervals, start, token_bytes, burst=BURST_BYTES):
+    """Contiguous runs of wanted 64 B units in a page; adjacent or overlapping units merge."""
+    runs, end = 0, None
+    for lo, hi in sorted(burst_chunks(intervals, start, token_bytes, burst)):
+        if end is None or lo > end:
+            runs += 1
+        end = hi if end is None else max(end, hi)
+    return runs
 
 
 def schedule(cfg, layout, accesses):
@@ -69,7 +83,9 @@ def schedule(cfg, layout, accesses):
             filled = min(start + layout.tokens(t), layout.shape.context) - start
             if op == "W" and useful != filled * layout.token_bytes(t):
                 raise ValueError("Partial-page prefill write would cause an update read")
-            requests.append(Request(lpa, op, useful, burst_bytes(intervals, start, layout.token_bytes(t))))
+            token = layout.token_bytes(t)
+            requests.append(Request(lpa, op, useful, burst_bytes(intervals, start, token),
+                                    burst_runs(intervals, start, token)))
         for start in range(0, len(requests), limit):
             serial = serials[step, layer]
             serials[step, layer] += 1

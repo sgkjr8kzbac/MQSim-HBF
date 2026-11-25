@@ -217,6 +217,12 @@ class Config:
         local = bank + banks * (die + OCP_DIES_PER_HOST_CHANNEL * offset)
         return host + hosts * local
 
+    def host_channel(self, lpa):
+        """Host (UCIe) channel of an LPA: for ``ocp`` the 4 KiB interleave over host channels; for
+        ``cwdp`` each MQSim channel is taken as one host channel (16x64 then matches the spec's
+        4 KiB interleave over 16 host channels)."""
+        return lpa % self.host_channels if self.address_map == "ocp" else self.device_lpa(lpa) % self.channels
+
     def unit(self, lpa):
         """Index of the MQSim (channel, chip, die, plane) that holds ``lpa``."""
         return self.device_lpa(lpa) % self.units

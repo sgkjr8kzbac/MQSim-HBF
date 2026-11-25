@@ -114,6 +114,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | 拓扑扫描 | 16×64、64×16、256×4 三种"chip 当 plane"配置，`ocp` 规范示例拓扑（见上），或任意"通道数x每通道 chip 数"（例如 16x16 即 256 个 plane，可作为对规范表 3 的另一种读法） |
 | 真实 die/plane 层级 | T-PLANE：每 die 最多 64 个 plane，multi-plane 读写，独立或同偏移两种地址规则；`--prefill` 按地址顺序写满整个布局区间（含条带布局的填充页），使 MQSim 的物理位置与规范的静态映射一致。多 plane 配置下读未写过的页会被拒绝（规范对它返回错误 0x7） |
 | 机制分析 | 页位置默认按 OCP 规范的静态映射（地址决定 bank 和页，`--placement static`），也可按 MQSim 的分配顺序（`--placement mqsim`）；`--analysis-only` 不跑 MQSim，数秒到数十秒内（32 层 × 128K 全量读约 33 s）算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
+| 协议约束 | 分析模式可选：每主机通道的命令额度（`--mocs`，规范 MOCS 寄存器取值 1 或 256–16,384）、是否支持读突发（`--read-burst`）、读整页还是只读需要的 64 B 段（`--read-unit`）。不支持读突发时每页要 64 条 64 B 读命令（规范 §5.3.1），额度会限制同时在读的页数；输出读命令数、只受额度限制的轮数，以及 bank 与额度共同限制的轮数。机制取自 HBF-EventLab，并用它的实测结果核对 |
 | 容量 | 默认每 plane 512 块，物理容量 512 GiB，与规范表 3 的数字相同；但表 3 是"用户容量"，MQSim 按 SSD 习惯预留 7%（OP），用户可见的逻辑容量为 476 GiB。HBF 没有 GC，规范中主机看不到预留空间。1,024 plane 时 MQSim 峰值内存约 4.2 GB |
 | 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照）；`striped_contiguous`（SPLASH 式条带：每个 (层, 张量, 头) 区域从指定的 plane 相位开始，头之间错开 P/(2H)，V 与 K 相隔 P/2，消除 32K 时各头同一块落在同一 plane 的冲突） |
 | 压缩后的存储格式 | 用 `TensorSpec(name, bits, dims)` 声明，例如 KIVI 的 2 bit K 加量化参数张量、ThinK 的静态通道裁剪、低秩 latent。每页 token 数和有用字节按各张量计算 |
@@ -197,6 +198,12 @@ python3 -m hbf.cli --topology 64x16 --mode dense --tensors '[{"name":"K","bits":
 
 ```bash
 python3 -m hbf.cli --analysis-only --topology 16x64 --layers 32 --context 32768 --mode uniform_pages --fraction 0.05 --plane-group 1 --plane-group 32
+```
+
+加上协议约束（每主机通道 256 条命令、不支持读突发），看命令额度对轮数的影响：
+
+```bash
+python3 -m hbf.cli --analysis-only --topology ocp --layers 32 --context 32768 --mode sink_recent --layout striped_contiguous --mocs 256
 ```
 
 真实层级（16 die × 64 plane），先整体写入再读，plane 独立寻址，使用 HBF 命令模型（每多一个 plane 10 ns，合并窗口 1 µs）：

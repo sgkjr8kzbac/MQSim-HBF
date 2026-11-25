@@ -7,10 +7,22 @@ from pathlib import Path
 from uuid import uuid4
 
 from .access import LAYOUTS, MODES, Shape, generate, parse_tensors, read_access, tensors_meta, write_access
-from .analysis import analyze, check_group
+from .analysis import READ_UNITS, Protocol, analyze, check_group
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule_run, unwritten_reads
 from .simulator import build, dump, simulate, write_table
+
+
+def protocol_report(step_rows, protocol):
+    report = ["## 协议约束（每主机通道命令额度）", "",
+              f"MOCS = {protocol.mocs}，读突发：{'支持' if protocol.read_burst else '不支持（每条读 64 B）'}，"
+              f"读取单位：{'整页' if protocol.read_unit == 'page' else '只读需要的 64 B 段'}。", "",
+              "| 并行组 | Step | 读命令 | 只受额度限制的轮数 | bank 与额度共同限制的轮数 | 利用率 |",
+              "|---:|---:|---:|---:|---:|---:|"]
+    for row in step_rows:
+        report.append(f"| {row['group']} | {row['step']} | {row['commands']} | {row['credit_rounds']} | "
+                      f"{row['protocol_rounds']} | {row['protocol_utilization']:.3f} |")
+    return report
 
 
 def analysis_report(layer_rows, step_rows):
@@ -33,7 +45,7 @@ def analysis_report(layer_rows, step_rows):
 
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
-             placement="static"):
+             placement="static", protocol=None):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None."""
     directory.mkdir(parents=True, exist_ok=False)
     generation = {
@@ -51,9 +63,10 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                    "prefill": prefill_layout and
                                    f"every LPA in [{layout.base}, {layout.base + layout.span}) in order",
                                    "placement": placement,
+                                   "protocol": None if protocol is None else asdict(protocol),
                                    "argv": sys.argv})
     batches = schedule_run(cfg, layout, read_access(access_path), prefill_layout)
-    layer_rows, step_rows = analyze(cfg, batches, plane_groups, placement)
+    layer_rows, step_rows = analyze(cfg, batches, plane_groups, placement, protocol)
     if layer_rows:
         write_table(directory / "analysis_layers.csv", layer_rows)
         write_table(directory / "analysis_steps.csv", step_rows)
@@ -65,6 +78,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                    "机制分析按静态位置计算时假定数据已在 HBF 中。需要 MQSim 按规范放置时请加 `--prefill`。", ""]
     if layer_rows:
         report += analysis_report(layer_rows, step_rows) + [""]
+        if protocol is not None:
+            report += protocol_report(step_rows, protocol) + [""]
     result = None
     if binary is not None:
         result = simulate(cfg, batches, directory, binary, physical=physical)
@@ -130,6 +145,13 @@ def main():
     parser.add_argument("--placement", choices=("static", "mqsim"), default="static",
                         help="page offsets for the mechanism analysis: static follows the OCP spec "
                              "(address decides bank and page); mqsim follows MQSim's allocation order")
+    parser.add_argument("--mocs", type=int,
+                        help="analysis: outstanding commands per host channel (OCP MOCS: 1 or 256-16384, power "
+                             "of two); enables the protocol-limited rounds")
+    parser.add_argument("--read-burst", action="store_true",
+                        help="analysis: the product supports burst reads (one command per contiguous run)")
+    parser.add_argument("--read-unit", choices=READ_UNITS, default="page",
+                        help="analysis: read whole pages or only the 64 B units with wanted tokens")
     parser.add_argument("--analysis-only", action="store_true",
                         help="write the mechanism analysis without building or running MQSim")
     parser.add_argument("--output", type=Path)
@@ -149,6 +171,9 @@ def main():
         tensors = parse_tensors(args.tensors)
         for group in args.plane_groups or (1,):
             check_group(cfg, group)
+        protocol = None
+        if args.mocs is not None or args.read_burst or args.read_unit != "page":
+            protocol = Protocol(256 if args.mocs is None else args.mocs, args.read_burst, args.read_unit)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     shape = Shape(args.layers, args.heads, args.head_dim, args.context)
@@ -156,7 +181,7 @@ def main():
     pipeline(cfg, shape, args.layout, directory, binary, mode=args.mode, generation=generation,
              input_csv=args.access_csv, physical=args.physical, tensors=tensors,
              plane_groups=tuple(args.plane_groups or (1,)), prefill_layout=args.prefill,
-             placement=args.placement)
+             placement=args.placement, protocol=protocol)
     print(directory.resolve())
 
 

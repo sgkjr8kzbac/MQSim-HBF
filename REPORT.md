@@ -339,6 +339,36 @@ MQSim 真实层级（16 die × 64 plane，T-CMD δ = 10 ns、窗口 1 µs，T-CA
 
 三档的单页读时延与"命令 + tR + R/B + 传输 + 主机"逐 ns 相等，有测试核对。`ocp` 拓扑有 32 条通道，每通道 48、96 GB/s，误差 −1.6%。整除时（如默认的 64 GB/s）公式与原先完全相同。规范的档位指主机侧链路，MQSim 的通道是 NAND 侧总线，两者不是同一个量；1,024 GB/s 的默认值来自 SPLASH。
 
+### 协议约束：命令额度与 64 B 读
+
+HBF-EventLab（sjtu-epcc，按 OCP 规范实现的事务级模拟器）中观察到一个此前没有建模的机制：读的并行度不仅受 bank 限制，还受主机协议限制。
+
+- 规范 §5.3.1 第 1 条：读请求以 64 B 为粒度，主机要发 64 条读命令才能取回整页 4 KiB；产品支持读突发时，可以用一条突发读（长度 0–63）。
+- MOCS（Maximum Outstanding Commands Supported/Selected，能力与控制寄存器）：base die 命令队列能同时容纳的命令数，取值 1 或 256–16,384 的 2 的幂。按 HBF-EventLab 的解释，额度按主机通道计。
+- 因此不支持读突发、MOCS = 256 时，一个主机通道同时最多只有 4 页在读，而规范示例中一个主机通道后有 64 个 bank。
+
+分析模式新增可选的 `Protocol(mocs, read_burst, read_unit)`（CLI：`--mocs`、`--read-burst`、`--read-unit page|wanted`）。每页的读命令数：整页读为 64 条（支持突发时 1 条）；只读需要的 64 B 段时为这些段的个数（支持突发时为连续段数）。轮数按主机通道贪心调度：每轮每个 bank（或联动组）最多感测一个偏移，每个主机通道该轮所发命令总数不超过 MOCS；命令的额度在感测它的那一轮内一直占用。每页命令数相同时，贪心结果等于下界 max(最长 bank 队列, ⌈页数 / ⌊MOCS / 每页命令数⌋⌉)，有随机测试核对。同一页其余的 64 B 读命中 bank 的 cache 缓冲（§5.3.1 第 5a、8 条），只占命令、不增加感测轮次。
+
+**与 HBF-EventLab 核对**：按 `ocp` 几何（16 主机通道 × 4 die × 16 bank）、4 KiB 交织、感测 4.096 µs 配置 HBF-EventLab，读 128 页（每主机通道 8 页、落在 8 个 bank）：MOCS 256 时读段耗时 8.4 µs（两轮感测），MOCS 1024 时 4.5 µs（一轮）。本模型给出 2 轮和 1 轮，一致（测试 `test_credit_rounds_match_hbf_eventlab_probe`）。
+
+**扫描**（`ocp`，Llama-3.1-8B 形状、32 层、32K；32 层合计轮数，括号内为利用率；数据见 [evidence/protocol-credit-scan.csv](evidence/protocol-credit-scan.csv)）：
+
+| 负载 | 布局 | 无协议约束 | MOCS 256 | MOCS 1024 | MOCS 16,384 | MOCS 256 + 读突发 | MOCS 256、只读需要的段 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| BF16，5% 均匀选页 | layer_contiguous | 215（0.24） | 971（0.053） | 256（0.20） | 215 | 215 | 971 |
+| BF16，sink_recent | layer_contiguous | 512（0.032） | 512 | 512 | 512 | 512 | 512 |
+| BF16，sink_recent | striped_contiguous | 32（0.52） | 384（0.043） | 96（0.17） | 32 | 32 | 288 |
+| 2 bit，5% 均匀选页 | layer_contiguous | 75（0.087） | 166（0.039） | 75 | 75 | 75 | 166 |
+
+观察：
+
+1. 不支持读突发、MOCS = 256 时，命令额度往往比 bank 更早成为瓶颈：BF16 稀疏读轮数增加 4.5 倍，条带布局的优势几乎消失（384 对 512 轮）。
+2. 读突发或较大的 MOCS 可以消除这一限制；MOCS 1024 已基本够用（BF16 稀疏读 256 对 215 轮）。
+3. 只读需要的 64 B 段能少发命令，但均匀选页时每页 token 都被选中，帮助有限；sink_recent 的窗口边缘页受益（384 → 288 轮）。
+4. 当瓶颈本来就在 bank（`layer_contiguous` 的 sink_recent，同一块堆在同一 bank）时，额度不改变结果。
+
+模型的简化：额度在一轮内占用、轮末全部释放，没有计入数据回传和 UCIe 链路时间（这会让额度占用更久，实际轮数只会更多）；主机可在同一主机通道内任意重排请求；普通读和批量读窗口（§5.3.2）不改变轮数，没有建模；MOCS 按主机通道计是 HBF-EventLab 的解释，规范寄存器描述的是"base die 命令队列"。
+
 ### T-CACHE：cache read
 
 原版 MQSim 的读要等全部页传出后 chip 才回到空闲，感测和传输不能重叠。补丁 `T-CACHE.patch`（`HBF_T_CACHE`）对用户读实现双缓冲：

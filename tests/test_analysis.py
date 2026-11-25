@@ -1,5 +1,6 @@
 """Mechanism analysis: read rounds, plane utilization and the 64 B transfer view."""
 import csv
+from collections import Counter
 
 import pytest
 
@@ -248,3 +249,66 @@ def test_ocp_topology_runs_in_mqsim(binary, tmp_path):
     analysis = {row["group"]: row for row in csv.DictReader((path / "analysis_layers.csv").open())}
     commands = stats["Issued_Flash_Read_CMD"] + stats["Issued_Flash_Multiplane_Read_CMD"]
     assert commands >= int(analysis["1"]["rounds"]) and layers[-1]["read_pages"] == 8 * 2 * (1 + 13)
+
+
+def test_protocol_commands_per_page():
+    from hbf.analysis import Protocol
+    cfg = load("ocp")
+    partial = Request(0, useful_bytes=96, burst_bytes=192, burst_runs=2)
+    assert Protocol(256).commands(cfg, partial) == 64  # whole page, 64 B commands (section 5.3.1)
+    assert Protocol(256, read_burst=True).commands(cfg, partial) == 1
+    assert Protocol(256, read_unit="wanted").commands(cfg, partial) == 3
+    assert Protocol(256, read_burst=True, read_unit="wanted").commands(cfg, partial) == 2
+    for bad in (0, 128, 300, 32768):
+        with pytest.raises(ValueError, match="MOCS"):
+            Protocol(bad)
+    shape = Shape(1, 1, 128, 1024)
+    layout = LAYOUTS["layer_contiguous"](cfg, shape, tensors=(TensorSpec("K", 2, 128),))
+    (request,) = schedule(cfg, layout, [Access(0, 0, 0, "K", "R", 1, 3, 2), Access(0, 0, 0, "K", "R", 5, 6, 2)])[0].requests
+    # 32 B tokens: tokens 1-2 are bytes 32-96 (units 0-1), token 5 is bytes 160-192 (unit 2): one run.
+    assert (request.burst_bytes, request.burst_runs) == (192, 1)
+
+
+def test_credit_rounds_match_hbf_eventlab_probe():
+    """HBF-EventLab, ocp geometry, 4 KiB interleave, 64 B reads: 128 pages (lpa 0-127, 8 per host
+    channel on 8 banks) took two sensing rounds at MOCS 256 (8.4 us) and one at MOCS 1024 (4.5 us)."""
+    from hbf.analysis import Protocol, protocol_rounds
+    cfg = load("ocp")
+    reads = [Request(lpa) for lpa in range(128)]
+    assert analyze_group(cfg, reads)["rounds"] == 1
+    assert protocol_rounds(cfg, reads, 1, None, Protocol(256))[:2] == (2, 2)
+    assert protocol_rounds(cfg, reads, 1, None, Protocol(1024))[:2] == (1, 1)
+    assert protocol_rounds(cfg, reads, 1, None, Protocol(256, read_burst=True))[:2] == (1, 1)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_greedy_credit_schedule_reaches_the_bound(seed):
+    """Uniform commands per page: rounds = max(longest bank queue, ceil(pages / floor(MOCS / c)))."""
+    import random
+    from hbf.analysis import Protocol, protocol_rounds
+    rng = random.Random(seed)
+    cfg = load("ocp")
+    reads = [Request(lpa) for lpa in rng.sample(range(16 * 1024), 3000)]
+    for protocol in (Protocol(256), Protocol(512), Protocol(16384), Protocol(256, read_burst=True)):
+        per_page = protocol.commands(cfg, reads[0])
+        bound = 0
+        for host in range(cfg.host_channels):
+            mine = [req for req in reads if cfg.host_channel(req.lpa) == host]
+            banks = Counter(locate(cfg, req.lpa)[:2] for req in mine)
+            bound = max(bound, max(banks.values()), -(-len(mine) // (protocol.mocs // per_page)))
+        rounds, credit, commands = protocol_rounds(cfg, reads, 1, None, protocol)
+        assert rounds == bound and commands == 3000 * per_page and credit <= rounds
+    lockstep, _, _ = protocol_rounds(cfg, reads, 16, None, Protocol(16384))
+    assert lockstep == analyze_group(cfg, reads, 16)["rounds"]  # ample credits: only the groups limit
+
+
+def test_protocol_columns_in_pipeline(tmp_path):
+    from hbf.analysis import Protocol
+    cfg = load("ocp")
+    pipeline(cfg, Shape(2, 8, 128, 8192), "layer_contiguous", tmp_path / "p", None, mode="uniform_pages",
+             generation={"fraction": .05}, plane_groups=(1, 16), protocol=Protocol(256))
+    rows = list(csv.DictReader((tmp_path / "p" / "analysis_steps.csv").open()))
+    for row in rows:
+        assert int(row["protocol_rounds"]) >= max(int(row["rounds"]), int(row["credit_rounds"]))
+        assert int(row["commands"]) == 64 * int(row["pages"])
+    assert "协议约束" in (tmp_path / "p" / "report.md").read_text()
