@@ -34,9 +34,10 @@ def union_size(intervals):
 def burst_bytes(intervals, start, token_bytes, burst=BURST_BYTES):
     """Bytes moved when a page read returns only the 64 B bursts covering the wanted tokens.
 
-    The OCP HBF base-die spec v0.7.0 (section 4.1) allows read bursts of 64 B to 4 KiB in
-    multiples of 64 B within one NAND page, so the transfer can be smaller than the page while
-    the sensing is always a whole page.
+    The OCP HBF base-die spec v0.7.0 (section 4.1) allows host read bursts of 64 B to 4 KiB in
+    multiples of 64 B within one NAND page, so the host link can carry less than a page. Between the
+    base die and the core dies the minimum is still 4 KiB (section 4.6, device logical unit), so
+    this counts host-side bytes only; sensing and the NAND-side transfer stay whole pages.
     """
     chunks = [((lo - start) * token_bytes // burst, -(-(hi - start) * token_bytes // burst))
               for lo, hi in intervals]

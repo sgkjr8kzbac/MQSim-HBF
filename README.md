@@ -52,7 +52,7 @@ MQSim 的 TSU 只在整颗 chip 空闲时才下发命令，同一 chip 上不同
 
 ```mermaid
 flowchart TB
-    HBF["HBF 单个 stack<br/>1,024 个 plane · 标称 1 TB/s"] --> T1 & T2 & T3
+    HBF["HBF 单个 stack<br/>1,024 个 plane · 默认 1,024 GB/s（取自 SPLASH）"] --> T1 & T2 & T3
     T1["16 通道 × 64 chip<br/>每通道 64 GB/s"]
     T2["64 通道 × 16 chip<br/>每通道 16 GB/s"]
     T3["256 通道 × 4 chip<br/>每通道 4 GB/s"]
@@ -69,7 +69,7 @@ flowchart TB
 
 ### 真实层级模式（T-PLANE）
 
-上面的 chip 当 plane 是默认模式。打开 T-PLANE 补丁后，可以改用和 HBF 一致的层级：**通道 = 一个 die 到 base die 的数据通路，chip = HBF die，MQSim plane = HBF plane**，例如 `--topology 16x1 --planes 64`，即 SPLASH 的 16 die × 64 plane。一个 die 的多个 plane 用一条 multi-plane 命令同时感测，plane 之间的地址规则可选：
+上面的 chip 当 plane 是默认模式。打开 T-PLANE 补丁后，可以改用 die/plane 两级的层级：**通道 = 一个 die 到 base die 的数据通路，chip = HBF die，MQSim plane = HBF plane（规范称 bank）**，例如 `--topology 16x1 --planes 64`，即 SPLASH 假设的 16 die × 64 plane。每 die 64 个 plane 和"一个 die 独占一条通道"来自 SPLASH，不是规范；规范示例见上面的 `ocp` 拓扑（每 die 16 个 bank，两个 die 共用一条 core die 通道）。一个 die 的多个 plane 用一条 multi-plane 命令同时感测，plane 之间的地址规则可选：
 
 | `--plane-rule` | 一条命令能合并哪些页 | 对应 |
 |---|---|---|
@@ -84,7 +84,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 - `--read-plane-ns δ`：n plane 读命令改为单 plane 命令加 (n−1)·δ，对应 base die 并行或广播地址；
 - `--coalesce-ns W`：新到的事务先等 W 再下发，同一批中到达同一 die 的页合成一条命令，去掉"第一页到达空闲 die 时单独下发"的现象。此时每层每 die 的读命令数正好等于机制分析的轮数。
 
-`--cache-read`（T-CACHE 补丁）给每个 plane 两个缓冲：感测完成后数据移入 cache，die 立即可以开始下一轮感测，同时传出上一轮的数据；每个 die 最多允许一批数据在等待传出时再发新命令；只有这类"cache 就绪"的读命令会排到已排队的数据传输之前，写和擦除仍按上游顺序。OCP 规范要求每个 bank 至少两个缓冲。
+`--cache-read`（T-CACHE 补丁）实现双缓冲读：感测完成后数据移入 cache，die 立即可以开始下一轮感测，同时传出上一轮的数据；每个 die 最多允许一批数据在等待传出时再发新命令（缓冲按 die 记账，而规范按 bank 描述）；只有这类"cache 就绪"的读命令会排到已排队的数据传输之前，写和擦除仍按上游顺序。依据是 OCP 规范 §5.3.1 第 7 条："HBF supports two cache buffers for each bank to hold up to at least two pages of data"（支持每个 bank 两个缓冲，可存至少两页）。
 
 ### 模块一览
 
@@ -111,10 +111,10 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | 能力 | 说明 |
 |---|---|
 | 页级读时序 | 逐请求的到达、入队、完成时间；可选物理时间线，精确到每条命令的通道、chip、块、页 |
-| 拓扑扫描 | 16×64、64×16、256×4 三种"chip 当 plane"配置，`ocp` 规范示例拓扑（见上），或任意"通道数x每通道 chip 数"（例如 16x16 即 256 个 plane） |
+| 拓扑扫描 | 16×64、64×16、256×4 三种"chip 当 plane"配置，`ocp` 规范示例拓扑（见上），或任意"通道数x每通道 chip 数"（例如 16x16 即 256 个 plane，可作为对规范表 3 的另一种读法） |
 | 真实 die/plane 层级 | T-PLANE：每 die 最多 64 个 plane，multi-plane 读写，独立或同偏移两种地址规则；`--prefill` 按地址顺序写满整个布局区间（含条带布局的填充页），使 MQSim 的物理位置与规范的静态映射一致。多 plane 配置下读未写过的页会被拒绝（规范对它返回错误 0x7） |
 | 机制分析 | 页位置默认按 OCP 规范的静态映射（地址决定 bank 和页，`--placement static`），也可按 MQSim 的分配顺序（`--placement mqsim`）；`--analysis-only` 不跑 MQSim，数秒到数十秒内（32 层 × 128K 全量读约 33 s）算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
-| 容量 | 默认每 plane 512 块，单 stack 512 GiB 物理容量（规范示例 cube 的容量），1,024 plane 时 MQSim 峰值内存约 4.2 GB |
+| 容量 | 默认每 plane 512 块，物理容量 512 GiB，与规范表 3 的数字相同；但表 3 是"用户容量"，MQSim 按 SSD 习惯预留 7%（OP），用户可见的逻辑容量为 476 GiB。HBF 没有 GC，规范中主机看不到预留空间。1,024 plane 时 MQSim 峰值内存约 4.2 GB |
 | 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照）；`striped_contiguous`（SPLASH 式条带：每个 (层, 张量, 头) 区域从指定的 plane 相位开始，头之间错开 P/(2H)，V 与 K 相隔 P/2，消除 32K 时各头同一块落在同一 plane 的冲突） |
 | 压缩后的存储格式 | 用 `TensorSpec(name, bits, dims)` 声明，例如 KIVI 的 2 bit K 加量化参数张量、ThinK 的静态通道裁剪、低秩 latent。每页 token 数和有用字节按各张量计算 |
 | 选择类方法 | StreamingLLM、SnapKV、动态选页等：访问记录本身就能表达读哪些 token 区间，部分覆盖的页按整页读并统计读放大 |
@@ -134,7 +134,8 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | 读一个张量的部分通道 | 需要通道主序的布局，目前不支持 |
 | 同一张量分段使用不同位宽 | 例如 KIVI 的全精度残差窗口，目前要声明成两个张量 |
 | 按块存的元数据 | 例如 Quest 的页摘要，它每块一行而不是每 token 一行，需要单独的块索引维度 |
-| HBF 专有器件行为 | 刷新、读扰动、热，均未建模；cache read 由 T-CACHE 提供，但只覆盖用户读 |
+| HBF 专有器件行为 | 读计数与刷新、坏块、ECC、读重试、数据保持、温控均未建模。按 OCP 规范，读计数在 base die、刷新是主机的责任（§11.5），坏块和 ECC 在 base die 内部处理，读重试可配置；不出故障时它们都不改变读轮数和 plane 利用率，所以留在范围外。cache read 由 T-CACHE 提供，但只覆盖用户读 |
+| 按 bank 调度 | 规范按 bank 排列感测顺序、每 bank 两个缓冲（§5.3.1）。多 plane 模式（T-PLANE、T-CACHE）以 die 为单位门控和记账，时延偏保守，轮数不变；要按 bank 独立调度，用"chip 当 plane"的拓扑（16×64 等），每个 bank 是独立的 chip，代价是每页一条命令占用总线 |
 
 ### 建模假设（解读结果前请先看）
 
