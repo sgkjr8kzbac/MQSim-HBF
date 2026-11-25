@@ -555,3 +555,12 @@ def test_gc_budget_with_rewrites(binary, evidence):
     assert stats["Issued_Flash_Erase_CMD"] == stats["gc_enqueued"] == 0
     with pytest.raises(ValueError, match="GC-free budget"):
         simulate(cfg, phases(fresh + 1), evidence / "gc-rewrite-over", binary)
+
+
+@pytest.mark.parametrize("aggregate, transfer", [(384, 170), (1536, 42), (3072, 20)])
+def test_ocp_bandwidth_grades(binary, evidence, aggregate, transfer):
+    """OCP Table 4 grades over 16 channels: MQSim truncates bytes / width / 2 to whole 2 ns cycles."""
+    cfg = load("16x64", aggregate_gb_s=aggregate)
+    assert cfg.transfer_ns == transfer and abs(cfg.transfer_error) < .07
+    rows, _, _, _ = simulate(cfg, cases(cfg, ([0],)), evidence / f"grade-{aggregate}", binary)
+    assert rows[0]["mqsim_ns"] == cfg.read_command_ns + cfg.read_ns + cfg.rb_ns + transfer + cfg.host_ns

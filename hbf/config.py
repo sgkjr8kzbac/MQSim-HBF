@@ -87,8 +87,9 @@ class Config:
         if self.page_bytes <= 0 or self.sector_bytes != 512 or self.page_bytes % self.sector_bytes:
             raise ValueError("MQSim requires 512 B sectors and sector-aligned pages")
         if (self.transfer_rate != 1000 or self.width <= 0
-                or self.aggregate_gb_s % self.channels or self.page_bytes % (2 * self.width)):
-            raise ValueError("Require rate=1000 and page divisible by 2*channel width")
+                or self.aggregate_gb_s % self.channels or self.page_bytes // self.width < 2):
+            raise ValueError("Require rate=1000, a whole number of GB/s per channel and a page of at "
+                             "least two bus cycles")
         if not 1 <= self.queue_depth <= 65535 or not 1 <= self.queue_fetch <= 65535:
             raise ValueError("Queue parameters must be nonzero uint16")
         if self.interval_ns <= 0:
@@ -127,7 +128,18 @@ class Config:
 
     @property
     def transfer_ns(self):
-        return self.page_bytes // self.width
+        """Page transfer time as MQSim computes it: (bytes / width / 2) two-unit cycles of 2 ns.
+
+        NVDDR2DataOutTransferTime divides in integers, so a width that does not divide the page
+        (e.g. 96 or 192 GB/s for the OCP grades 1.536 and 3.072 TB/s over 16 channels) is truncated:
+        42 instead of 42.67 ns and 20 instead of 21.33 ns. ``transfer_error`` gives the deviation.
+        """
+        return self.page_bytes // self.width // 2 * 2
+
+    @property
+    def transfer_error(self):
+        """Relative error of ``transfer_ns`` against the exact page_bytes / width."""
+        return self.transfer_ns / (self.page_bytes / self.width) - 1
 
     @property
     def read_command_ns(self):

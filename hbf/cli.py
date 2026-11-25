@@ -104,6 +104,9 @@ def main():
     parser.add_argument("--tensors", help="JSON list or file of stored tensor formats, "
                         'e.g. \'[{"name":"K","bits":2,"dims":128},{"name":"V","bits":16,"dims":128}]\'; '
                         "default BF16 K and V with head_dim channels")
+    parser.add_argument("--aggregate-gb-s", type=int,
+                        help="total NAND channel bandwidth in GB/s, split evenly over the channels "
+                             "(default 1024, from SPLASH; OCP grades are 384, 1536 and 3072)")
     parser.add_argument("--plane-group", type=int, action="append", dest="plane_groups",
                         help="planes per lock-step group for the mechanism analysis; repeat to compare "
                              "(1 = independent planes, the default)")
@@ -112,7 +115,7 @@ def main():
                              "reads, as the OCP spec requires; needed for multi-plane MQSim runs")
     parser.add_argument("--plane-rule", choices=("independent", "lockstep"),
                         help="T-PLANE multi-plane rule; without it MQSim keeps its upstream same-page rule")
-    parser.add_argument("--planes", type=int, default=1,
+    parser.add_argument("--planes", type=int,
                         help="planes per MQSim die (with --topology Cx1 this gives the real die/plane hierarchy)")
     parser.add_argument("--dbsy-ns", type=int, help="t_DBSY between planes of a multi-plane command (T-PLANE)")
     parser.add_argument("--read-plane-ns", type=int,
@@ -137,9 +140,12 @@ def main():
         "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units"
     )}
     try:
-        cfg = load(args.topology, batch_pages=args.batch_pages, planes=args.planes,
-                   plane_rule=args.plane_rule, dbsy_ns=args.dbsy_ns, coalesce_ns=args.coalesce_ns,
-                   read_plane_ns=args.read_plane_ns, cache_read=args.cache_read)
+        given = {"aggregate_gb_s": args.aggregate_gb_s, "planes": args.planes, "plane_rule": args.plane_rule,
+                 "dbsy_ns": args.dbsy_ns, "coalesce_ns": args.coalesce_ns, "read_plane_ns": args.read_plane_ns,
+                 "cache_read": args.cache_read or None}
+        # Only flags given on the command line override the topology's own settings (e.g. ocp).
+        cfg = load(args.topology, batch_pages=args.batch_pages,
+                   **{key: value for key, value in given.items() if value is not None})
         tensors = parse_tensors(args.tensors)
         for group in args.plane_groups or (1,):
             check_group(cfg, group)
