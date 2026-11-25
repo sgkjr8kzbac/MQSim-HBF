@@ -207,26 +207,38 @@ class VllmInterleaved(Layout):
 
 
 class StripedContiguous(Layout):
-    """``layer_contiguous`` regions started at a chosen plane phase (SPLASH-style striping).
+    """``layer_contiguous`` regions separated by fixed gaps of padding (SPLASH-style striping).
 
-    Pages land on plane ``lpa mod units`` (CWDP), so a region's first block decides where all its
-    blocks go. With 32K BF16 tokens a head holds 2,048 blocks, a multiple of 1,024 planes, and
-    ``layer_contiguous`` puts block b of every head and tensor on the same plane. Here region
-    (layer, t, head) starts on plane ``t*P/T + head*P/(T*H)`` (mod P): heads P/(2H) apart and V half
-    a device away from K for the default two tensors, as in SPLASH. Regions keep their order and
-    are padded by less than P pages each to reach their phase. The OCP spec forbids skipping
-    addresses inside a block (section 5.4.1), so a prefill writes the padding pages too.
+    Pages land on plane ``lpa mod units`` (CWDP, a permutation of it under the ocp map), so a
+    region's first block decides where all its blocks go. With 32K BF16 tokens a head holds 2,048
+    blocks, a multiple of 1,024 planes, and ``layer_contiguous`` puts block b of every head and
+    tensor on the same plane. Here every layer starts on phase 0 and each region after the first
+    is preceded by a gap of ``P/(T*H)`` pages. For regions that are a multiple of P long this gives
+    SPLASH's phases ``t*P/T + head*P/(T*H)``: heads P/(2H) apart and V half a device away from K
+    for the default two tensors. For shorter or unequal regions (2-bit or KIVI tensors) the gap
+    keeps neighbours apart without padding each region up to a fixed phase, so a layer costs
+    less than P extra pages. The OCP spec forbids skipping addresses inside a block (section
+    5.4.1), so a prefill writes the padding pages too.
+
+    ``stagger`` makes the gap odd, so that consecutive regions also start on different host
+    channels (``lpa mod 16``); with an even gap of 64 or 512 pages the block b of every region of a
+    layer shares one host channel, which matters under host credit limits (``--mocs``).
     """
+    stagger = False
 
     def __init__(self, cfg, shape, base=0, tensors=None):
         Layout.__init__(self, cfg, shape, base, tensors)
         units, count, heads = cfg.units, len(self.tensors), shape.kv_heads
+        gap = max(units // (count * heads), 1)
+        if self.stagger:
+            gap |= 1
+        self.gap = gap
         self.starts, self.regions, cursor = {}, [], 0
         for layer in range(shape.layers):
+            cursor += -(base + cursor) % units  # each layer starts on phase 0
             for t in range(count):
                 for head in range(heads):
-                    phase = (t * units // count + head * units // (count * heads)) % units
-                    start = cursor + (phase - (base + cursor)) % units
+                    start = cursor + (gap if (t, head) != (0, 0) else 0)
                     self.starts[layer, t, head] = start
                     self.regions.append((start, layer, t, head))
                     cursor = start + self.block_counts[t]
@@ -247,8 +259,13 @@ class StripedContiguous(Layout):
         return layer, head, t, offset - start
 
 
+class StripedStaggered(StripedContiguous):
+    """``striped_contiguous`` with an odd gap, so neighbouring regions start on different host channels."""
+    stagger = True
+
+
 LAYOUTS = {"layer_contiguous": LayerContiguous, "vllm_interleaved": VllmInterleaved,
-           "striped_contiguous": StripedContiguous}
+           "striped_contiguous": StripedContiguous, "striped_staggered": StripedStaggered}
 
 
 MODES = (

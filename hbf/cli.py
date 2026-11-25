@@ -34,8 +34,8 @@ def topology_name(cfg):
 
 def analysis_report(layer_rows, step_rows):
     report = ["## 机制分析", "",
-              "| 并行组 | Step | 层数 | 读页 | 轮数 | 子批轮数 | 最少轮数 | plane 利用率 | 均衡损失 | 感测放大 | 读放大 | 传输放大 |",
-              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+              "| 并行组 | Step | 层数 | 读页 | 轮数 | 子批轮数 | 最少轮数 | 核心通道下界轮数 | plane 利用率 | 均衡损失 | 感测放大 | 读放大 | 传输放大 |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     amplification = {}
     for row in layer_rows:
         key = row["group"], row["step"]
@@ -46,7 +46,7 @@ def analysis_report(layer_rows, step_rows):
         report.append(
             f"| {row['group']} | {row['step']} | {row['layers']} | {row['pages']} | {row['rounds']} | "
             f"{row['batch_rounds']} | "
-            f"{row['min_rounds']} | {row['utilization']:.3f} | {row['balance_loss']:.2f} | "
+            f"{row['min_rounds']} | {row['channel_rounds']} | {row['utilization']:.3f} | {row['balance_loss']:.2f} | "
             f"{row['sense_amplification']:.2f} | {page / useful:.2f} | {burst / useful:.2f} |")
     return report
 

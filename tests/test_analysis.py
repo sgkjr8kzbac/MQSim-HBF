@@ -165,11 +165,16 @@ def test_striped_layout_phases_and_round_trip():
     tensors = (TensorSpec("K", 16, 128), TensorSpec("K_scale", 16, 2), TensorSpec("V", 16, 128))
     layout = LAYOUTS["striped_contiguous"](cfg, shape, base=5, tensors=tensors)
     seen = set()
+    end = None
     for layer in range(2):
         for t in range(3):
             for head in range(4):
                 first = layout.lpa(layer, head, t, 0)
-                assert first % cfg.units == (t * 1024 // 3 + head * 1024 // 12) % 1024
+                if (t, head) == (0, 0):
+                    assert first % cfg.units == 0  # each layer starts on phase 0
+                else:
+                    assert first == end + 1024 // 12  # a fixed gap of P / (T * H) pages
+                end = layout.lpa(layer, head, t, layout.blocks(t) - 1) + 1
                 for block in range(layout.blocks(t)):
                     lpa = layout.lpa(layer, head, t, block)
                     assert lpa not in seen and layout.decode(lpa) == (layer, head, t, block)
@@ -195,6 +200,34 @@ def test_striping_removes_the_same_block_collision():
     layout = LAYOUTS["striped_contiguous"](cfg, Shape(1, 8, 128, 32768))
     (row,), _ = analyze(cfg, schedule(cfg, layout, generate(cfg, layout, "dense")))
     assert row["utilization"] == 1
+    # SPLASH's phases when every region is a multiple of P long: heads P/16 apart, V half a device on.
+    assert [layout.lpa(0, h, t, 0) % 1024 for t in range(2) for h in range(8)] == list(range(0, 1024, 64))
+
+
+@pytest.mark.parametrize("bits, shape", [((16, 16), Shape(2, 8, 128, 32768)), ((2, 2), Shape(2, 8, 128, 32768)),
+                                         ((2, 16), Shape(2, 8, 128, 8192)), ((16, 16), Shape(2, 32, 128, 4096)),
+                                         ((2, 16), Shape(2, 32, 128, 32768))])
+def test_striped_padding_is_bounded_and_dense_reads_stay_balanced(bits, shape):
+    """Phases that ignored region length padded short regions up to fixed phases (4.2x the pages for
+    2-bit 32K, 16x for 2-bit with 32 heads) and left KIVI's dense reads twice the minimum. With gaps
+    a layer pads less than 2P pages and a dense layer needs at most two rounds above the minimum."""
+    cfg = load("ocp")
+    tensors = (TensorSpec("K", bits[0], 128), TensorSpec("V", bits[1], 128))
+    for name in ("striped_contiguous", "striped_staggered"):
+        layout = LAYOUTS[name](cfg, shape, tensors=tensors)
+        assert layout.span < layout.pages + 2 * shape.layers * 1024
+        (row, *_), _ = analyze(cfg, schedule(cfg, layout, generate(cfg, layout, "dense")))
+        assert row["rounds"] <= row["min_rounds"] + 2
+
+
+def test_staggered_stripes_spread_host_channels():
+    cfg = load("ocp")
+    shape = Shape(1, 8, 128, 32768)
+    hosts = {}
+    for name in ("striped_contiguous", "striped_staggered"):
+        layout = LAYOUTS[name](cfg, shape)
+        hosts[name] = {cfg.host_channel(layout.lpa(0, h, t, 0)) for t in range(2) for h in range(8)}
+    assert hosts["striped_contiguous"] == {0} and len(hosts["striped_staggered"]) == 16
 
 
 def test_striped_layout_runs_in_mqsim(binary, tmp_path):
@@ -301,7 +334,7 @@ def test_credit_rounds_against_hbf_eventlab_four_pages_per_bank():
 
 @pytest.mark.parametrize("seed", range(5))
 def test_greedy_credit_schedule_reaches_the_bound(seed):
-    """Uniform commands per page: rounds = max(longest bank queue, ceil(pages / floor(MOCS / c)))."""
+    """Uniform commands per page: rounds = max(longest bank queue, ceil(pages / ceil(MOCS / c)))."""
     import random
     from hbf.analysis import Protocol, protocol_rounds
     rng = random.Random(seed)
@@ -506,3 +539,17 @@ def test_generator_and_cli_edge_cases(tmp_path, monkeypatch):
         pipeline(cfg, Shape(1, 8, 128, 8192), "layer_contiguous", tmp_path / "x", None, mode="same_unit",
                  generation={"count": 99})
     assert not (tmp_path / "x").exists() and not (tmp_path / "z").exists()
+
+
+def test_core_channel_bound_follows_bandwidth():
+    """Dense 8K layer on ocp: 256 pages per core-die channel. MQSim took 96.5, 42.3, 39.0 and 37.6 us
+    (23.6, 10.3, 9.5 and 9.2 tR) at 384, 1,024, 1,536 and 3,072 GB/s with cache read, so the
+    channel bound, not the 8 sensing rounds, decides at 384 GB/s."""
+    bounds = {}
+    for grade in (384, 1024, 1536, 3072):
+        cfg = load("ocp", aggregate_gb_s=grade)
+        layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 8, 128, 8192))
+        (row,), (step,) = analyze(cfg, schedule(cfg, layout, generate(cfg, layout, "dense")))
+        assert row["rounds"] == 8 and step["channel_rounds"] == row["channel_rounds"]
+        bounds[grade] = row["channel_rounds"]
+    assert bounds == {384: 22, 1024: 8, 1536: 6, 3072: 3}

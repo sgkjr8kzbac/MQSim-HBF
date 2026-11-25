@@ -17,6 +17,15 @@ bf16,uniform_pages,striped_contiguous,trigger256,52736,3375104,213,32,0.2418
 bf16,uniform_pages,striped_contiguous,trigger256 g1,52736,3375104,213,32,0.2418
 bf16,uniform_pages,striped_contiguous,trigger256 g2,52736,3375104,213,32,0.2418
 bf16,uniform_pages,striped_contiguous,trigger256 g3,52736,3375104,213,32,0.2418
+bf16,uniform_pages,striped_staggered,none,52736,,215,,0.2395
+bf16,uniform_pages,striped_staggered,fcfs256,52736,3375104,986,986,0.0522
+bf16,uniform_pages,striped_staggered,fcfs1024,52736,3375104,259,258,0.1988
+bf16,uniform_pages,striped_staggered,fcfs256 wanted,52736,3375104,986,986,0.0522
+bf16,uniform_pages,striped_staggered,burst256,52736,52736,215,32,0.2395
+bf16,uniform_pages,striped_staggered,trigger256,52736,3375104,215,32,0.2395
+bf16,uniform_pages,striped_staggered,trigger256 g1,52736,3375104,215,32,0.2395
+bf16,uniform_pages,striped_staggered,trigger256 g2,52736,3375104,215,32,0.2395
+bf16,uniform_pages,striped_staggered,trigger256 g3,52736,3375104,215,32,0.2395
 bf16,sink_recent,layer_contiguous,none,16896,,512,,0.0322
 bf16,sink_recent,layer_contiguous,fcfs256,16896,1081344,512,384,0.0322
 bf16,sink_recent,layer_contiguous,fcfs1024,16896,1081344,512,96,0.0322
@@ -35,6 +44,15 @@ bf16,sink_recent,striped_contiguous,trigger256,16896,1081344,32,32,0.5156
 bf16,sink_recent,striped_contiguous,trigger256 g1,16896,1081344,32,32,0.5156
 bf16,sink_recent,striped_contiguous,trigger256 g2,16896,1081344,32,32,0.5156
 bf16,sink_recent,striped_contiguous,trigger256 g3,16896,1081344,32,32,0.5156
+bf16,sink_recent,striped_staggered,none,16896,,32,,0.5156
+bf16,sink_recent,striped_staggered,fcfs256,16896,1081344,288,288,0.0573
+bf16,sink_recent,striped_staggered,fcfs1024,16896,1081344,96,96,0.1719
+bf16,sink_recent,striped_staggered,fcfs256 wanted,16896,1056768,256,224,0.0645
+bf16,sink_recent,striped_staggered,burst256,16896,16896,32,32,0.5156
+bf16,sink_recent,striped_staggered,trigger256,16896,1081344,32,32,0.5156
+bf16,sink_recent,striped_staggered,trigger256 g1,16896,1081344,32,32,0.5156
+bf16,sink_recent,striped_staggered,trigger256 g2,16896,1081344,32,32,0.5156
+bf16,sink_recent,striped_staggered,trigger256 g3,16896,1081344,32,32,0.5156
 2bit,uniform_pages,layer_contiguous,none,6656,,75,,0.0867
 2bit,uniform_pages,layer_contiguous,fcfs256,6656,425984,166,166,0.0392
 2bit,uniform_pages,layer_contiguous,fcfs1024,6656,425984,75,64,0.0867
@@ -44,12 +62,21 @@ bf16,sink_recent,striped_contiguous,trigger256 g3,16896,1081344,32,32,0.5156
 2bit,uniform_pages,layer_contiguous,trigger256 g1,6656,425984,75,32,0.0867
 2bit,uniform_pages,layer_contiguous,trigger256 g2,6656,425984,75,32,0.0867
 2bit,uniform_pages,layer_contiguous,trigger256 g3,6656,425984,75,32,0.0867
-2bit,uniform_pages,striped_contiguous,none,6656,,74,,0.0878
+2bit,uniform_pages,striped_contiguous,none,6656,,78,,0.0833
 2bit,uniform_pages,striped_contiguous,fcfs256,6656,425984,166,166,0.0392
-2bit,uniform_pages,striped_contiguous,fcfs1024,6656,425984,74,64,0.0878
+2bit,uniform_pages,striped_contiguous,fcfs1024,6656,425984,78,64,0.0833
 2bit,uniform_pages,striped_contiguous,fcfs256 wanted,6656,425984,166,166,0.0392
-2bit,uniform_pages,striped_contiguous,burst256,6656,6656,74,32,0.0878
-2bit,uniform_pages,striped_contiguous,trigger256,6656,425984,74,32,0.0878
-2bit,uniform_pages,striped_contiguous,trigger256 g1,6656,425984,74,32,0.0878
-2bit,uniform_pages,striped_contiguous,trigger256 g2,6656,425984,74,32,0.0878
-2bit,uniform_pages,striped_contiguous,trigger256 g3,6656,425984,74,32,0.0878
+2bit,uniform_pages,striped_contiguous,burst256,6656,6656,78,32,0.0833
+2bit,uniform_pages,striped_contiguous,trigger256,6656,425984,78,32,0.0833
+2bit,uniform_pages,striped_contiguous,trigger256 g1,6656,425984,78,32,0.0833
+2bit,uniform_pages,striped_contiguous,trigger256 g2,6656,425984,78,32,0.0833
+2bit,uniform_pages,striped_contiguous,trigger256 g3,6656,425984,78,32,0.0833
+2bit,uniform_pages,striped_staggered,none,6656,,73,,0.089
+2bit,uniform_pages,striped_staggered,fcfs256,6656,425984,164,164,0.0396
+2bit,uniform_pages,striped_staggered,fcfs1024,6656,425984,73,62,0.089
+2bit,uniform_pages,striped_staggered,fcfs256 wanted,6656,425984,164,164,0.0396
+2bit,uniform_pages,striped_staggered,burst256,6656,6656,73,32,0.089
+2bit,uniform_pages,striped_staggered,trigger256,6656,425984,73,32,0.089
+2bit,uniform_pages,striped_staggered,trigger256 g1,6656,425984,73,32,0.089
+2bit,uniform_pages,striped_staggered,trigger256 g2,6656,425984,73,32,0.089
+2bit,uniform_pages,striped_staggered,trigger256 g3,6656,425984,73,32,0.089

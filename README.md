@@ -3,7 +3,7 @@
 本项目研究：KV cache 存进 **HBF（High Bandwidth Flash）** 后，每生成一个 token 要读多少页，这些页能否整页、均匀地铺满各个 plane，又会出现哪些读放大、plane 冲突和排队。HBF 是放在 GPU 旁边、接口类似 HBM 的 NAND 闪存堆栈。项目做法是"现成的 NAND 器件模拟器 + 自己写的上层"：
 
 - **器件层**：固定版本的 [MQSim](https://github.com/CMU-SAFARI/MQSim)（FAST 2018），使用它的事务调度、ONFI 通道和闪存芯片时序。对 MQSim 的修改全部以可开关的补丁形式保存。
-- **中间件**：本仓库的 Python 包 `hbf`。它把"每步、每层、每个 KV 头读写哪些 token"翻译成 4 KiB 页请求和 MQSim 轨迹，跑完后还原出子批、层和 decode 步的时延与负载指标，并与两个解析估算器对照。
+- **中间件**：本仓库的 Python 包 `hbf`。它把"每步、每层、每个 KV 头读写哪些 token"翻译成 4 KiB 页请求和 MQSim 轨迹，跑完后还原出子批、层和 decode 步的时延与负载指标，并与两个解析估算器对照（多 plane 配置只用其中的理想下界，见下文"估算器 1 有适用范围"）。
 
 > **当前状态：第 0 阶段已完成，第 1 阶段的模拟器改进已在开发分支上。** 第 1 阶段新增：容量扩到每 plane 512 块、不跑 MQSim 的机制分析模式、真实 die/plane 层级（T-PLANE）、HBF 命令模型（T-CMD）、cache read（T-CACHE）、SPLASH 式条带布局、规范示例拓扑 `ocp`、规范带宽档位，以及机制分析中的主机协议约束（命令额度、64 B 读、读突发、主机链路）。对照 OCP HBF 规范 v0.7.0 做了一致性修正（见 REPORT"规范一致性审查"）。最近一次全量运行 147 项通过、3 项 xfail，xfail 是如实记录的已知偏差，见[验证状态](#验证状态)。详细实测、源码依据和偏差分析见 [REPORT.md](REPORT.md)。
 
@@ -16,14 +16,14 @@
 ```mermaid
 flowchart LR
     subgraph IN["输入"]
-        GEN["随机生成器<br/>8 种模式，固定种子"]
+        GEN["随机生成器<br/>9 种模式，固定种子"]
         CSV["access.csv<br/>真实模型或压缩方法产出"]
         TS["张量规格 TensorSpec<br/>name · bits · dims"]
     end
 
     subgraph MW["中间件 hbf/"]
         ACC["access.py<br/>访问记录校验"]
-        LAY["布局<br/>layer_contiguous / vllm_interleaved / striped_contiguous<br/>(层, 张量, 头, 块) → LPA"]
+        LAY["布局<br/>layer_contiguous / vllm_interleaved / striped_contiguous / striped_staggered<br/>(层, 张量, 头, 块) → LPA"]
         CTL["controller.py<br/>按 (step, layer) 分批、去重<br/>≤ 8,192 页子批、间隔 100 ms"]
         SIM["simulator.py<br/>GC 预算检查 · 写轨迹 · 运行<br/>完整性与重叠断言"]
         EST["估算器与指标<br/>MQSim 一致估算 · 理想 HBF 下界<br/>读放大 · 不均衡度"]
@@ -65,7 +65,9 @@ flowchart TB
 
 按 OCP HBF 规范图 4 的例子：16 个主机通道，每个主机通道接 2 条 core die 通道，每条通道挂 2 个 die，每个 die 16 个 bank，共 1,024 个 bank。在 MQSim 中是 32 个通道 × 每通道 2 个 chip（die）× 每 die 16 个 plane（bank），plane 独立寻址。地址按规范排列（`address_map: "ocp"`）：主机地址以 4 KiB 为单位在 16 个主机通道间交织；在一个主机通道内，4 KiB 单元的低 4 位选 bank，接下来 2 位选 die，die 0、2 在第一条 core die 通道，die 1、3 在第二条；第 64 个单元回到 die 0、bank 0 的下一页。中间件把这个顺序换算成 MQSim 能直接执行的地址，物理位置与规范逐页一致（有测试核对）。
 
-规范的表 3 另写了"每 cube 16 个 die、每通道 16 个 bank"，信息不全（算不出 512 GiB），与图 4 的组织不能直接对应，这里按图 4 建模。规范没有规定 core die 通道的带宽，默认把 1,024 GB/s 平均分给 32 条通道。
+规范的表 3 另写了"每 cube 16 个 die、每通道 16 个 bank"，信息不全（算不出 512 GiB），与图 4 的组织不能直接对应，这里按图 4 建模。规范没有规定 core die 通道的带宽，默认把 1,024 GB/s 平均分给 32 条通道。1,024 GB/s 取自 SPLASH，不是规范的三档之一（384、1,536、3,072），需要时用 `--aggregate-gb-s` 指定。
+
+`ocp` 是多 plane 配置，跑 MQSim 时必须加 `--prefill`。在默认的 ONFI 命令时序下，一条 16 plane 的读命令约 10 µs（约 2.45 个 tR），而且按 die 门控（见"按 bank 调度"）。所以建议像 REPORT 的对照实验那样加 `--read-plane-ns 0 --coalesce-ns 1 --cache-read`。合并窗口取 1 ns 就够了：一个子批同时到达，任何大于 0 的窗口都能把它合成完整的多 plane 命令；更大的窗口只会给每层多加等待时间。
 
 ### 真实层级模式（T-PLANE）
 
@@ -94,10 +96,10 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | [`hbf/controller.py`](hbf/controller.py) | token 区间到页的转换、批内去重、有用字节按区间并集计算、64 B 突发传输字节、子批划分、两个估算器和负载指标 |
 | [`hbf/analysis.py`](hbf/analysis.py) | 机制分析：不跑 MQSim，按层计算读轮数、最少轮数、plane 利用率、均衡损失和感测放大，支持独立 plane 与同偏移联动两种组织 |
 | [`hbf/simulator.py`](hbf/simulator.py) | 校验源码散列、打补丁、编译 MQSim；GC 预算检查；写轨迹；运行并对回逐请求完成日志；聚合结果 |
-| [`hbf/config.py`](hbf/config.py) | 参数文件、三套拓扑、设备与 workload XML 的生成和互相校验、CWDP 正反映射、逻辑容量上界 |
+| [`hbf/config.py`](hbf/config.py) | 参数文件、三套 chip 当 plane 拓扑与 `ocp` 规范示例拓扑、设备与 workload XML 的生成和互相校验、CWDP 与 OCP 地址映射、主机通道、逻辑容量上界 |
 | [`hbf/cli.py`](hbf/cli.py) | 一键入口：生成或导入 → 轨迹 → MQSim → 解析 → 简报 |
 | [`hbf/mqsim/`](hbf/mqsim) | MQSim 上游原版源码，逐文件 SHA-256 校验，不直接修改 |
-| [`hbf/patches/`](hbf/patches) | I1–I4 仪表与修复补丁，T-SUSP、T-ONFI 时序对照补丁，T-PLANE 多 plane 补丁 |
+| [`hbf/patches/`](hbf/patches) | I1–I4 仪表与修复补丁，T-SUSP、T-ONFI 时序对照补丁，T-PLANE 多 plane 补丁，T-CMD HBF 命令模型，T-CACHE cache read；`series` 规定应用顺序 |
 | [`hbf/configs/`](hbf/configs) | 参数 JSON、设备模板、三种拓扑的设备和 workload XML |
 | [`tests/`](tests) | T0–T10 验证测试、机制分析与 T-PLANE 测试、上游行为探针、规模测试 |
 | [`evidence/`](evidence) | 随仓库保存的实测摘要和测试日志 |
@@ -114,9 +116,9 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | 拓扑扫描 | 16×64、64×16、256×4 三种"chip 当 plane"配置，`ocp` 规范示例拓扑（见上），或任意"通道数x每通道 chip 数"（例如 16x16 即 256 个 plane，可作为对规范表 3 的另一种读法） |
 | 真实 die/plane 层级 | T-PLANE：每 die 最多 64 个 plane，multi-plane 读写，独立或同偏移两种地址规则；`--prefill` 按地址顺序写满整个布局区间（含条带布局的填充页），使 MQSim 的物理位置与规范的静态映射一致。多 plane 配置下读未写过的页会被拒绝（规范对它返回错误 0x7） |
 | 机制分析 | 页位置默认按 OCP 规范的静态映射（地址决定 bank 和页，`--placement static`），也可按 MQSim 的分配顺序（`--placement mqsim`）；`--analysis-only` 不跑 MQSim，数秒到数十秒内（32 层 × 128K 全量读约 33 s）算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
-| 协议约束 | 分析模式可选：每主机通道的命令额度（`--mocs`，规范 MOCS 寄存器取值 1 或 256–16,384）、是否支持读突发（`--read-burst`）、读整页还是只读需要的 64 B 段（`--read-unit`）、主机发送顺序（`--host-order fcfs` 一页命令一起排队，`trigger` 先发一条触发感测）、主机链路档位（`--ucie-grade`，48/94/188 GB/s）。不支持读突发时每页要 64 条 64 B 读命令（规范 §5.3.1）；fcfs 主机下额度会限制同时在读的页数，trigger 主机下基本不会。机制取自 HBF-EventLab，并用它的实测结果核对 |
+| 协议约束 | 分析模式可选：每主机通道的命令额度（`--mocs`，规范 MOCS 寄存器取值 1 或 256–16,384）、是否支持读突发（`--read-burst`）、读整页还是只读需要的 64 B 段（`--read-unit`）、主机发送顺序（`--host-order fcfs` 一页命令一起排队，`trigger` 先发一条触发感测）、联动组的感测假设（`--group-sense arrived|whole`，默认 arrived 只感测命令已到的页；whole 在第一条命令到达时感测整组，规范和 HBF-EventLab 都没有规定）、主机链路档位（`--ucie-grade`，48/94/188 GB/s）。给出任一协议参数就启用协议约束；不给 `--mocs` 时不限额度。不支持读突发时每页要 64 条 64 B 读命令（规范 §5.3.1）；fcfs 主机下额度会限制同时在读的页数，trigger 主机下基本不会。机制取自 HBF-EventLab，并用它的实测结果核对 |
 | 容量 | 默认每 plane 512 块，物理容量 512 GiB，与规范表 3 的数字相同；但表 3 是"用户容量"，MQSim 按 SSD 习惯预留 7%（OP），用户可见的逻辑容量为 476 GiB。HBF 没有 GC，规范中主机看不到预留空间。1,024 plane 时 MQSim 峰值内存约 4.2 GB |
-| 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照）；`striped_contiguous`（SPLASH 式条带：每个 (层, 张量, 头) 区域从指定的 plane 相位开始，头之间错开 P/(2H)，V 与 K 相隔 P/2，消除 32K 时各头同一块落在同一 plane 的冲突） |
+| 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照）；`striped_contiguous`（SPLASH 式条带：每层从相位 0 开始，各 (张量, 头) 区域之间留 P/(T·H) 页的间隔；区域长度是 P 的倍数时（如 32K BF16），头之间错开 P/(2H)，V 与 K 相隔 P/2，消除各头同一块落在同一 plane 的冲突）；`striped_staggered`（同上，间隔取奇数，相邻区域还落在不同的主机通道上，在 fcfs 额度限制下更均衡） |
 | 压缩后的存储格式 | 用 `TensorSpec(name, bits, dims)` 声明，例如 KIVI 的 2 bit K 加量化参数张量、ThinK 的静态通道裁剪、低秩 latent。每页 token 数和有用字节按各张量计算 |
 | 选择类方法 | StreamingLLM、SnapKV、动态选页等：访问记录本身就能表达读哪些 token 区间，部分覆盖的页按整页读并统计读放大 |
 | 指标 | 读页数、有用字节、读放大、按 64 B 突发计的传输字节和传输放大、最忙单元和最忙通道的页数、不均衡度、MQSim makespan、两个估算值及比值，按子批、层、步输出 |
@@ -144,7 +146,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 - 主结果使用**原版 MQSim 时序**：chip 级门控、每条命令约 290 ns 的 ONFI 开销、没有 cache read（T-PLANE、T-CMD、T-CACHE 是可选的 HBF 化改造，默认关闭）。这些都是按 SSD 做的假设，未必符合 HBF，所以用拓扑扫描和 T-ONFI 做敏感性分析。
 - **FTL 用原版**，作为"未做 HBF 专门设计"的基线。CWDP 按 LPA 轮转到各单元，所以稠密读天然均衡；稀疏读是否均衡，取决于选中了哪些页。
 - **理想 HBF 下界**假设感测与传输可以完全重叠、没有命令开销。它与 MQSim 一致估算之差，就是 MQSim 建模假设带来的额外开销。
-- **估算器 1 有适用范围**：当最忙单元的串行时间和最忙通道的总线时间接近时，它会明显低估。T8 中有两组越界，T9 的 256×4 低估 57%。原因分析见报告。
+- **估算器 1 有适用范围**：当最忙单元的串行时间和最忙通道的总线时间接近时，它会明显低估。T8 中有两组越界，T9 的 256×4 低估 57%。原因分析见报告。多 plane 配置（`--planes` > 1，包括 `ocp`）不给出估算器 1，因为它按每页一条命令计算，而 MQSim 的一条多 plane 命令覆盖整个 die；这时用机制分析的轮数代替（REPORT X3）。
 
 ---
 
@@ -212,10 +214,10 @@ python3 -m hbf.cli --analysis-only --topology ocp --layers 32 --context 32768 --
 python3 -m hbf.cli --analysis-only --topology ocp --layers 32 --context 32768 --mode sink_recent --layout striped_contiguous --mocs 256 --host-order fcfs
 ```
 
-真实层级（16 die × 64 plane），先整体写入再读，plane 独立寻址，使用 HBF 命令模型（每多一个 plane 10 ns，合并窗口 1 µs）：
+真实层级（16 die × 64 plane），先整体写入再读，plane 独立寻址，使用 HBF 命令模型（每多一个 plane 10 ns，合并窗口 1 ns）、cache read：
 
 ```bash
-python3 -m hbf.cli --topology 16x1 --planes 64 --plane-rule independent --read-plane-ns 10 --coalesce-ns 1000 --cache-read --prefill --mode uniform_pages --fraction 0.05 --context 8192
+python3 -m hbf.cli --topology 16x1 --planes 64 --plane-rule independent --read-plane-ns 10 --coalesce-ns 1 --cache-read --prefill --mode uniform_pages --fraction 0.05 --context 8192
 ```
 
 导入已有的访问记录：
@@ -240,7 +242,7 @@ python3 -m pytest -q -m 'not scale' --evidence-dir runs/validation
 python3 -m pytest -q -m scale --evidence-dir runs/scale
 ```
 
-非规模测试约 1 分钟。规模测试包括 T9 的六组稠密矩阵、T9 不拆分对照和 T10，约 13 分钟。默认每 plane 512 块时，1,024 plane 的单次 MQSim 运行内存峰值约 4.2 GB，请不要并行跑多个规模测试。每次请用一个新的 `--evidence-dir`。
+非规模测试约 2 分钟。规模测试包括 T9 的六组稠密矩阵、T9 不拆分对照和 T10，约 13 分钟。默认每 plane 512 块时，1,024 plane 的单次 MQSim 运行内存峰值约 4.2 GB，请不要并行跑多个规模测试。每次请用一个新的 `--evidence-dir`。
 
 ---
 
@@ -269,7 +271,8 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 
 - `layer_contiguous` 按 (层, 张量, 头) 依次预留连续区域，各张量的块数可以不同。
 - `vllm_interleaved` 要求所有张量每页 token 数相同。
-- 使用默认规格时，两种布局的 LPA 与早期版本逐位相同。
+- `striped_contiguous` 与 `layer_contiguous` 的区域顺序相同，每层从相位 0 开始，区域之间留固定间隔（填充页）；`--prefill` 会把填充页一起写入。
+- 使用默认规格时，`layer_contiguous` 和 `vllm_interleaved` 的 LPA 与早期版本逐位相同。
 
 ### 运行目录
 
@@ -334,7 +337,7 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 ```
 .
 ├── README.md            项目介绍（本文件）
-├── REPORT.md            第 0 阶段验证报告：配置、实测、偏差、源码依据
+├── REPORT.md            验证与实验报告：第 0 阶段验证、第 1 阶段改进、规范一致性、协议与选择粒度实验
 ├── hbf/                 中间件 Python 包
 │   ├── access.py        访问记录、张量规格、布局、生成器
 │   ├── controller.py    分批、去重、估算器、指标

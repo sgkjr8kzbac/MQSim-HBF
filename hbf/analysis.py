@@ -7,8 +7,8 @@ rounds a group needs depends on how its pages land on the planes and on the plan
 * ``group = 1`` - independent planes. Every plane senses any block and page in a round, as the
   OCP HBF spec (per-bank sense ordering) and SPLASH assume. A plane holding ``L`` wanted pages
   needs ``L`` rounds.
-* ``group = g > 1`` - lock-step groups of ``g`` planes in one die (FlashAccel's megaplanes,
-  and MQSim's own multi-plane rule). All planes of a group sense the same offset in a round, so
+* ``group = g > 1`` - lock-step groups of ``g`` planes in one die (FlashAccel's megaplanes;
+  MQSim's upstream same-page rule behaves the same after a prefill). All planes of a group sense the same offset in a round, so
   a group needs one round per distinct offset it must read, and every plane of the group senses
   in that round whether it holds a wanted page or not.
 
@@ -97,13 +97,17 @@ def analyze_group(cfg, requests, group=1, offsets=None):
     pages = len(reads)
     total = dies * per_die
     rounds = max(map(len, needed.values()), default=0)
+    # Core-die (MQSim) channel bound: a channel's bus moves one page per transfer_ns, so a round of
+    # tR carries at most read_ns / transfer_ns pages per channel (dense reads at 384 or 1,024 GB/s).
+    per_channel = Counter(cfg.device_lpa(req.lpa) % cfg.channels for req in reads)
+    channel_rounds = ceil(max(per_channel.values(), default=0) * cfg.transfer_ns / cfg.read_ns)
     best = ceil(pages / total)
     senses = group * sum(map(len, needed.values()))
     useful = sum(req.useful_bytes for req in reads)
     bursts = sum(req.burst_bytes for req in reads)
     return {
         "group": group, "planes": total, "pages": pages, "active_planes": len(planes),
-        "rounds": rounds, "min_rounds": best,
+        "rounds": rounds, "min_rounds": best, "channel_rounds": channel_rounds,
         "utilization": pages / (rounds * total) if rounds else None,
         "balance_loss": rounds / best if rounds else None,
         "sensed_pages": senses, "sense_amplification": senses / pages if pages else None,
@@ -119,7 +123,7 @@ READ_UNITS = ("page", "wanted")
 HOST_ORDERS = ("fcfs", "trigger")
 GROUP_SENSES = ("arrived", "whole")
 # System read throughput per UCIe module and direction, OCP sections 5.1.2.1-5.1.2.3 (GB/s).
-UCIE_GRADES = {1: 48, 2: 94, 3: 188}
+UCIE_GRADES = {1: 48, 2: 94, 3: 188}  # grade 1 allows at most 8 modules (0.384 TB/s), 2 and 3 up to 16
 
 
 @dataclass(frozen=True)
@@ -272,7 +276,8 @@ def analyze(cfg, batches, groups=(1,), mode="static", protocol=None):
         part = [req for req in batch.requests if req.op == "R"]
         if part:
             parts[batch.step, batch.layer].append(part)
-    keys = ("pages", "rounds", "batch_rounds", "min_rounds", "sensed_pages", "useful_bytes", "burst_bytes")
+    keys = ("pages", "rounds", "batch_rounds", "min_rounds", "channel_rounds", "sensed_pages", "useful_bytes",
+            "burst_bytes")
     if protocol is not None:
         keys += ("commands", "credit_rounds", "link_rounds", "protocol_rounds")
     layers, steps = [], []
