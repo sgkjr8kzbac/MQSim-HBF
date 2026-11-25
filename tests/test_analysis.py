@@ -279,6 +279,24 @@ def test_credit_rounds_match_hbf_eventlab_probe():
     assert protocol_rounds(cfg, reads, 1, None, Protocol(256))[:2] == (2, 2)
     assert protocol_rounds(cfg, reads, 1, None, Protocol(1024))[:2] == (1, 1)
     assert protocol_rounds(cfg, reads, 1, None, Protocol(256, read_burst=True))[:2] == (1, 1)
+    # Trigger-first order (one 64 B read starts the sense): HBF-EventLab 4.31 us, one round.
+    assert protocol_rounds(cfg, reads, 1, None, Protocol(256, host_order="trigger"))[0] == 1
+
+
+def test_credit_rounds_against_hbf_eventlab_four_pages_per_bank():
+    """32 pages on 8 banks of host channel 0 (4 per bank), MOCS 256, sense 4.096 us.
+
+    HBF-EventLab sensed in 7 waves of up to 5 pages with the natural order (it frees each credit
+    when its response is delivered), 4 waves (the bank bound) with trigger-first order or MOCS 1024.
+    The round model holds credits for a whole round, so under fcfs it is one round pessimistic.
+    """
+    from hbf.analysis import Protocol, protocol_rounds
+    cfg = load("ocp")
+    reads = [Request(16 * (bank + 64 * k)) for bank in range(8) for k in range(4)]
+    assert {cfg.host_channel(req.lpa) for req in reads} == {0} and analyze_group(cfg, reads)["rounds"] == 4
+    assert protocol_rounds(cfg, reads, 1, None, Protocol(256))[0] == 8
+    assert protocol_rounds(cfg, reads, 1, None, Protocol(256, host_order="trigger"))[0] == 4
+    assert protocol_rounds(cfg, reads, 1, None, Protocol(1024))[0] == 4
 
 
 @pytest.mark.parametrize("seed", range(5))
@@ -296,9 +314,9 @@ def test_greedy_credit_schedule_reaches_the_bound(seed):
             mine = [req for req in reads if cfg.host_channel(req.lpa) == host]
             banks = Counter(locate(cfg, req.lpa)[:2] for req in mine)
             bound = max(bound, max(banks.values()), -(-len(mine) // (protocol.mocs // per_page)))
-        rounds, credit, commands = protocol_rounds(cfg, reads, 1, None, protocol)
+        rounds, credit, commands, _ = protocol_rounds(cfg, reads, 1, None, protocol)
         assert rounds == bound and commands == 3000 * per_page and credit <= rounds
-    lockstep, _, _ = protocol_rounds(cfg, reads, 16, None, Protocol(16384))
+    lockstep, _, _, _ = protocol_rounds(cfg, reads, 16, None, Protocol(16384))
     assert lockstep == analyze_group(cfg, reads, 16)["rounds"]  # ample credits: only the groups limit
 
 
@@ -309,6 +327,42 @@ def test_protocol_columns_in_pipeline(tmp_path):
              generation={"fraction": .05}, plane_groups=(1, 16), protocol=Protocol(256))
     rows = list(csv.DictReader((tmp_path / "p" / "analysis_steps.csv").open()))
     for row in rows:
-        assert int(row["protocol_rounds"]) >= max(int(row["rounds"]), int(row["credit_rounds"]))
+        assert int(row["protocol_rounds"]) >= max(int(row["rounds"]), int(row["credit_rounds"]),
+                                                  int(row["link_rounds"]))
         assert int(row["commands"]) == 64 * int(row["pages"])
     assert "协议约束" in (tmp_path / "p" / "report.md").read_text()
+
+
+def test_items_larger_than_mocs_span_rounds():
+    """A lock-step offset that gathers 16 pages needs 1,024 commands: four rounds at MOCS 256."""
+    from hbf.analysis import Protocol, protocol_rounds
+    cfg = load("ocp")
+    die0 = [Request(16 * bank) for bank in range(16)]  # host channel 0, die 0, banks 0-15, offset 0
+    rounds, credit, commands, _ = protocol_rounds(cfg, die0, 16, None, Protocol(256))
+    assert (rounds, credit, commands) == (4, 4, 1024)
+    assert protocol_rounds(cfg, die0, 16, None, Protocol(256, host_order="trigger"))[0] == 1
+    mocs1 = protocol_rounds(cfg, [Request(lpa) for lpa in range(128)], 1, None, Protocol(1))
+    assert mocs1[0] >= mocs1[1] == 512  # 8 pages x 64 commands per host channel, one at a time
+
+
+def test_cwdp_topologies_keep_sixteen_host_channels():
+    from hbf.analysis import Protocol, protocol_rounds
+    for topology in ("16x64", "64x16", "256x4"):
+        cfg = load(topology)
+        assert cfg.host_channels == 16 and {cfg.host_channel(lpa) for lpa in range(64)} == set(range(16))
+    reads = [Request(lpa) for lpa in range(1024)]
+    for topology in ("16x64", "64x16", "256x4"):
+        assert protocol_rounds(load(topology), reads, 1, None, Protocol(256))[:2] == (16, 16)
+    assert load("16x1", planes=64).host_channels == 16 and load("16x64", channels=1, chips=4).host_channels == 1
+
+
+def test_link_bound_follows_ucie_grade():
+    """A dense round of 64 pages per host channel moves 256 KiB: 5.46 us at grade 1 (48 GB/s)."""
+    from hbf.analysis import Protocol, protocol_rounds
+    cfg = load("ocp")
+    reads = [Request(lpa) for lpa in range(1024 * 2)]  # every bank twice
+    link = {grade: protocol_rounds(cfg, reads, 1, None, Protocol(16384, ucie_grade=grade))[3] for grade in (1, 2, 3)}
+    # per host channel: 128 pages = 512 KiB; one tR carries 48/94/188 GB/s x 4,096 ns
+    assert link == {1: 3, 2: 2, 3: 1}
+    with pytest.raises(ValueError, match="ucie_grade"):
+        Protocol(256, ucie_grade=4)

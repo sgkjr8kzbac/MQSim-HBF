@@ -17,6 +17,7 @@ MAX_PLANES = 64
 PLANE_RULES = (None, "independent", "lockstep")
 ADDRESS_MAPS = ("cwdp", "ocp")
 OCP_DIES_PER_HOST_CHANNEL = 4  # Figure 4: 2 core-die channels x 2 dies per host channel
+OCP_HOST_CHANNELS = 16  # section 4.1: "Support 16 host channels"
 
 
 @dataclass(frozen=True)
@@ -185,7 +186,11 @@ class Config:
 
     @property
     def host_channels(self):
-        return self.channels // 2 if self.address_map == "ocp" else self.channels
+        """Host (UCIe) channels: ``ocp`` has two core-die channels per host channel; ``cwdp`` takes
+        the spec's 16 host channels (section 4.1) with 4 KiB interleave, or fewer MQSim channels."""
+        if self.address_map == "ocp":
+            return self.channels // 2
+        return min(self.channels, OCP_HOST_CHANNELS)
 
     def device_lpa(self, lpa):
         """The LPA that MQSim sees, so that its CWDP placement realises ``address_map``.
@@ -218,10 +223,13 @@ class Config:
         return host + hosts * local
 
     def host_channel(self, lpa):
-        """Host (UCIe) channel of an LPA: for ``ocp`` the 4 KiB interleave over host channels; for
-        ``cwdp`` each MQSim channel is taken as one host channel (16x64 then matches the spec's
-        4 KiB interleave over 16 host channels)."""
-        return lpa % self.host_channels if self.address_map == "ocp" else self.device_lpa(lpa) % self.channels
+        """Host (UCIe) channel of an LPA under the spec's 4 KiB interleave (Figure 3, n = 6).
+
+        For ``cwdp`` with 16 or more MQSim channels the host channel is the MQSim channel modulo 16,
+        so 64x16 and 256x4 keep the spec's 16 host channels (and 16 MOCS budgets)."""
+        if self.address_map == "cwdp" and self.channels % self.host_channels:
+            raise ValueError("Host channels need a channel count that is a multiple of 16")
+        return lpa % self.host_channels
 
     def unit(self, lpa):
         """Index of the MQSim (channel, chip, die, plane) that holds ``lpa``."""

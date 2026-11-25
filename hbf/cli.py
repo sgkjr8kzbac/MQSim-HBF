@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .access import LAYOUTS, MODES, Shape, generate, parse_tensors, read_access, tensors_meta, write_access
-from .analysis import READ_UNITS, Protocol, analyze, check_group
+from .analysis import HOST_ORDERS, READ_UNITS, Protocol, analyze, check_group
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule_run, unwritten_reads
 from .simulator import build, dump, simulate, write_table
@@ -16,12 +16,14 @@ from .simulator import build, dump, simulate, write_table
 def protocol_report(step_rows, protocol):
     report = ["## 协议约束（每主机通道命令额度）", "",
               f"MOCS = {protocol.mocs}，读突发：{'支持' if protocol.read_burst else '不支持（每条读 64 B）'}，"
-              f"读取单位：{'整页' if protocol.read_unit == 'page' else '只读需要的 64 B 段'}。", "",
-              "| 并行组 | Step | 读命令 | 只受额度限制的轮数 | bank 与额度共同限制的轮数 | 利用率 |",
-              "|---:|---:|---:|---:|---:|---:|"]
+              f"读取单位：{'整页' if protocol.read_unit == 'page' else '只读需要的 64 B 段'}，"
+              f"主机发送顺序：{'整页命令一起排队（fcfs）' if protocol.host_order == 'fcfs' else '先发一条触发感测（trigger）'}，"
+              f"链路档位：{protocol.ucie_grade or '不计'}。", "",
+              "| 并行组 | Step | 读命令 | 只受额度限制的轮数 | 只受链路限制的轮数 | 全部约束下的轮数 | 利用率 |",
+              "|---:|---:|---:|---:|---:|---:|---:|"]
     for row in step_rows:
         report.append(f"| {row['group']} | {row['step']} | {row['commands']} | {row['credit_rounds']} | "
-                      f"{row['protocol_rounds']} | {row['protocol_utilization']:.3f} |")
+                      f"{row['link_rounds']} | {row['protocol_rounds']} | {row['protocol_utilization']:.3f} |")
     return report
 
 
@@ -152,6 +154,11 @@ def main():
                         help="analysis: the product supports burst reads (one command per contiguous run)")
     parser.add_argument("--read-unit", choices=READ_UNITS, default="page",
                         help="analysis: read whole pages or only the 64 B units with wanted tokens")
+    parser.add_argument("--host-order", choices=HOST_ORDERS, default="fcfs",
+                        help="analysis: fcfs queues a page's commands together (they hold credits during the "
+                             "sense); trigger sends one 64 B read first and the rest as cache hits")
+    parser.add_argument("--ucie-grade", type=int, choices=(1, 2, 3),
+                        help="analysis: bound rounds by the host link (48/94/188 GB/s per channel)")
     parser.add_argument("--analysis-only", action="store_true",
                         help="write the mechanism analysis without building or running MQSim")
     parser.add_argument("--output", type=Path)
@@ -172,8 +179,10 @@ def main():
         for group in args.plane_groups or (1,):
             check_group(cfg, group)
         protocol = None
-        if args.mocs is not None or args.read_burst or args.read_unit != "page":
-            protocol = Protocol(256 if args.mocs is None else args.mocs, args.read_burst, args.read_unit)
+        if (args.mocs is not None or args.read_burst or args.read_unit != "page" or args.host_order != "fcfs"
+                or args.ucie_grade is not None):
+            protocol = Protocol(256 if args.mocs is None else args.mocs, args.read_burst, args.read_unit,
+                                args.host_order, args.ucie_grade)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     shape = Shape(args.layers, args.heads, args.head_dim, args.context)

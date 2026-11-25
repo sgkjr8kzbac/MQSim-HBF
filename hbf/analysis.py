@@ -116,79 +116,112 @@ def analyze_group(cfg, requests, group=1, offsets=None):
 BURST_BYTES = 64
 MOCS_VALUES = (1,) + tuple(2 ** k for k in range(8, 15))  # OCP register: 1 or 256 ... 16,384
 READ_UNITS = ("page", "wanted")
+HOST_ORDERS = ("fcfs", "trigger")
+# System read throughput per UCIe module and direction, OCP sections 5.1.2.1-5.1.2.3 (GB/s).
+UCIE_GRADES = {1: 48, 2: 94, 3: 188}
 
 
 @dataclass(frozen=True)
 class Protocol:
     """Host protocol limits on read concurrency (OCP HBF v0.7.0).
 
-    * ``mocs`` - Maximum Outstanding Commands Selected: commands the base die command queue of one
-      host channel accepts at once (capability register: 1 or a power of two from 256 to 16,384).
+    * ``mocs`` - Maximum Outstanding Commands Selected of a host channel's base-die command queue
+      (capability register of the Base Die UCIe Channel, section 5.9.2.1: 1 or a power of two
+      from 256 to 16,384).
     * ``read_burst`` - burst reads supported (product option, BCS bit). Without them every read is
       one 64 B command, so a whole 4 KiB page takes 64 commands (section 5.3.1, item 1); with them
-      one command reads up to 64 consecutive 64 B units of a page.
+      one command reads a contiguous run of up to 64 units of 64 B inside one page (section 4.1).
     * ``read_unit`` - ``page`` reads the whole 4 KiB page; ``wanted`` reads only the 64 B units
-      that hold wanted tokens (one burst command per contiguous run when bursts are supported).
-
-    The sensing is a whole page either way; later 64 B reads of a sensed page hit the bank's
-    cache buffer (section 5.3.1, items 5a and 8), so they cost commands but no extra round.
+      that hold wanted tokens.
+    * ``host_order`` - ``fcfs`` queues all commands of a page at once, as HBF-EventLab's default
+      host does, so they hold credits while the page is sensed; ``trigger`` first sends one 64 B
+      read per page to start the sense and the rest after the data reached the bank's cache
+      buffer, where they are served at once as cache hits (section 5.3.1, items 5a, 7 and 8).
+      The spec allows both; ``trigger`` needs only one credit per page during the sense.
+    * ``ucie_grade`` - optional speed grade 1-3 for a link bound: a host channel moves at most
+      48, 94 or 188 GB/s of read data, so a round of tR carries at most that much.
     """
     mocs: int = 256
     read_burst: bool = False
     read_unit: str = "page"
+    host_order: str = "fcfs"
+    ucie_grade: int | None = None
 
     def __post_init__(self):
         if self.mocs not in MOCS_VALUES:
             raise ValueError(f"MOCS must be one of {MOCS_VALUES} (OCP capability register)")
         if self.read_unit not in READ_UNITS or type(self.read_burst) is not bool:
             raise ValueError(f"read_unit must be one of {READ_UNITS}")
+        if self.host_order not in HOST_ORDERS:
+            raise ValueError(f"host_order must be one of {HOST_ORDERS}")
+        if self.ucie_grade is not None and self.ucie_grade not in UCIE_GRADES:
+            raise ValueError("ucie_grade must be 1, 2 or 3 (OCP section 5.1.2)")
 
     def commands(self, cfg, req):
-        """Read commands one page request needs."""
+        """Read commands one page request needs in total."""
         if self.read_unit == "page":
             return 1 if self.read_burst else cfg.page_bytes // BURST_BYTES
         return req.burst_runs if self.read_burst else req.burst_bytes // BURST_BYTES
+
+    def sensing_credits(self, cfg, req):
+        """Credits the page holds while its sense is pending."""
+        return 1 if self.host_order == "trigger" else self.commands(cfg, req)
+
+    def read_bytes(self, cfg, req):
+        return cfg.page_bytes if self.read_unit == "page" else req.burst_bytes
 
 
 def protocol_rounds(cfg, reads, group, offsets, protocol):
     """Read rounds when each host channel can hold at most ``mocs`` outstanding commands.
 
     A round senses at most one offset per lock-step group (one page per bank for ``group = 1``) and,
-    per host channel, issues at most ``mocs`` commands; a page's commands are counted in the round
-    that senses it, as their credits stay held until the data is returned. Rounds are scheduled
-    greedily per host channel, longest group queue first, which reaches the lower bound
-    max(longest queue, ceil(commands / mocs)) when every page needs the same number of commands.
-    Returns (rounds, credit-bound rounds, total commands).
+    per host channel, admits at most ``mocs`` credits; a page holds ``sensing_credits`` credits in
+    the round that senses it. An item that needs more credits than are left (a lock-step offset that
+    gathers many pages, or MOCS = 1) is admitted over several rounds and its group waits meanwhile.
+    Rounds are scheduled greedily per host channel, longest group queue first: with equal credits per
+    page this reaches max(longest queue, ceil(pages / floor(MOCS / credits))); otherwise it is an
+    achievable upper bound. The model treats a round as one tR and releases all credits at its end,
+    so it is approximate: HBF-EventLab, which frees each credit when its response is delivered,
+    fits slightly more pages per wave under ``fcfs``.
+
+    Returns (rounds, credit-bound rounds, total commands, link-bound rounds).
     """
     queues = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-    total = 0
+    commands = 0
+    data = defaultdict(int)
     for req in reads:
         die, plane, offset = locate(cfg, req.lpa, offsets)
-        cost = protocol.commands(cfg, req)
-        queues[cfg.host_channel(req.lpa)][die, plane // group][offset] += cost
-        total += cost
+        host = cfg.host_channel(req.lpa)
+        queues[host][die, plane // group][offset] += protocol.sensing_credits(cfg, req)
+        commands += protocol.commands(cfg, req)
+        data[host] += protocol.read_bytes(cfg, req)
     rounds = credit = 0
     for groups in queues.values():
-        pending = {key: sorted(items.items()) for key, items in groups.items()}
-        commands = sum(cost for items in pending.values() for _, cost in items)
-        credit = max(credit, -(-commands // protocol.mocs))
+        pending = {key: [list(item) for item in sorted(items.items())] for key, items in groups.items()}
+        credit = max(credit, -(-sum(cost for items in pending.values() for _, cost in items) // protocol.mocs))
         count = 0
         while pending:
             budget = protocol.mocs
-            issued = False
             for key in sorted(pending, key=lambda k: -len(pending[k])):
-                cost = pending[key][0][1]
-                if cost <= budget or not issued:  # a lone item may exceed a tiny MOCS
-                    budget -= cost
-                    issued = True
+                if budget == 0:
+                    break
+                head = pending[key][0]
+                admitted = min(head[1], budget)
+                if admitted < head[1] and admitted < protocol.mocs and head[1] <= protocol.mocs:
+                    continue  # it fits in a fresh round; do not split it
+                head[1] -= admitted
+                budget -= admitted
+                if head[1] == 0:
                     pending[key].pop(0)
                     if not pending[key]:
                         del pending[key]
-                if budget <= 0:
-                    break
             count += 1
         rounds = max(rounds, count)
-    return rounds, credit, total
+    link = 0
+    if protocol.ucie_grade is not None and data:
+        per_round = UCIE_GRADES[protocol.ucie_grade] * cfg.read_ns  # GB/s x ns = bytes
+        link = -(-max(data.values()) // per_round)
+    return rounds, credit, commands, link
 
 
 PLACEMENTS = ("static", "mqsim")
@@ -212,7 +245,7 @@ def analyze(cfg, batches, groups=(1,), mode="static", protocol=None):
             parts[batch.step, batch.layer].append(part)
     keys = ("pages", "rounds", "batch_rounds", "min_rounds", "sensed_pages", "useful_bytes", "burst_bytes")
     if protocol is not None:
-        keys += ("commands", "credit_rounds", "protocol_rounds")
+        keys += ("commands", "credit_rounds", "link_rounds", "protocol_rounds")
     layers, steps = [], []
     for group in groups:
         totals = {}
@@ -225,7 +258,8 @@ def analyze(cfg, batches, groups=(1,), mode="static", protocol=None):
                 limited = [protocol_rounds(cfg, chunk, group, offsets, protocol) for chunk in chunks]
                 row["commands"] = sum(item[2] for item in limited)
                 row["credit_rounds"] = sum(item[1] for item in limited)
-                row["protocol_rounds"] = sum(item[0] for item in limited)
+                row["link_rounds"] = sum(item[3] for item in limited)
+                row["protocol_rounds"] = sum(max(item[0], item[3]) for item in limited)
                 row["protocol_utilization"] = row["pages"] / (row["protocol_rounds"] * row["planes"])
             layers.append(row)
             total = totals.setdefault(step, {"group": group, "step": step, "planes": row["planes"],
