@@ -15,6 +15,8 @@ DEFAULT_DBSY_NS = 500
 MAX_PLANES = 64
 # None keeps upstream multi-plane grouping (same page index); see hbf/patches/T-PLANE.patch.
 PLANE_RULES = (None, "independent", "lockstep")
+ADDRESS_MAPS = ("cwdp", "ocp")
+OCP_DIES_PER_HOST_CHANNEL = 4  # Figure 4: 2 core-die channels x 2 dies per host channel
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,7 @@ class Config:
     coalesce_ns: int | None = None
     read_plane_ns: int | None = None
     cache_read: bool = False
+    address_map: str = "cwdp"
 
     def __post_init__(self):
         if any(type(n) is not int or not 1 <= n <= 65535 for n in self.geometry):
@@ -70,6 +73,11 @@ class Config:
         if self.coalesce_ns is not None and (type(self.coalesce_ns) is not int or self.coalesce_ns <= 0
                                              or self.scheduler != "PRIORITY_OUT_OF_ORDER"):
             raise ValueError("A coalescing window must be a positive integer with PRIORITY_OUT_OF_ORDER")
+        if self.address_map not in ADDRESS_MAPS:
+            raise ValueError(f"address_map must be one of {ADDRESS_MAPS}")
+        if self.address_map == "ocp" and (self.chips != 2 or self.dies != 1 or self.channels % 2):
+            raise ValueError("The OCP address map models Figure 4: 2 core-die channels per host channel, "
+                             "2 dies (chips) per core-die channel and one MQSim die per chip")
         if type(self.cache_read) is not bool or self.cache_read and (
                 self.scheduler != "PRIORITY_OUT_OF_ORDER" or self.suspend != "NONE"):
             raise ValueError("Cache read (T-CACHE) needs PRIORITY_OUT_OF_ORDER and no suspension")
@@ -163,13 +171,53 @@ class Config:
         blocks = self.blocks_per_plane - 3 - self.gc_threshold_blocks + 1
         return max(blocks * self.pages_per_block - 1, 0)
 
+    @property
+    def host_channels(self):
+        return self.channels // 2 if self.address_map == "ocp" else self.channels
+
+    def device_lpa(self, lpa):
+        """The LPA that MQSim sees, so that its CWDP placement realises ``address_map``.
+
+        ``cwdp`` is MQSim's own order (channel, chip, die, plane). ``ocp`` follows the OCP HBF spec:
+        host addresses are interleaved in 4 KiB units over the host channels (Figure 3, n = 6);
+        inside a host channel the low 4 bits of the 4 KiB unit select the bank and the next 2 bits
+        the die (section 4.6); Figure 4 puts dies 0 and 2 on core-die channel 0 and dies 1 and 3 on
+        core-die channel 1. The page offset inside a bank is ``lpa // units`` in both maps.
+        """
+        if self.address_map == "cwdp":
+            return lpa
+        hosts, banks = self.host_channels, self.planes
+        host, local = lpa % hosts, lpa // hosts
+        bank, die, offset = local % banks, local // banks % OCP_DIES_PER_HOST_CHANNEL, local // (
+            banks * OCP_DIES_PER_HOST_CHANNEL)
+        channel, chip = 2 * host + die % 2, die // 2
+        return channel + self.channels * (chip + self.chips * (bank + banks * offset))
+
+    def host_lpa(self, device):
+        """Inverse of ``device_lpa``."""
+        if self.address_map == "cwdp":
+            return device
+        hosts, banks = self.host_channels, self.planes
+        channel, rest = device % self.channels, device // self.channels
+        chip, rest = rest % self.chips, rest // self.chips
+        bank, offset = rest % banks, rest // banks
+        host, die = channel // 2, channel % 2 + 2 * chip
+        local = bank + banks * (die + OCP_DIES_PER_HOST_CHANNEL * offset)
+        return host + hosts * local
+
+    def unit(self, lpa):
+        """Index of the MQSim (channel, chip, die, plane) that holds ``lpa``."""
+        return self.device_lpa(lpa) % self.units
+
     def lba(self, lpa):
+        """MQSim LBA of a host LPA (through ``device_lpa``)."""
         if not 0 <= lpa < self.capacity_sectors // self.spp:
             raise ValueError(f"LPA {lpa} exceeds logical capacity")
-        return lpa * self.spp
+        return self.device_lpa(lpa) * self.spp
 
     def physical(self, lpa):
         self.lba(lpa)
+        lpa = self.device_lpa(lpa)
         address = []
         for length in self.geometry:
             lpa, index = divmod(lpa, length)
@@ -179,7 +227,7 @@ class Config:
     def unit_lpa(self, unit, k, base=0):
         if not 0 <= unit < self.units or k < 0 or base < 0:
             raise ValueError("Invalid unit or page index")
-        lpa = base + (unit - base) % self.units + k * self.units
+        lpa = self.host_lpa(base + (unit - base) % self.units + k * self.units)
         self.lba(lpa)
         return lpa
 
@@ -193,23 +241,27 @@ class Config:
 
 
 def parse_topology(topology, named=None):
-    """Channels and chips per channel of a named topology or of any ``<channels>x<chips>``."""
+    """Config fields of a named topology or of any ``<channels>x<chips>``.
+
+    A named topology is either ``[channels, chips]`` or a dict of Config fields.
+    """
     if named and topology in named:
-        return tuple(named[topology])
+        value = named[topology]
+        return dict(value) if isinstance(value, dict) else {"channels": value[0], "chips": value[1]}
     try:
         channels, chips = map(int, topology.split("x"))
     except (AttributeError, ValueError):
         raise ValueError(f"Topology {topology!r} is neither named nor <channels>x<chips>") from None
-    return channels, chips
+    return {"channels": channels, "chips": chips}
 
 
 def load(topology="64x16", **overrides):
     params = json.loads(PARAMETERS.read_text())
-    channels, chips = parse_topology(topology, params.pop("topologies"))
+    fields = parse_topology(topology, params.pop("topologies"))
     reference = params.pop("calibration_reference")
     if reference["width_gb_s"] * reference["xfer_ns"] != params["page_bytes"]:
         raise ValueError("Reference NAND transfer calibration disagrees with the page size")
-    return replace(Config(channels, chips, **params.pop("calibration"), **params), **overrides)
+    return replace(Config(**params.pop("calibration"), **params, **fields), **overrides)
 
 
 def xml_settings(cfg):

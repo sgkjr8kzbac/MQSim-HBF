@@ -321,6 +321,12 @@ MQSim 真实层级（16 die × 64 plane，T-CMD δ = 10 ns、窗口 1 µs，T-CA
 
 条带化在 plane 独立寻址时效果最好（轮数降到下限）；在 lockstep 下也有效，但幅度小得多：每层 32 → 18 轮，因为联动要求同一轮读同一偏移，条带化把各头的页分散到不同 plane，却不能让它们的偏移对齐。此前版本写的是"lockstep 下轮数不变（128 轮）"，那是 prefill 没有写填充页、MQSim 压紧偏移造成的假象（规范一致性审查 S3），已按规范的静态位置重测。
 
+### 规范示例拓扑 `ocp`
+
+按规范图 4（p23）的例子新增命名拓扑 `ocp`：每个主机通道 2 条 core die 通道 × 每通道 2 个 die × 每 die 16 个 bank，16 个主机通道共 1,024 个 bank；MQSim 中为 32 通道 × 2 chip × 16 plane，plane 规则 independent。`Config.address_map = "ocp"` 按规范排列地址：4 KiB 单元在主机通道间交织（图 3，n = 6）；通道内低 4 位为 bank、再 2 位为 die（§4.6）；die 0、2 在 core die 通道 0，die 1、3 在通道 1（图 4）。`Config.device_lpa` 把这个顺序换算成 MQSim CWDP 下的 LPA，`host_lpa` 是其逆；测试逐个核对图 4 中的位置、双射性，以及 MQSim 物理时间线上每个写入页的 (通道, chip, plane, 偏移)。
+
+机制分析中，`ocp` 每个 die 的 16 个 bank 与 16×64 中"同一通道、相邻 16 个 chip"恰好是同一组单元，所以独立 plane 和 16 联动的轮数两者完全相同（Llama-3.1-8B 形状、32K：5% 均匀选页 215 / 789 轮，sink_recent 512 / 512 轮，条带布局 32 / 192 轮）。两者的差别在 MQSim 的总线结构：`ocp` 是 32 条通道各挂 2 个 die，16×64 是 16 条通道各挂 64 个 chip。
+
 ### T-CACHE：cache read
 
 原版 MQSim 的读要等全部页传出后 chip 才回到空闲，感测和传输不能重叠。补丁 `T-CACHE.patch`（`HBF_T_CACHE`）对用户读实现双缓冲：
@@ -354,7 +360,7 @@ cache read 不改变轮数：16 die × 64 plane、lockstep、10% 选页时，开
 | S2 | 读未写过的页在规范中返回错误，MQSim 却分配新页并成功返回 | 表 12 p60 "Read from ErasePage"，错误码 0x7；§11.5.1.7 p120 | 同 S1 | 统计并拒绝（多 plane 时）读未写页 | 已改：分析默认静态位置；prefill 按地址顺序写满（含填充页）；多 plane 运行拒绝读未写页；条带结论已重测 |
 | S3 | 条带布局的填充地址没有写入，MQSim 把后续页的偏移压紧 | §5.4.1 第 4 条 "No skipping or jumping of 4KiB local address" | 条带布局 lockstep-64 每层按规范 18 轮，报告写成 32 轮；"条带化在 lockstep 下无效"的结论不成立 | prefill 连同填充地址一起写 | 已改：分析默认静态位置；prefill 按地址顺序写满（含填充页）；多 plane 运行拒绝读未写页；条带结论已重测 |
 | S4 | README 的 lockstep 示例没加 `--prefill` | 同 S1 | 示例结果低估约 2.8 倍 | 改示例 | 已改：分析默认静态位置；prefill 按地址顺序写满（含填充页）；多 plane 运行拒绝读未写页；条带结论已重测 |
-| S5 | 规范示例层级没有现成配置：每主机通道 2 条 core die 通道 × 每通道 2 die × 每 die 16 bank，共 1,024 bank；地址先 bank 后 die | 图 4 p23（"for example"）；表 3 p16 只给 cube 汇总，信息不全 | 现有 T-PLANE 用 SPLASH 的 16 die × 64 plane，分组不同 | 新增规范示例拓扑和地址顺序 | 待改 |
+| S5 | 规范示例层级没有现成配置：每主机通道 2 条 core die 通道 × 每通道 2 die × 每 die 16 bank，共 1,024 bank；地址先 bank 后 die | 图 4 p23（"for example"）；表 3 p16 只给 cube 汇总，信息不全 | 现有 T-PLANE 用 SPLASH 的 16 die × 64 plane，分组不同 | 新增规范示例拓扑和地址顺序 | 已改：新增 `--topology ocp`（32 通道 × 2 die × 16 bank，规范地址顺序） |
 | S6 | 规范三档带宽 0.384/1.536/3.072 TB/s 无法配置：16 通道下每通道 24/96/192 GB/s 不是 2 的幂，配置检查拒绝 | 表 2、表 4 p16 | 无法做带宽档位扫描 | 放宽检查，传输时间与 MQSim 的整数算法一致 | 待改 |
 | S7 | 文档措辞：缓冲个数写成"要求"；"16x16 对应规范示例"；"16 die × 64 plane 和 HBF 一致"；"标称 1 TB/s"；512 GiB 是物理容量而规范表 3 是用户容量 | §5.3.1 第 7 条 p57；图 4；表 3、表 4 | 仅文档 | 改措辞并注明出处 | 待改 |
 | S8 | 调度按 die 门控（T-PLANE、T-CACHE），规范按 bank 排序感测、每 bank 两个缓冲 | §5.3.1 第 5b–8 条 p57 | 多 plane 模式下时延偏保守，轮数不变 | 不改：chip 当 plane 模式即按 bank 独立调度；在文档中说明 | 不改 |

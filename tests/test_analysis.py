@@ -118,8 +118,9 @@ def test_analysis_only_pipeline_skips_mqsim(tmp_path):
 
 
 def test_parse_topology():
-    assert parse_topology("16x16") == (16, 16)
-    assert parse_topology("64x16", {"64x16": [64, 16]}) == (64, 16)
+    assert parse_topology("16x16") == {"channels": 16, "chips": 16}
+    assert parse_topology("64x16", {"64x16": [64, 16]}) == {"channels": 64, "chips": 16}
+    assert load("ocp").geometry == (32, 2, 1, 16) and load("ocp").address_map == "ocp"
     with pytest.raises(ValueError, match="neither named"):
         parse_topology("sixteen")
 
@@ -202,3 +203,48 @@ def test_striped_layout_runs_in_mqsim(binary, tmp_path):
                                    prefill_layout=True)
     reads = [row for row in layers if row["step"] == 0]
     assert len(reads) == 2 and all(row["read_pages"] == 16 * (1 + 13) for row in reads)
+
+
+def test_ocp_address_map_follows_figure_4():
+    """4 KiB units: host channel = g mod 16; inside it bank = L mod 16, die = L / 16 mod 4 (section 4.6).
+
+    Figure 4: dies 0 and 2 sit on core-die channel 0, dies 1 and 3 on core-die channel 1; unit 64 of a
+    host channel returns to die 0, bank 0, one page further.
+    """
+    cfg = load("ocp")
+    assert cfg.units == 1024 and cfg.host_channels == 16 and plane_geometry(cfg) == (64, 16)
+    host = 3
+    expect = {0: (0, 0, 0), 15: (0, 0, 15), 16: (1, 0, 0), 31: (1, 0, 15), 32: (0, 1, 0), 48: (1, 1, 0),
+              63: (1, 1, 15), 64: (0, 0, 0)}
+    for local, (core, chip, bank) in expect.items():
+        lpa = host + 16 * local
+        assert cfg.physical(lpa) == (2 * host + core, chip, 0, bank)
+        assert locate(cfg, lpa)[2] == local // 64
+    span = range(3 * cfg.units)
+    assert sorted(cfg.device_lpa(lpa) for lpa in span) == list(span)
+    assert all(cfg.host_lpa(cfg.device_lpa(lpa)) == lpa for lpa in span)
+    assert all(cfg.unit(cfg.unit_lpa(unit, 2)) == unit for unit in range(cfg.units))
+    layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 8, 128, 8192))
+    rows, _ = analyze(cfg, schedule(cfg, layout, generate(cfg, layout, "dense")), (1, 16))
+    assert [(row["group"], row["utilization"], row["rounds"]) for row in rows] == [(1, 1, 8), (16, 1, 8)]
+    with pytest.raises(ValueError, match="must divide"):
+        analyze_group(cfg, [Request(0)], 32)
+    with pytest.raises(ValueError, match="Figure 4"):
+        load("ocp", chips=4)
+
+
+def test_ocp_topology_runs_in_mqsim(binary, tmp_path):
+    cfg = load("ocp", blocks_per_plane=64, coalesce_ns=1000)
+    path = tmp_path / "ocp"
+    _, layers, _, stats = pipeline(cfg, Shape(1, 8, 128, 4096), "layer_contiguous", path, binary,
+                                   mode="sink_recent", generation={"count": 4, "fraction": .05},
+                                   prefill_layout=True, physical=True, plane_groups=(1, 16))
+    for row in csv.reader((path / "physical.csv").open()):
+        if row[1] == "issue":
+            channel, chip, die, plane, block, page, device = map(int, row[3:10])
+            lpa = cfg.host_lpa(device)
+            assert cfg.physical(lpa) == (channel, chip, die, plane)
+            assert block * cfg.pages_per_block + page == lpa // cfg.units  # the spec's static offset
+    analysis = {row["group"]: row for row in csv.DictReader((path / "analysis_layers.csv").open())}
+    commands = stats["Issued_Flash_Read_CMD"] + stats["Issued_Flash_Multiplane_Read_CMD"]
+    assert commands >= int(analysis["1"]["rounds"]) and layers[-1]["read_pages"] == 8 * 2 * (1 + 13)

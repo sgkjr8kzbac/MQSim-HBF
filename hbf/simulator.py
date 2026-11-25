@@ -196,7 +196,7 @@ def check_gc_budget(cfg, batches):
     for batch in batches:
         for req in batch.requests:
             if req.op == "W" or req.lpa not in seen:
-                used[req.lpa % cfg.units] += 1
+                used[cfg.unit(req.lpa)] += 1
                 seen.add(req.lpa)
     worst = max(range(cfg.units), key=used.__getitem__)
     if used[worst] > cfg.gc_page_budget:

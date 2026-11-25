@@ -114,8 +114,8 @@ def load_counts(cfg, requests):
     units, channels = Counter(), Counter()
     for req in requests:
         if req.op == "R":
-            units[req.lpa % cfg.units] += 1
-            channels[req.lpa % cfg.channels] += 1
+            units[cfg.unit(req.lpa)] += 1
+            channels[cfg.device_lpa(req.lpa) % cfg.channels] += 1
     return units, channels
 
 

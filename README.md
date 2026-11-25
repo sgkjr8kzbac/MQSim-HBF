@@ -61,6 +61,12 @@ flowchart TB
 
 一次页读在 MQSim 中依次经过：发命令（约 290 ns）→ 感测 tR（4,096 ns）→ R/B 就绪（20 ns）→ 通道传输（4096 B ÷ 每通道带宽）→ 主机接口（约 1 ns）。同一 chip 上感测和传输不能重叠，同一通道上的命令和数据传输共享总线。
 
+### 规范示例拓扑（`--topology ocp`）
+
+按 OCP HBF 规范图 4 的例子：16 个主机通道，每个主机通道接 2 条 core die 通道，每条通道挂 2 个 die，每个 die 16 个 bank，共 1,024 个 bank。在 MQSim 中是 32 个通道 × 每通道 2 个 chip（die）× 每 die 16 个 plane（bank），plane 独立寻址。地址按规范排列（`address_map: "ocp"`）：主机地址以 4 KiB 为单位在 16 个主机通道间交织；在一个主机通道内，4 KiB 单元的低 4 位选 bank，接下来 2 位选 die，die 0、2 在第一条 core die 通道，die 1、3 在第二条；第 64 个单元回到 die 0、bank 0 的下一页。中间件把这个顺序换算成 MQSim 能直接执行的地址，物理位置与规范逐页一致（有测试核对）。
+
+规范的表 3 另写了"每 cube 16 个 die、每通道 16 个 bank"，信息不全（算不出 512 GiB），与图 4 的组织不能直接对应，这里按图 4 建模。规范没有规定 core die 通道的带宽，默认把 1,024 GB/s 平均分给 32 条通道。
+
 ### 真实层级模式（T-PLANE）
 
 上面的 chip 当 plane 是默认模式。打开 T-PLANE 补丁后，可以改用和 HBF 一致的层级：**通道 = 一个 die 到 base die 的数据通路，chip = HBF die，MQSim plane = HBF plane**，例如 `--topology 16x1 --planes 64`，即 SPLASH 的 16 die × 64 plane。一个 die 的多个 plane 用一条 multi-plane 命令同时感测，plane 之间的地址规则可选：
@@ -105,7 +111,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | 能力 | 说明 |
 |---|---|
 | 页级读时序 | 逐请求的到达、入队、完成时间；可选物理时间线，精确到每条命令的通道、chip、块、页 |
-| 拓扑扫描 | 16×64、64×16、256×4 三种命名配置，或任意"通道数x每通道 chip 数"（例如 16x16 即 256 个 plane，对应规范示例），都按 1 TB/s 标称带宽配置 |
+| 拓扑扫描 | 16×64、64×16、256×4 三种"chip 当 plane"配置，`ocp` 规范示例拓扑（见上），或任意"通道数x每通道 chip 数"（例如 16x16 即 256 个 plane） |
 | 真实 die/plane 层级 | T-PLANE：每 die 最多 64 个 plane，multi-plane 读写，独立或同偏移两种地址规则；`--prefill` 按地址顺序写满整个布局区间（含条带布局的填充页），使 MQSim 的物理位置与规范的静态映射一致。多 plane 配置下读未写过的页会被拒绝（规范对它返回错误 0x7） |
 | 机制分析 | 页位置默认按 OCP 规范的静态映射（地址决定 bank 和页，`--placement static`），也可按 MQSim 的分配顺序（`--placement mqsim`）；`--analysis-only` 不跑 MQSim，数秒到数十秒内（32 层 × 128K 全量读约 33 s）算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
 | 容量 | 默认每 plane 512 块，单 stack 512 GiB 物理容量（规范示例 cube 的容量），1,024 plane 时 MQSim 峰值内存约 4.2 GB |

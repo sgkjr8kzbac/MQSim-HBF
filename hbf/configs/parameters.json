@@ -28,7 +28,14 @@
     "256x4": [
       256,
       4
-    ]
+    ],
+    "ocp": {
+      "channels": 32,
+      "chips": 2,
+      "planes": 16,
+      "address_map": "ocp",
+      "plane_rule": "independent"
+    }
   },
   "calibration": {
     "cmd_ns": 290,

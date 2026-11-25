@@ -68,7 +68,7 @@ def placement(cfg, batches):
     for batch in batches:
         for req in batch.requests:
             if req.op == "W" or req.lpa not in offsets:
-                unit = req.lpa % cfg.units
+                unit = cfg.unit(req.lpa)
                 offsets[req.lpa] = used[unit]
                 used[unit] += 1
     return offsets
