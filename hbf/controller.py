@@ -1,6 +1,6 @@
 """Deduplicate token ranges into page I/O and schedule open-loop sub-batches."""
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,39 @@ def schedule(cfg, layout, accesses):
             batches.append(Batch(step, layer, serial, len(batches) * cfg.interval_ns,
                                  tuple(requests[start:start + limit])))
     return batches
+
+
+def prefill_batches(cfg, layout):
+    """Write every LPA of the layout's span once, in address order, as step -1 (layer -1).
+
+    The OCP HBF spec maps an address to a fixed bank, die, block and page and requires the host to
+    write a block's 4 KiB addresses consecutively without skipping (section 5.4.1), so the span is
+    written whole, padding pages of striped layouts included. MQSim then places page k of each
+    plane at offset k, which equals the spec's static offset ``lpa // units`` for a layout at a
+    base that is a multiple of the unit count.
+    """
+    lpas = range(layout.base, layout.base + layout.span)
+    limit = cfg.batch_pages
+    return [Batch(-1, -1, index, 0, tuple(Request(lpa, "W") for lpa in lpas[start:start + limit]))
+            for index, start in enumerate(range(0, len(lpas), limit))]
+
+
+def schedule_run(cfg, layout, accesses, prefill=False):
+    """Batches of one run: an optional whole-layout prefill, then the scheduled accesses."""
+    accesses = list(accesses)
+    if prefill and any(access.op == "W" for access in accesses):
+        raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
+    batches = (prefill_batches(cfg, layout) if prefill else []) + schedule(cfg, layout, accesses)
+    return [replace(batch, arrival_ns=index * cfg.interval_ns) for index, batch in enumerate(batches)]
+
+
+def unwritten_reads(batches):
+    """Reads of LPAs that no earlier batch wrote; the OCP spec answers them with error 0x7."""
+    written, count = set(), 0
+    for batch in batches:
+        count += sum(req.op == "R" and req.lpa not in written for req in batch.requests)
+        written.update(req.lpa for req in batch.requests if req.op == "W")
+    return count
 
 
 def load_counts(cfg, requests):

@@ -225,9 +225,11 @@ T8 原先只在默认的 64×16 上运行。现在对三种拓扑各跑三档，
 - 感测页数与感测放大：联动时，组内每个 plane 每轮都要感测，即使它没有要读的页；
 - 64 B 突发传输字节：OCP 规范 §4.1 允许读突发为 64 B 到 4 KiB，因此传输可以小于整页，感测始终是整页。
 
-页在 plane 内的偏移按 MQSim 的实际分配方式计算：每个 plane 按轨迹顺序，在每次写入、以及未写过的 LPA 首次被读时，取写前沿的下一页。加 `--prefill` 时偏移由整体写入的顺序决定；不加时，稀疏读的页按首次读取的顺序紧凑排列，与 MQSim 一致。一层超过子批上限被拆开时，`batch_rounds` 给出各子批轮数之和，这是与 MQSim 对照的口径；`rounds` 把整层当作一次突发。独立 plane 的轮数与已有指标 `max_unit_pages` 逐层相等，有测试核对。
+页在 plane 内的偏移有两种算法（`--placement`）。默认 `static` 按 OCP 规范：地址决定 bank、die、块和页（§4.6、图 4；§5.4.1 块内连续写、禁止跳地址；§11.4 无页级 FTL），偏移为 `lpa // 单元数`，并假定数据已在 HBF 中。`mqsim` 按 MQSim 的实际分配：每个 plane 按轨迹顺序，在每次写入、以及未写过的 LPA 首次被读时，取写前沿的下一页；加 `--prefill`（按地址顺序写满整个布局区间，含填充页）后两者相同，不加时稀疏读的页按首次读取的顺序紧凑排列，这在规范中不允许（读未写页返回错误 0x7）。一层超过子批上限被拆开时，`batch_rounds` 给出各子批轮数之和，这是与 MQSim 对照的口径；`rounds` 把整层当作一次突发。独立 plane 的轮数与已有指标 `max_unit_pages` 逐层相等，有测试核对。
 
-**与 MQSim 逐层核对**：2 die × 8 plane，`vllm_interleaved` 与 `layer_contiguous`，含层数、头数不整除 plane 数的形状，加或不加 prefill，independent 与 lockstep 两种规则，共 6 组。用物理时间线统计每层每 die 实际发出的读命令数，全部落在 [分析轮数, 分析轮数 + 1] 之内，多出的 1 条是首页单独下发。初版曾直接取 `lpa // 单元数` 作偏移，在 `vllm_interleaved` 加 prefill（逐层写入）和不加 prefill 两种情况下与 MQSim 不符，由第二轮审查发现后改正。
+**与 MQSim 逐层核对**：2 die × 8 plane，`vllm_interleaved`、`layer_contiguous` 和 `striped_contiguous`，含层数、头数不整除 plane 数的形状，independent 与 lockstep 两种规则，加或不加 T-CMD 合并窗口，共 16 组，全部先整体 prefill。物理时间线上每个写入页的 (块, 页) 都等于规范的静态偏移 `lpa // 单元数`；每层每 die 实际发出的读命令数落在 [静态分析轮数, 轮数 + 1] 之内，开合并窗口时正好相等。多 plane 配置下，读未写过的页会在运行前被拒绝（chip 当 plane 时偏移不影响时序，只计数）。
+
+这一部分经历过两次修正：初版直接取 `lpa // 单元数`，但当时的 prefill 逐层写入、不写条带布局的填充页，MQSim 的位置因此与之不符（第二轮审查）；随后一度把分析改为跟随 MQSim 的分配，规范一致性审查（见下文 S1–S4）指出规范要求的是静态位置，于是改为按地址顺序写满整个区间，使 MQSim 与规范一致，分析默认回到静态位置。
 
 **示例扫描**：Llama-3.1-8B 形状（32 层、8 个 KV 头、32K），先整体 prefill，再每层每头每张量均匀随机选页，下表为 32 层合计的读轮数（括号内为均衡损失 R/R*），数据见 [evidence/stage1-analysis-sweep.csv](evidence/stage1-analysis-sweep.csv)：
 
@@ -274,7 +276,7 @@ host + [cmd(1) + tR + R/B + x] + [cmd(n−1) + tR + R/B + (n−1)·x]，cmd(n) =
 | lockstep | 8 | 122 | 133 | 61.7 µs |
 | 不设（原版规则） | 8 | 122 | 133 | 61.7 µs |
 
-16 个 die 合计的读命令数落在 [各 die 所需轮数之和, 该和 + die 数] 之内，多出的部分来自上面说的首页单独下发，有测试核对。prefill 不可省：MQSim 在首次读到一个 LPA 时按到达顺序分配物理页，不写入就读，稀疏读的页会被紧凑地分配在相同偏移上，lockstep 和 independent 会给出相同结果。
+16 个 die 合计的读命令数落在 [各 die 所需轮数之和, 该和 + die 数] 之内，多出的部分来自上面说的首页单独下发，有测试核对。prefill 不可省：MQSim 在首次读到一个 LPA 时按到达顺序分配物理页，不写入就读，稀疏读的页会被紧凑地分配在相同偏移上，lockstep 和 independent 会给出相同结果；按规范这种读本应返回错误 0x7，所以多 plane 配置下现在直接拒绝。
 
 ### T-CMD：HBF 命令模型
 
@@ -302,11 +304,11 @@ host + [cmd(1) + tR + R/B + x] + [cmd(n−1) + tR + R/B + (n−1)·x]，cmd(n) =
 
 32K 上下文下 `layer_contiguous` 每个头 2,048 块，正好是 1,024 的倍数，各头各张量的同一块落在同一 plane。机制分析（Llama-3.1-8B 形状、32 层、sink 4 个 token、最近 1/64）：
 
-| 布局 | 每层读页 | 32 层轮数（独立 plane） | 最少轮数 | 利用率 |
-|---|---:|---:|---:|---:|
-| layer_contiguous | 528 | 512 | 32 | 0.032 |
-| striped_contiguous | 528 | 32 | 32 | 0.516 |
-| vllm_interleaved | 528 | 544 | 32 | 0.030 |
+| 布局 | 每层读页 | 32 层轮数：独立 plane（利用率） | 联动 16 | 联动 64 | 最少轮数 |
+|---|---:|---:|---:|---:|---:|
+| layer_contiguous | 528 | 512（0.032） | 512 | 1,024 | 32 |
+| striped_contiguous | 528 | 32（0.516） | 192 | 576 | 32 |
+| vllm_interleaved | 528 | 544（0.030） | 544 | 544 | 32 |
 
 MQSim 真实层级（16 die × 64 plane，T-CMD δ = 10 ns、窗口 1 µs，T-CACHE，prefill 后读 4 层）：
 
@@ -315,9 +317,9 @@ MQSim 真实层级（16 die × 64 plane，T-CMD δ = 10 ns、窗口 1 µs，T-CA
 | layer_contiguous | independent | 64 | 72.0 µs |
 | striped_contiguous | independent | 4 | 8.9 µs |
 | layer_contiguous | lockstep | 128 | 142.3 µs |
-| striped_contiguous | lockstep | 128 | 142.3 µs |
+| striped_contiguous | lockstep | 72 | 80.7 µs |
 
-条带化只在 plane 能独立寻址时有效：lockstep 要求同一轮读同一偏移，而各头的 sink 页和最近窗口在各自 plane 上的偏移不同，条带化改变的是它们落在哪个 plane，不改变偏移，所以轮数不变。
+条带化在 plane 独立寻址时效果最好（轮数降到下限）；在 lockstep 下也有效，但幅度小得多：每层 32 → 18 轮，因为联动要求同一轮读同一偏移，条带化把各头的页分散到不同 plane，却不能让它们的偏移对齐。此前版本写的是"lockstep 下轮数不变（128 轮）"，那是 prefill 没有写填充页、MQSim 压紧偏移造成的假象（规范一致性审查 S3），已按规范的静态位置重测。
 
 ### T-CACHE：cache read
 
@@ -348,10 +350,10 @@ cache read 不改变轮数：16 die × 64 plane、lockstep、10% 选页时，开
 
 | # | 问题 | 规范依据 | 影响 | 处理 | 状态 |
 |---|---|---|---|---|---|
-| S1 | 页在 plane 内的偏移由 MQSim 按写入或首次读的顺序分配；规范是地址决定位置（无页级 FTL） | §4.6 p22–23 地址位序与图 4；§5.4.1 p58 块内连续写、禁止跳地址、写 page 0 自动擦除；§5.7 p62–63 由地址算 page-0；§11.4 p117 无 GC、只做块级重映射 | lockstep 轮数：4 层 × 32K、5% 选页、32 联动时，不加 prefill 43 轮，按规范 122 轮；独立 plane 不受影响 | 分析默认用静态偏移；prefill 按地址顺序写满；多 plane 运行要求页已写入 | 待改 |
-| S2 | 读未写过的页在规范中返回错误，MQSim 却分配新页并成功返回 | 表 12 p60 "Read from ErasePage"，错误码 0x7；§11.5.1.7 p120 | 同 S1 | 统计并拒绝（多 plane 时）读未写页 | 待改 |
-| S3 | 条带布局的填充地址没有写入，MQSim 把后续页的偏移压紧 | §5.4.1 第 4 条 "No skipping or jumping of 4KiB local address" | 条带布局 lockstep-64 每层按规范 18 轮，报告写成 32 轮；"条带化在 lockstep 下无效"的结论不成立 | prefill 连同填充地址一起写 | 待改 |
-| S4 | README 的 lockstep 示例没加 `--prefill` | 同 S1 | 示例结果低估约 2.8 倍 | 改示例 | 待改 |
+| S1 | 页在 plane 内的偏移由 MQSim 按写入或首次读的顺序分配；规范是地址决定位置（无页级 FTL） | §4.6 p22–23 地址位序与图 4；§5.4.1 p58 块内连续写、禁止跳地址、写 page 0 自动擦除；§5.7 p62–63 由地址算 page-0；§11.4 p117 无 GC、只做块级重映射 | lockstep 轮数：4 层 × 32K、5% 选页、32 联动时，不加 prefill 43 轮，按规范 122 轮；独立 plane 不受影响 | 分析默认用静态偏移；prefill 按地址顺序写满；多 plane 运行要求页已写入 | 已改：分析默认静态位置；prefill 按地址顺序写满（含填充页）；多 plane 运行拒绝读未写页；条带结论已重测 |
+| S2 | 读未写过的页在规范中返回错误，MQSim 却分配新页并成功返回 | 表 12 p60 "Read from ErasePage"，错误码 0x7；§11.5.1.7 p120 | 同 S1 | 统计并拒绝（多 plane 时）读未写页 | 已改：分析默认静态位置；prefill 按地址顺序写满（含填充页）；多 plane 运行拒绝读未写页；条带结论已重测 |
+| S3 | 条带布局的填充地址没有写入，MQSim 把后续页的偏移压紧 | §5.4.1 第 4 条 "No skipping or jumping of 4KiB local address" | 条带布局 lockstep-64 每层按规范 18 轮，报告写成 32 轮；"条带化在 lockstep 下无效"的结论不成立 | prefill 连同填充地址一起写 | 已改：分析默认静态位置；prefill 按地址顺序写满（含填充页）；多 plane 运行拒绝读未写页；条带结论已重测 |
+| S4 | README 的 lockstep 示例没加 `--prefill` | 同 S1 | 示例结果低估约 2.8 倍 | 改示例 | 已改：分析默认静态位置；prefill 按地址顺序写满（含填充页）；多 plane 运行拒绝读未写页；条带结论已重测 |
 | S5 | 规范示例层级没有现成配置：每主机通道 2 条 core die 通道 × 每通道 2 die × 每 die 16 bank，共 1,024 bank；地址先 bank 后 die | 图 4 p23（"for example"）；表 3 p16 只给 cube 汇总，信息不全 | 现有 T-PLANE 用 SPLASH 的 16 die × 64 plane，分组不同 | 新增规范示例拓扑和地址顺序 | 待改 |
 | S6 | 规范三档带宽 0.384/1.536/3.072 TB/s 无法配置：16 通道下每通道 24/96/192 GB/s 不是 2 的幂，配置检查拒绝 | 表 2、表 4 p16 | 无法做带宽档位扫描 | 放宽检查，传输时间与 MQSim 的整数算法一致 | 待改 |
 | S7 | 文档措辞：缓冲个数写成"要求"；"16x16 对应规范示例"；"16 die × 64 plane 和 HBF 一致"；"标称 1 TB/s"；512 GiB 是物理容量而规范表 3 是用户容量 | §5.3.1 第 7 条 p57；图 4；表 3、表 4 | 仅文档 | 改措辞并注明出处 | 待改 |

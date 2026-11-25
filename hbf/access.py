@@ -128,6 +128,7 @@ class Layout:
             raise ValueError("A token row must fit in one page and base must be nonnegative")
         self.block_counts = tuple(-(-shape.context // tokens) for tokens in self.tokens_per_page)
         self.pages = shape.layers * shape.kv_heads * sum(self.block_counts)
+        self.span = self.pages  # LPAs [base, base + span) belong to the layout, padding included
         cfg.lba(base + self.pages - 1)
 
     def tensor_index(self, name):
@@ -213,7 +214,8 @@ class StripedContiguous(Layout):
     ``layer_contiguous`` puts block b of every head and tensor on the same plane. Here region
     (layer, t, head) starts on plane ``t*P/T + head*P/(T*H)`` (mod P): heads P/(2H) apart and V half
     a device away from K for the default two tensors, as in SPLASH. Regions keep their order and
-    are padded by less than P pages each to reach their phase.
+    are padded by less than P pages each to reach their phase. The OCP spec forbids skipping
+    addresses inside a block (section 5.4.1), so a prefill writes the padding pages too.
     """
 
     def __init__(self, cfg, shape, base=0, tensors=None):
@@ -249,20 +251,6 @@ LAYOUTS = {"layer_contiguous": LayerContiguous, "vllm_interleaved": VllmInterlea
            "striped_contiguous": StripedContiguous}
 
 
-def prefill(layout):
-    """Write every page of the layout once, in LPA order, before the reads (step -1).
-
-    MQSim assigns a physical page to an LPA when it is first written or, without a write, when it
-    is first read. A prefill therefore fixes each page's offset in its plane to its rank among the
-    plane's LPAs (``lpa // units`` for a layout at base 0), the placement that the lock-step
-    analysis and the T-PLANE lockstep rule assume. Without it, sparse reads get compact offsets
-    in first-touch order.
-    """
-    shape = layout.shape
-    for layer in range(shape.layers):
-        for head in range(shape.kv_heads):
-            for spec in layout.tensors:
-                yield Access(-1, layer, head, spec.name, "W", 0, shape.context, spec.bits)
 MODES = (
     "dense", "uniform_pages", "sink_recent", "same_unit", "distinct_units", "same_channel_distinct_units",
     "hot_unit", "write_then_read",

@@ -3,15 +3,13 @@ import argparse
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
-from itertools import chain
 from pathlib import Path
 from uuid import uuid4
 
-from .access import (LAYOUTS, MODES, Shape, generate, parse_tensors, prefill, read_access, tensors_meta,
-                     write_access)
+from .access import LAYOUTS, MODES, Shape, generate, parse_tensors, read_access, tensors_meta, write_access
 from .analysis import analyze, check_group
 from .config import MAX_BATCH_PAGES, load
-from .controller import schedule
+from .controller import schedule_run, unwritten_reads
 from .simulator import build, dump, simulate, write_table
 
 
@@ -33,14 +31,9 @@ def analysis_report(layer_rows, step_rows):
     return report
 
 
-def reject_write(access):
-    if access.op == "W":
-        raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
-    return access
-
-
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
-             input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False):
+             input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
+             placement="static"):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None."""
     directory.mkdir(parents=True, exist_ok=False)
     generation = {
@@ -50,22 +43,26 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
     access_path = directory / "access.csv"
     accesses = generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv)
-    if prefill_layout:
-        accesses = chain(prefill(layout), (reject_write(access) for access in accesses))
     write_access(access_path, accesses)
     dump(directory / "meta.json", {"shape": asdict(shape), "layout": layout_name,
                                    "tensors": tensors_meta(layout),
                                    "generator": {"mode": mode, **generation} if input_csv is None else None,
                                    "input_csv": str(input_csv) if input_csv else None,
-                                   "prefill": prefill_layout,
+                                   "prefill": prefill_layout and
+                                   f"every LPA in [{layout.base}, {layout.base + layout.span}) in order",
+                                   "placement": placement,
                                    "argv": sys.argv})
-    batches = schedule(cfg, layout, read_access(access_path))
-    layer_rows, step_rows = analyze(cfg, batches, plane_groups)
+    batches = schedule_run(cfg, layout, read_access(access_path), prefill_layout)
+    layer_rows, step_rows = analyze(cfg, batches, plane_groups, placement)
     if layer_rows:
         write_table(directory / "analysis_layers.csv", layer_rows)
         write_table(directory / "analysis_steps.csv", step_rows)
+    unwritten = unwritten_reads(batches)
     report = ["# 本次运行", "", f"布局 `{layout_name}`，拓扑 {cfg.channels}×{cfg.chips}，"
-              f"子批 {len(batches)} 个。", ""]
+              f"子批 {len(batches)} 个。机制分析的页位置：{placement}。", ""]
+    if unwritten:
+        report += [f"有 {unwritten} 次读的页在本次运行中没有写过。OCP 规范对这种读返回错误 0x7（表 12）；"
+                   "机制分析按静态位置计算时假定数据已在 HBF 中。需要 MQSim 按规范放置时请加 `--prefill`。", ""]
     if layer_rows:
         report += analysis_report(layer_rows, step_rows) + [""]
     result = None
@@ -111,8 +108,8 @@ def main():
                         help="planes per lock-step group for the mechanism analysis; repeat to compare "
                              "(1 = independent planes, the default)")
     parser.add_argument("--prefill", action="store_true",
-                        help="write the whole KV layout before the reads so that each page's physical "
-                             "offset follows its LPA (needed for lock-step comparisons)")
+                        help="write every address of the layout (padding included) in order before the "
+                             "reads, as the OCP spec requires; needed for multi-plane MQSim runs")
     parser.add_argument("--plane-rule", choices=("independent", "lockstep"),
                         help="T-PLANE multi-plane rule; without it MQSim keeps its upstream same-page rule")
     parser.add_argument("--planes", type=int, default=1,
@@ -127,6 +124,9 @@ def main():
     parser.add_argument("--coalesce-ns", type=int,
                         help="T-CMD: hold newly received transactions this long before dispatching, so that "
                              "a batch leaves as full multi-plane commands")
+    parser.add_argument("--placement", choices=("static", "mqsim"), default="static",
+                        help="page offsets for the mechanism analysis: static follows the OCP spec "
+                             "(address decides bank and page); mqsim follows MQSim's allocation order")
     parser.add_argument("--analysis-only", action="store_true",
                         help="write the mechanism analysis without building or running MQSim")
     parser.add_argument("--output", type=Path)
@@ -149,7 +149,8 @@ def main():
     binary = None if args.analysis_only else build()
     pipeline(cfg, shape, args.layout, directory, binary, mode=args.mode, generation=generation,
              input_csv=args.access_csv, physical=args.physical, tensors=tensors,
-             plane_groups=tuple(args.plane_groups or (1,)), prefill_layout=args.prefill)
+             plane_groups=tuple(args.plane_groups or (1,)), prefill_layout=args.prefill,
+             placement=args.placement)
     print(directory.resolve())
 
 

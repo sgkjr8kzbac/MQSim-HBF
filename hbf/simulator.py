@@ -16,7 +16,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from .config import PACKAGE, ROOT, device_xml, workload_xml
-from .controller import metrics
+from .controller import metrics, unwritten_reads
 
 PIN = (PACKAGE / "mqsim.commit").read_text().strip()
 MQSIM_SOURCE = PACKAGE / "mqsim"
@@ -206,7 +206,7 @@ def check_gc_budget(cfg, batches):
 
 
 def simulate(cfg, batches, directory, binary, *, physical=False, suspension=False, onfi=False,
-             overlap=False, timeout=1200):
+             overlap=False, timeout=1200, allow_unwritten=False):
     directory.mkdir(parents=True, exist_ok=True)
     if (directory / "trace.txt").exists():
         raise ValueError(f"Run directory already contains a trace: {directory}")
@@ -222,6 +222,13 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     if not batches or not all(batch.requests for batch in batches):
         raise ValueError("At least one nonempty batch is required")
     check_gc_budget(cfg, batches)
+    unwritten = unwritten_reads(batches)
+    if unwritten and cfg.planes > 1 and not allow_unwritten:
+        # One plane per chip makes the offset irrelevant; with multi-plane commands MQSim's first-read
+        # allocation would put the pages at offsets the OCP spec does not allow (Table 12, error 0x7).
+        raise ValueError(f"{unwritten} reads of pages that were never written; the OCP spec answers them "
+                         "with error 0x7 and MQSim would place them at first-read offsets. Use --prefill "
+                         "(device-level probes that only time commands may pass allow_unwritten=True)")
     expected = {}
     reads = writes = 0
     with (directory / "trace.txt").open("w") as stream:
@@ -258,7 +265,8 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     run_timed(command, directory, env, timeout)
     elapsed = time.perf_counter() - start
     stats = flash_stats(directory / "workload_scenario_1.xml")
-    stats.update(wall_seconds=elapsed, peak_rss_kib=int((directory / "rss_kib.txt").read_text()))
+    stats.update(wall_seconds=elapsed, peak_rss_kib=int((directory / "rss_kib.txt").read_text()),
+                 unwritten_reads=unwritten)
     dump(directory / "statistics.json", stats)
     # A multi-plane command serves 2..planes pages; MQSim counts commands, not pages, for it.
     multi = cfg.planes > 1

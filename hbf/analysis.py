@@ -13,10 +13,15 @@ rounds a group needs depends on how its pages land on the planes and on the plan
   in that round whether it holds a wanted page or not.
 
 Pages are placed on planes by MQSim's CWDP static mapping (``Config.physical``). The *offset* of
-a page inside its plane follows MQSim's allocation (``placement``): each plane fills its pages in
-trace order, at every write of an LPA and at the first read of an LPA that was never written.
-So with ``--prefill`` the offsets follow the prefill order, and without it sparse reads get
-compact offsets in first-touch order, exactly as in MQSim.
+a page inside its plane has two models:
+
+* ``static`` (default) - the OCP HBF spec: the address alone decides bank, die, block and page
+  (section 4.6, Figure 4; consecutive writes without skipping, section 5.4.1; no page-level FTL,
+  section 11.4), so the offset is ``lpa // units``. The data is assumed to be resident.
+* ``mqsim`` - MQSim's allocation (``placement``): each plane fills its pages in trace order, at
+  every write and at the first read of an LPA that was never written. With ``--prefill`` (whole
+  span in address order) it equals ``static``; without it, sparse reads get compact first-touch
+  offsets that the spec does not allow (it answers such reads with error 0x7).
 
 A layer larger than ``Config.batch_pages`` is split into sub-batches that MQSim serves one after
 another; ``batch_rounds`` sums the rounds of the sub-batches and is the figure to compare with
@@ -107,11 +112,16 @@ def analyze_group(cfg, requests, group=1, offsets=None):
     }
 
 
-def analyze(cfg, batches, groups=(1,)):
+PLACEMENTS = ("static", "mqsim")
+
+
+def analyze(cfg, batches, groups=(1,), mode="static"):
     """Per-layer rows and per-step totals for each plane organization in ``groups``."""
     for group in groups:
         check_group(cfg, group)
-    offsets = placement(cfg, batches)
+    if mode not in PLACEMENTS:
+        raise ValueError(f"placement must be one of {PLACEMENTS}")
+    offsets = placement(cfg, batches) if mode == "mqsim" else None
     parts = defaultdict(list)
     for batch in batches:
         part = [req for req in batch.requests if req.op == "R"]
