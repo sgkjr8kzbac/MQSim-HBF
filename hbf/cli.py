@@ -29,8 +29,8 @@ def protocol_report(step_rows, protocol):
 
 def analysis_report(layer_rows, step_rows):
     report = ["## 机制分析", "",
-              "| 并行组 | Step | 层数 | 读页 | 轮数 | 最少轮数 | plane 利用率 | 均衡损失 | 感测放大 | 读放大 | 传输放大 |",
-              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+              "| 并行组 | Step | 层数 | 读页 | 轮数 | 子批轮数 | 最少轮数 | plane 利用率 | 均衡损失 | 感测放大 | 读放大 | 传输放大 |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     amplification = {}
     for row in layer_rows:
         key = row["group"], row["step"]
@@ -40,6 +40,7 @@ def analysis_report(layer_rows, step_rows):
         page, useful, burst = amplification[row["group"], row["step"]]
         report.append(
             f"| {row['group']} | {row['step']} | {row['layers']} | {row['pages']} | {row['rounds']} | "
+            f"{row['batch_rounds']} | "
             f"{row['min_rounds']} | {row['utilization']:.3f} | {row['balance_loss']:.2f} | "
             f"{row['sense_amplification']:.2f} | {page / useful:.2f} | {burst / useful:.2f} |")
     return report
@@ -52,7 +53,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     directory.mkdir(parents=True, exist_ok=False)
     generation = {
         "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
-        "hot_fraction": .5, "hot_units": 1,
+        "hot_fraction": .5, "hot_units": 1, "select_tokens": 16,
     } | (generation or {})
     layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
     access_path = directory / "access.csv"
@@ -92,7 +93,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                    "|---:|---:|---:|---:|---:|"]
         for row in steps:
             report.append(f"| {row['step']} | {row['read_pages']} | {row['mqsim_ns']} | "
-                          f"{row['mq_est_ns']} | {row['ideal_ns']:.0f} |")
+                          f"{'—' if row['mq_est_ns'] is None else row['mq_est_ns']} | {row['ideal_ns']:.0f} |")
     (directory / "report.md").write_text("\n".join(report) + "\n")
     return result
 
@@ -114,6 +115,8 @@ def main():
     parser.add_argument("--unit", type=int, default=0)
     parser.add_argument("--hot-fraction", type=float, default=.5)
     parser.add_argument("--hot-units", type=int, default=1)
+    parser.add_argument("--select-tokens", type=int, default=16,
+                        help="uniform_tokens: tokens per selected block (Quest's page; default 16)")
     parser.add_argument("--batch-pages", type=int, default=MAX_BATCH_PAGES,
                         help=f"maximum pages per sub-batch (1–{MAX_BATCH_PAGES})")
     parser.add_argument("--physical", action="store_true")
@@ -166,7 +169,7 @@ def main():
     now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     directory = args.output or Path("runs") / f"{now}-{uuid4().hex[:8]}"
     generation = {key: getattr(args, key) for key in (
-        "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units"
+        "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units", "select_tokens"
     )}
     try:
         given = {"aggregate_gb_s": args.aggregate_gb_s, "planes": args.planes, "plane_rule": args.plane_rule,

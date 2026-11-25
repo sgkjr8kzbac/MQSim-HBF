@@ -20,7 +20,7 @@ bf16,uniform_pages,striped_contiguous,trigger256 g3,52736,3375104,213,32,0.2418
 bf16,sink_recent,layer_contiguous,none,16896,,512,,0.0322
 bf16,sink_recent,layer_contiguous,fcfs256,16896,1081344,512,384,0.0322
 bf16,sink_recent,layer_contiguous,fcfs1024,16896,1081344,512,96,0.0322
-bf16,sink_recent,layer_contiguous,fcfs256 wanted,16896,1056768,512,288,0.0322
+bf16,sink_recent,layer_contiguous,fcfs256 wanted,16896,1056768,512,256,0.0322
 bf16,sink_recent,layer_contiguous,burst256,16896,16896,512,32,0.0322
 bf16,sink_recent,layer_contiguous,trigger256,16896,1081344,512,32,0.0322
 bf16,sink_recent,layer_contiguous,trigger256 g1,16896,1081344,512,32,0.0322
@@ -29,7 +29,7 @@ bf16,sink_recent,layer_contiguous,trigger256 g3,16896,1081344,512,32,0.0322
 bf16,sink_recent,striped_contiguous,none,16896,,32,,0.5156
 bf16,sink_recent,striped_contiguous,fcfs256,16896,1081344,384,384,0.043
 bf16,sink_recent,striped_contiguous,fcfs1024,16896,1081344,96,96,0.1719
-bf16,sink_recent,striped_contiguous,fcfs256 wanted,16896,1056768,288,288,0.0573
+bf16,sink_recent,striped_contiguous,fcfs256 wanted,16896,1056768,256,256,0.0645
 bf16,sink_recent,striped_contiguous,burst256,16896,16896,32,32,0.5156
 bf16,sink_recent,striped_contiguous,trigger256,16896,1081344,32,32,0.5156
 bf16,sink_recent,striped_contiguous,trigger256 g1,16896,1081344,32,32,0.5156

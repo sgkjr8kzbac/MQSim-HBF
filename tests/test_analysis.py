@@ -333,16 +333,41 @@ def test_protocol_columns_in_pipeline(tmp_path):
     assert "协议约束" in (tmp_path / "p" / "report.md").read_text()
 
 
-def test_items_larger_than_mocs_span_rounds():
-    """A lock-step offset that gathers 16 pages needs 1,024 commands: four rounds at MOCS 256."""
+def test_items_larger_than_mocs_start_their_sense_once():
+    """An item whose commands do not all fit is sensed once; the rest are cache hits.
+
+    HBF-EventLab, ocp geometry, MOCS 1, burst4096 prefill, 64 B reads: eight pages on eight banks
+    of host channel 0 finished in 33.17 us with 8 senses and 504 cache hits (8 x 4.096 us plus
+    hits), against 8.31 us (two rounds) at MOCS 256.
+    """
     from hbf.analysis import Protocol, protocol_rounds
     cfg = load("ocp")
+    eight = [Request(16 * bank) for bank in range(8)]
+    assert protocol_rounds(cfg, eight, 1, None, Protocol(1))[:2] == (8, 8)
+    assert protocol_rounds(cfg, eight, 1, None, Protocol(256))[:2] == (2, 2)
     die0 = [Request(16 * bank) for bank in range(16)]  # host channel 0, die 0, banks 0-15, offset 0
-    rounds, credit, commands, _ = protocol_rounds(cfg, die0, 16, None, Protocol(256))
-    assert (rounds, credit, commands) == (4, 4, 1024)
+    # A lock-step offset that gathers 16 pages needs 1,024 commands but one group sense.
+    assert protocol_rounds(cfg, die0, 16, None, Protocol(256))[:3] == (1, 1, 1024)
     assert protocol_rounds(cfg, die0, 16, None, Protocol(256, host_order="trigger"))[0] == 1
     mocs1 = protocol_rounds(cfg, [Request(lpa) for lpa in range(128)], 1, None, Protocol(1))
-    assert mocs1[0] >= mocs1[1] == 512  # 8 pages x 64 commands per host channel, one at a time
+    assert mocs1[:2] == (8, 8)  # 8 pages per host channel, one sense at a time
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_credit_bound_never_exceeds_rounds(seed):
+    import random
+    from hbf.analysis import Protocol, protocol_rounds
+    rng = random.Random(seed)
+    cfg = load("ocp")
+    reads = []
+    for lpa in rng.sample(range(16 * 1024), 2000):
+        wanted = rng.randint(1, 64)
+        reads.append(Request(lpa, useful_bytes=64 * wanted, burst_bytes=64 * wanted, burst_runs=rng.randint(1, wanted)))
+    for group in (1, 4, 16):
+        for protocol in (Protocol(1), Protocol(256), Protocol(256, read_unit="wanted"),
+                         Protocol(256, read_burst=True, read_unit="wanted"), Protocol(1, host_order="trigger")):
+            rounds, credit, _, _ = protocol_rounds(cfg, reads, group, None, protocol)
+            assert analyze_group(cfg, reads, group)["rounds"] <= rounds and credit <= rounds
 
 
 def test_cwdp_topologies_keep_sixteen_host_channels():
@@ -366,3 +391,43 @@ def test_link_bound_follows_ucie_grade():
     assert link == {1: 3, 2: 2, 3: 1}
     with pytest.raises(ValueError, match="ucie_grade"):
         Protocol(256, ucie_grade=4)
+
+
+def test_uniform_tokens_reads_the_same_tokens_of_every_tensor():
+    """Quest-style selection: K and V of a head cover the same token blocks, whatever their format."""
+    cfg = load("ocp")
+    shape = Shape(2, 2, 128, 4096)
+    kivi = (TensorSpec("K", 2, 128), TensorSpec("V", 16, 128))
+    layout = LAYOUTS["layer_contiguous"](cfg, shape, tensors=kivi)
+    accesses = list(generate(cfg, layout, "uniform_tokens", fraction=.05, seed=3, select_tokens=16))
+    chosen = {}
+    for access in accesses:
+        chosen.setdefault((access.layer, access.kv_head, access.kind), set()).add((access.token_start, access.token_end))
+    for layer in range(2):
+        for head in range(2):
+            assert chosen[layer, head, "K"] == chosen[layer, head, "V"]
+            assert len(chosen[layer, head, "K"]) == 13  # ceil(256 blocks x 5%)
+    batches = schedule(cfg, layout, accesses)
+    reads = [req for batch in batches for req in batch.requests]
+    k_pages = {req.lpa for req in reads if layout.decode(req.lpa)[2] == 0}
+    tokens = 13 * 16 * 2 * 2  # blocks x tokens x heads x layers, for each tensor
+    assert sum(req.useful_bytes for req in reads) == tokens * 32 + tokens * 256
+    assert len(k_pages) < 13 * 2 * 2 < len(reads) - len(k_pages) + 1  # 128-token K pages are shared
+    with pytest.raises(ValueError, match="generator"):
+        list(generate(cfg, layout, "uniform_tokens", select_tokens=0))
+
+
+def test_unit_modes_reject_pages_beyond_the_layout():
+    cfg = load("ocp")
+    layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 8, 128, 8192))
+    with pytest.raises(ValueError, match="beyond the layout"):
+        list(generate(cfg, layout, "same_unit", count=9))
+
+
+def test_per_page_estimate_is_withheld_for_multi_plane_dies(tmp_path):
+    assert metrics(load("ocp"), [Request(0)])["mq_est_ns"] is None
+    assert metrics(load("64x16"), [Request(0)])["mq_est_ns"] > load("64x16").read_ns  # chip as plane
+    cfg = load("ocp", batch_pages=100)
+    pipeline(cfg, Shape(1, 8, 128, 8192), "layer_contiguous", tmp_path / "b", None)
+    report = (tmp_path / "b" / "report.md").read_text()
+    assert "| 子批轮数 |" in report and "| 1 | 0 | 1 | 8192 | 8 | 82 | 8 |" in report

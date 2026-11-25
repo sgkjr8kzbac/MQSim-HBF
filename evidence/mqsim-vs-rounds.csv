@@ -1,0 +1,17 @@
+layout,mode,plane_rule,layer,rounds_independent,rounds_lockstep16,mqsim_ns,mqsim_over_tR
+layer_contiguous,sink_recent,independent,0,16,16,72399,17.68
+layer_contiguous,sink_recent,independent,1,16,16,72399,17.68
+layer_contiguous,sink_recent,lockstep,0,16,16,72399,17.68
+layer_contiguous,sink_recent,lockstep,1,16,16,72399,17.68
+layer_contiguous,uniform_pages,independent,0,6,26,27855,6.80
+layer_contiguous,uniform_pages,independent,1,7,26,32261,7.88
+layer_contiguous,uniform_pages,lockstep,0,6,26,115685,28.24
+layer_contiguous,uniform_pages,lockstep,1,7,26,115975,28.31
+striped_contiguous,sink_recent,independent,0,2,7,13170,3.22
+striped_contiguous,sink_recent,independent,1,2,7,13170,3.22
+striped_contiguous,sink_recent,lockstep,0,2,7,32901,8.03
+striped_contiguous,sink_recent,lockstep,1,2,7,32901,8.03
+striped_contiguous,uniform_pages,independent,0,7,25,32355,7.90
+striped_contiguous,uniform_pages,independent,1,6,25,27858,6.80
+striped_contiguous,uniform_pages,lockstep,0,7,25,111791,27.29
+striped_contiguous,uniform_pages,lockstep,1,6,25,111663,27.26

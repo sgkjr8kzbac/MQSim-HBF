@@ -252,19 +252,37 @@ LAYOUTS = {"layer_contiguous": LayerContiguous, "vllm_interleaved": VllmInterlea
 
 
 MODES = (
-    "dense", "uniform_pages", "sink_recent", "same_unit", "distinct_units", "same_channel_distinct_units",
+    "dense", "uniform_pages", "uniform_tokens", "sink_recent", "same_unit", "distinct_units", "same_channel_distinct_units",
     "hot_unit", "write_then_read",
 )
 
 
 def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0,
-             hot_fraction=.5, hot_units=1):
+             hot_fraction=.5, hot_units=1, select_tokens=16):
+    """Seeded accesses of one workload mode.
+
+    ``uniform_pages`` picks ``fraction`` of each tensor's storage pages, independently per tensor, so
+    the selection unit grows with compression (a 2-bit page holds 128 tokens, a BF16 page 16) and K
+    and V pages of one head cover different tokens. ``uniform_tokens`` picks ``fraction`` of the
+    blocks of ``select_tokens`` tokens per (step, layer, head), as Quest-style methods do, and reads
+    every tensor of the head for the same tokens.
+    """
     shape = layout.shape
     if (mode not in MODES or steps <= 0 or not 0 < fraction <= 1 or count <= 0
             or not 0 <= hot_fraction <= 1 or not 1 <= hot_units <= cfg.units
-            or not 0 <= unit < cfg.units):
+            or not 0 <= unit < cfg.units or type(select_tokens) is not int or select_tokens <= 0):
         raise ValueError("Invalid generator parameters")
     rng = Random(seed)
+    if mode == "uniform_tokens":
+        blocks = -(-shape.context // select_tokens)
+        for step in range(steps):
+            for layer in range(shape.layers):
+                for head in range(shape.kv_heads):
+                    for block in sorted(rng.sample(range(blocks), ceil(blocks * fraction))):
+                        lo, hi = block * select_tokens, min((block + 1) * select_tokens, shape.context)
+                        for spec in layout.tensors:
+                            yield Access(step, layer, head, spec.name, "R", lo, hi, spec.bits)
+        return
     if mode == "sink_recent":
         # StreamingLLM-style: the first ``count`` tokens plus the last ``fraction`` of the context.
         recent = max(1, round(shape.context * fraction))
@@ -315,6 +333,9 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
         k = used.get(target, 0)
         used[target] = k + 1
         pa = cfg.unit_lpa(target, k, layout.base)
+        if pa >= layout.base + layout.span:
+            raise ValueError(f"{mode}: unit {target} needs its page {k}, beyond the layout's {layout.span} pages; "
+                             "use fewer pages per unit or a larger shape")
         access = layout.page_access(pa)
         access.validate(layout)
         addresses.append(pa)

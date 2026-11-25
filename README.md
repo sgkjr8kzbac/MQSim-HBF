@@ -5,7 +5,7 @@
 - **器件层**：固定版本的 [MQSim](https://github.com/CMU-SAFARI/MQSim)（FAST 2018），使用它的事务调度、ONFI 通道和闪存芯片时序。对 MQSim 的修改全部以可开关的补丁形式保存。
 - **中间件**：本仓库的 Python 包 `hbf`。它把"每步、每层、每个 KV 头读写哪些 token"翻译成 4 KiB 页请求和 MQSim 轨迹，跑完后还原出子批、层和 decode 步的时延与负载指标，并与两个解析估算器对照。
 
-> **当前状态：第 0 阶段已完成，第 1 阶段的模拟器改进已在开发分支上。** 第 1 阶段新增：容量扩到每 plane 512 块、不跑 MQSim 的机制分析模式、真实 die/plane 层级（T-PLANE）、HBF 命令模型（T-CMD）、cache read（T-CACHE）、SPLASH 式条带布局、规范示例拓扑 `ocp`、规范带宽档位，以及机制分析中的主机协议约束（命令额度、64 B 读、读突发、主机链路）。对照 OCP HBF 规范 v0.7.0 做了一致性修正（见 REPORT"规范一致性审查"）。最近一次全量运行 138 项通过、3 项 xfail，xfail 是如实记录的已知偏差，见[验证状态](#验证状态)。详细实测、源码依据和偏差分析见 [REPORT.md](REPORT.md)。
+> **当前状态：第 0 阶段已完成，第 1 阶段的模拟器改进已在开发分支上。** 第 1 阶段新增：容量扩到每 plane 512 块、不跑 MQSim 的机制分析模式、真实 die/plane 层级（T-PLANE）、HBF 命令模型（T-CMD）、cache read（T-CACHE）、SPLASH 式条带布局、规范示例拓扑 `ocp`、规范带宽档位，以及机制分析中的主机协议约束（命令额度、64 B 读、读突发、主机链路）。对照 OCP HBF 规范 v0.7.0 做了一致性修正（见 REPORT"规范一致性审查"）。最近一次全量运行 146 项通过、3 项 xfail，xfail 是如实记录的已知偏差，见[验证状态](#验证状态)。详细实测、源码依据和偏差分析见 [REPORT.md](REPORT.md)。
 
 ---
 
@@ -90,7 +90,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 
 | 模块 | 作用 |
 |---|---|
-| [`hbf/access.py`](hbf/access.py) | 访问记录格式与校验、张量规格 `TensorSpec`、三种布局、8 种生成模式（含 StreamingLLM 式 `sink_recent`）、整体 prefill |
+| [`hbf/access.py`](hbf/access.py) | 访问记录格式与校验、张量规格 `TensorSpec`、三种布局、9 种生成模式（含 StreamingLLM 式 `sink_recent`、Quest 式按 token 块选择的 `uniform_tokens`）、整体 prefill |
 | [`hbf/controller.py`](hbf/controller.py) | token 区间到页的转换、批内去重、有用字节按区间并集计算、64 B 突发传输字节、子批划分、两个估算器和负载指标 |
 | [`hbf/analysis.py`](hbf/analysis.py) | 机制分析：不跑 MQSim，按层计算读轮数、最少轮数、plane 利用率、均衡损失和感测放大，支持独立 plane 与同偏移联动两种组织 |
 | [`hbf/simulator.py`](hbf/simulator.py) | 校验源码散列、打补丁、编译 MQSim；GC 预算检查；写轨迹；运行并对回逐请求完成日志；聚合结果 |
@@ -198,6 +198,12 @@ python3 -m hbf.cli --topology 64x16 --mode dense --tensors '[{"name":"K","bits":
 
 ```bash
 python3 -m hbf.cli --analysis-only --topology 16x64 --layers 32 --context 32768 --mode uniform_pages --fraction 0.05 --plane-group 1 --plane-group 32
+```
+
+按固定 token 块选择（每个头选 5% 的 16-token 块，K、V 读同一批 token），比较 BF16 与 2 bit：`uniform_pages` 按存储页抽样，选择单位会随压缩变大，`uniform_tokens` 不会：
+
+```bash
+python3 -m hbf.cli --analysis-only --topology ocp --layers 32 --context 32768 --mode uniform_tokens --select-tokens 16 --fraction 0.05 --tensors '[{"name":"K","bits":2,"dims":128},{"name":"V","bits":2,"dims":128}]'
 ```
 
 加上协议约束（每主机通道 256 条命令、不支持读突发、一页命令一起排队），看命令额度对轮数的影响；把 `--host-order` 换成 `trigger` 可以比较另一种主机发送策略：

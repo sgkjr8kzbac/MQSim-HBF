@@ -147,10 +147,14 @@ def metrics(cfg, requests):
     bus_ns = cfg.read_command_ns + cfg.transfer_ns
     cycle = bus_ns + cfg.read_ns + cfg.rb_ns
     mq = max(unit_max * cycle, channel_max * bus_ns) + cfg.host_ns if reads else 0
+    if cfg.planes > 1:
+        # The estimate charges one read command per page. Multi-plane commands share one command
+        # among a die's planes, so it does not apply; the mechanism analysis gives the rounds.
+        mq = None
     ideal = max(unit_max * cfg.read_ns, byte_count / cfg.aggregate_gb_s)
     return {
         "read_pages": reads, "useful_bytes": useful, "read_amplification": byte_count / useful if useful else None,
         "active_units": len(units), "max_unit_pages": unit_max,
         "unit_imbalance": unit_max * cfg.units / reads if reads else None,
-        "max_channel_pages": channel_max, "mq_est_ns": mq, "ideal_ns": ideal, "estimate_gap_ns": mq - ideal,
+        "max_channel_pages": channel_max, "mq_est_ns": mq, "ideal_ns": ideal, "estimate_gap_ns": None if mq is None else mq - ideal,
     }

@@ -134,7 +134,8 @@ class Protocol:
     * ``read_unit`` - ``page`` reads the whole 4 KiB page; ``wanted`` reads only the 64 B units
       that hold wanted tokens.
     * ``host_order`` - ``fcfs`` queues all commands of a page at once, as HBF-EventLab's default
-      host does, so they hold credits while the page is sensed; ``trigger`` first sends one 64 B
+      host does, so the admitted ones hold credits while the page is sensed (commands that did not
+      fit follow as cache hits); ``trigger`` first sends one 64 B
       read per page to start the sense and the rest after the data reached the bank's cache
       buffer, where they are served at once as cache hits (section 5.3.1, items 5a, 7 and 8).
       The spec allows both; ``trigger`` needs only one credit per page during the sense.
@@ -176,15 +177,21 @@ def protocol_rounds(cfg, reads, group, offsets, protocol):
 
     A round senses at most one offset per lock-step group (one page per bank for ``group = 1``) and,
     per host channel, admits at most ``mocs`` credits; a page holds ``sensing_credits`` credits in
-    the round that senses it. An item that needs more credits than are left (a lock-step offset that
-    gathers many pages, or MOCS = 1) is admitted over several rounds and its group waits meanwhile.
-    Rounds are scheduled greedily per host channel, longest group queue first: with equal credits per
-    page this reaches max(longest queue, ceil(pages / floor(MOCS / credits))); otherwise it is an
+    the round that senses it. An item (a page, or a lock-step offset with all its pages) starts its
+    sense as soon as one of its commands is admitted; when only part of its commands fit, the rest
+    enter after the sense and are served from the bank's cache buffer (section 5.3.1, items 5a and 7),
+    which takes no sensing round. HBF-EventLab with MOCS = 1 confirms it: eight pages of one host
+    channel took eight senses and 504 cache hits (33.2 us), not 512 rounds.
+
+    Rounds are scheduled greedily per host channel, longest group queue first: with equal credits
+    ``c`` per item this reaches max(longest queue, ceil(items / ceil(MOCS / c))); otherwise it is an
     achievable upper bound. The model treats a round as one tR and releases all credits at its end,
     so it is approximate: HBF-EventLab, which frees each credit when its response is delivered,
     fits slightly more pages per wave under ``fcfs``.
 
-    Returns (rounds, credit-bound rounds, total commands, link-bound rounds).
+    Returns (rounds, credit-bound rounds, total commands, link-bound rounds). The credit bound is
+    ceil(items / k), where k is the most items one round can start: one more than the number of the
+    cheapest items whose credits sum to less than MOCS.
     """
     queues = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     commands = 0
@@ -197,24 +204,22 @@ def protocol_rounds(cfg, reads, group, offsets, protocol):
         data[host] += protocol.read_bytes(cfg, req)
     rounds = credit = 0
     for groups in queues.values():
-        pending = {key: [list(item) for item in sorted(items.items())] for key, items in groups.items()}
-        credit = max(credit, -(-sum(cost for items in pending.values() for _, cost in items) // protocol.mocs))
+        costs = sorted(cost for items in groups.values() for cost in items.values())
+        spent = per_round = 0
+        while per_round < len(costs) and spent < protocol.mocs:
+            spent += costs[per_round]
+            per_round += 1
+        credit = max(credit, -(-len(costs) // per_round))
+        pending = {key: [cost for _, cost in sorted(items.items())] for key, items in groups.items()}
         count = 0
         while pending:
             budget = protocol.mocs
             for key in sorted(pending, key=lambda k: -len(pending[k])):
                 if budget == 0:
                     break
-                head = pending[key][0]
-                admitted = min(head[1], budget)
-                if admitted < head[1] and admitted < protocol.mocs and head[1] <= protocol.mocs:
-                    continue  # it fits in a fresh round; do not split it
-                head[1] -= admitted
-                budget -= admitted
-                if head[1] == 0:
-                    pending[key].pop(0)
-                    if not pending[key]:
-                        del pending[key]
+                budget -= min(pending[key].pop(0), budget)  # the sense starts; the rest are cache hits
+                if not pending[key]:
+                    del pending[key]
             count += 1
         rounds = max(rounds, count)
     link = 0

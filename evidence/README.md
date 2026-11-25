@@ -7,3 +7,5 @@
 第二轮审查修改：`t8-topologies.csv` 是三种拓扑 × 三档的 T8 时延比与通道项/单元项之比，`t9-unsplit.csv` 是单层一次提交与 4×8K 拆分的对照，`pytest/review-round2.log` 是对应的测试日志。
 
 第 1 阶段：`stage1-analysis-sweep.csv` 是机制分析的示例扫描（Llama-3.1-8B 形状、32K、均匀随机选页，1,024 与 256 个 plane，BF16 与 2 bit，两种布局，独立与同偏移联动），由 `hbf/analysis.py` 生成，不经过 MQSim。
+
+实验排查：`selection-granularity.csv` 比较按页抽样（`uniform_pages`）与按 16-token 块选择（`uniform_tokens`），`ocp`、32 层、32K，BF16、2 bit 与 KIVI 格式，由 `hbf/analysis.py` 生成；`mqsim-vs-rounds.csv` 是 `ocp` 上 MQSim 每层时延与分析轮数的对照（2 层、32K、T-CMD + T-CACHE）。`protocol-credit-scan.csv` 已按修正后的协议模型重算。

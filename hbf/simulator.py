@@ -319,9 +319,10 @@ def aggregate(cfg, group, keys):
               **metrics(cfg, (req for batch, _ in group for req in batch.requests))}
     result["mq_est_unsplit_ns"] = result["mq_est_ns"]
     result["ideal_unsplit_ns"] = result["ideal_ns"]
-    result["mq_est_ns"] = sum(row["mq_est_ns"] for _, row in group)
+    estimates = [row["mq_est_ns"] for _, row in group]
+    result["mq_est_ns"] = None if None in estimates else sum(estimates)
     result["ideal_ns"] = sum(row["ideal_ns"] for _, row in group)
-    result["estimate_gap_ns"] = result["mq_est_ns"] - result["ideal_ns"]
+    result["estimate_gap_ns"] = None if result["mq_est_ns"] is None else result["mq_est_ns"] - result["ideal_ns"]
     result["mqsim_over_est"] = result["mqsim_ns"] / result["mq_est_ns"] if result["mq_est_ns"] else None
     if "layer" not in keys:
         # Each layer runs serially in the reconstructed step. Keep unsplit bounds additive.
@@ -329,6 +330,7 @@ def aggregate(cfg, group, keys):
         for batch, row in group:
             layers[batch.layer].append((batch, row))
         per_layer = [metrics(cfg, (req for batch, _ in items for req in batch.requests)) for items in layers.values()]
-        result["mq_est_unsplit_ns"] = sum(layer["mq_est_ns"] for layer in per_layer)
+        estimates = [layer["mq_est_ns"] for layer in per_layer]
+        result["mq_est_unsplit_ns"] = None if None in estimates else sum(estimates)
         result["ideal_unsplit_ns"] = sum(layer["ideal_ns"] for layer in per_layer)
     return result
