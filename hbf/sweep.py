@@ -21,6 +21,8 @@ import csv
 import itertools
 import json
 import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 import re
 import shutil
 import sys
@@ -38,7 +40,7 @@ RESERVED = ("output", "help", "analysis_only", "timing")  # set by the sweep its
 T_KEYS = tuple(key for key in TIMING_KEYS if key.startswith("t_"))
 STEP_KEYS = ("pages", "rounds", "min_rounds", "channel_rounds", "protocol_rounds", "est_ns", "est_batches_ns",
              "bound_ns") + T_KEYS + ("useful_bytes", "burst_bytes", "hbm_bytes", "attended_tokens",
-                                     "attended_elements", "dequant_ops", "utilization")
+                                     "attended_elements", "hbf_elements", "dequant_ops", "utilization")
 SYSTEM_KEYS = ("tpot_hbf_est_ns", "tpot_hbf_bound_ns", "tpot_hbm_ns", "tokens_per_s_hbf", "tokens_per_s_hbm",
                "hbf_over_hbm", "hbf_wait_share")
 FIT_KEYS = ("hbm_fits", "hbm_fits_hbf")
@@ -173,9 +175,11 @@ def summarize_run(directory, head_dim):
     decode steps, except ``max_block_reads`` (maximum over steps) and ``hbm_fits``/``hbm_fits_hbf``
     (true only if every step fits). A mean is empty when any step lacks the value, e.g. an
     estimate that does not exist for the topology. ``bottleneck`` is the most common per-layer
-    bottleneck of group 1 over all steps. ``effective_gb_s`` = attended_elements x 2 B (the K and V
-    elements attention uses, as BF16-equivalent logical bytes, of one stack's requests) / est_ns,
-    i.e. bytes per ns; runs without the column fall back to attended_tokens x 2 x head_dim.
+    bottleneck of group 1 over all steps. ``effective_gb_s`` = hbf_elements x 2 B (the K and V
+    elements attention uses that come from HBF, as BF16-equivalent logical bytes, of one stack's
+    requests) / est_ns, i.e. bytes per ns; HBM-tier elements (a KIVI residual window) are left out
+    because est_ns is the HBF read time. Runs without the column fall back to attended_elements,
+    then attended_tokens x 2 x head_dim.
     """
     steps = _group1(directory / "analysis_steps.csv")
     row = {key: _mean([step.get(key) for step in steps]) for key in STEP_KEYS}
@@ -189,7 +193,10 @@ def summarize_run(directory, head_dim):
     for key in FIT_KEYS:
         fits = [step.get(key) for step in system]
         row[key] = None if not fits or None in fits else all(fits)
-    est, tokens, elements = row["est_ns"], row["attended_tokens"], row.get("attended_elements")
+    est, tokens = row["est_ns"], row["attended_tokens"]
+    elements = row.get("hbf_elements")
+    if elements is None:
+        elements = row.get("attended_elements")
     if elements is None and tokens is not None:
         elements = tokens * 2 * head_dim
     row["effective_gb_s"] = None if not est or elements is None else elements * 2 / est
@@ -209,6 +216,8 @@ def run_one(task):
     try:
         args = parser.parse_args(argv)
         row["seed"] = args.seed
+        if args.plane_groups and 1 not in args.plane_groups:
+            raise ValueError("the summary reads plane group 1; include 1 in plane_group")
         run = configure(args)
     except (OSError, TypeError, ValueError) as error:  # as hbf.cli.main
         row["status"] = _status("infeasible", error)
@@ -257,9 +266,17 @@ def sweep(grid, output, jobs=1, keep=True, skip_access=False, progress=None):
         for task in tasks:
             record(run_one(task))
     else:
-        with multiprocessing.get_context("spawn").Pool(jobs) as pool:
-            for result in pool.imap_unordered(run_one, tasks, chunksize=1):
-                record(result)
+        # A killed worker (e.g. out of memory) breaks the pool; the unfinished runs are then recorded
+        # as errors instead of waiting forever.
+        with ProcessPoolExecutor(jobs, mp_context=multiprocessing.get_context("spawn")) as pool:
+            futures = {pool.submit(run_one, task): task for task in tasks}
+            for future in as_completed(futures):
+                try:
+                    record(future.result())
+                except BrokenProcessPool as error:
+                    index, name, _, varied, *_ = futures[future]
+                    row = {"index": index, "run": name, "status": _status("error", f"worker died: {error}")}
+                    record((row | {key: cell(value) for key, value in varied.items() if key != "seed"}, 0.0))
     rows.sort(key=lambda row: row["index"])
     varied_keys = list(dict.fromkeys(key for _, varied in runs for key in varied if key != "seed"))
     fields = ["index", "run", *varied_keys, "seed", "status", *METRICS]

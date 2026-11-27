@@ -300,7 +300,8 @@ PROTOCOL_KEYS = ("commands", "credit_rounds", "link_rounds", "protocol_rounds")
 
 
 TIMING_KEYS = ("est_ns", "est_batches_ns", "bound_ns", "t_balanced_ns", "t_imbalance_ns", "t_protocol_ns",
-               "t_channel_ns", "t_overhead_ns", "attended_tokens", "attended_elements", "hbm_bytes", "dequant_ops")
+               "t_channel_ns", "t_overhead_ns", "attended_tokens", "attended_elements", "hbf_elements", "hbm_bytes",
+               "dequant_ops")
 
 
 def summarize(layers, protocol=None, timing=False):
@@ -509,6 +510,7 @@ def _timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max
         "t_channel_ns": max(0, channel_ns - effective * cfg.read_ns),
         "t_overhead_ns": None if estimate is None else estimate - bound, "bottleneck": bottleneck,
         "attended_tokens": layer.attended_tokens, "attended_elements": layer.attended_elements,
+        "hbf_elements": layer.hbf_elements,
         "hbm_bytes": layer.hbm_bytes, "dequant_ops": layer.dequant_ops,
     }
 

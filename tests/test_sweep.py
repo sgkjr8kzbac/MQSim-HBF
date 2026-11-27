@@ -100,7 +100,7 @@ def test_summary_equals_run_csv_values(tmp_path):
         for key in ("hbm_fits", "hbm_fits_hbf"):
             assert row[key] == str(all(step[key] == "True" for step in system))
         assert number(row["effective_gb_s"]) == pytest.approx(
-            number(row["attended_elements"]) * 2 / number(row["est_ns"]))
+            number(row["hbf_elements"]) * 2 / number(row["est_ns"]))
         meta = json.loads((run / "meta.json").read_text())
         assert "--analysis-only" in meta["argv"] and meta["system"]["batch"] == int(row["batch"])
     # A larger batch attends more tokens on the same stack.
@@ -140,3 +140,21 @@ def test_no_keep_and_skip_access_csv(tmp_path, capsys):
                  ["--output", str(tmp_path / "jobs"), "--jobs", "4"]):
         with pytest.raises(SystemExit):
             main([str(grid), *argv])
+
+
+def test_plane_groups_without_one_are_infeasible(tmp_path):
+    from hbf.sweep import sweep
+    grid = {"base": {"topology": "ocp", "layers": 1, "context": 1024}, "vary": {"plane_group": [[16], [1, 16]]}}
+    rows = sweep(grid, tmp_path / "g", progress=open("/dev/null", "w"))
+    assert rows[0]["status"].startswith("infeasible") and "plane group 1" in rows[0]["status"]
+    assert rows[1]["status"] == "ok" and rows[1]["rounds"] is not None
+
+
+def test_effective_bandwidth_leaves_out_the_hbm_tier(tmp_path):
+    from hbf.sweep import sweep
+    grid = {"base": {"topology": "ocp", "read_plane_ns": 0, "coalesce_ns": 1, "cache_read": True, "layers": 1,
+                     "context": 2048, "format": "kivi2"}}
+    (row,) = sweep(grid, tmp_path / "k", progress=open("/dev/null", "w"))
+    assert row["hbf_elements"] == 8 * (1920 * 128 * 2)  # body tokens of K and V; the residual is in HBM
+    assert row["attended_elements"] == 8 * 2048 * 256
+    assert row["effective_gb_s"] == pytest.approx(row["hbf_elements"] * 2 / row["est_ns"])
