@@ -74,11 +74,14 @@ def write_check_report(cfg, spec, check):
               "生成的 token 满一页时写入），逐块核对 OCP 规范 §5.4.1：块内从第 0 页起按页顺序写、不得跳页；"
               "写第 0 页会自动擦除整块。每块 "
               f"{cfg.pages_per_block} 页（假设）。", "",
-              "| 写入页 | 其中 prefill | 填充页 | decode 写回 | 涉及块 | 跳页 | 覆盖写 | 擦除仍有效的块 | 合法 |",
-              "|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
+              "| 写入页 | 其中 prefill | 填充页 | decode 写回 | 涉及块 | 跳页 | 回退写 | 重复写 | 擦除仍有数据的块 | 合法 |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
               f"| {check['writes']} | {kinds['prefill']} | {kinds['padding']} | {kinds['decode']} | {check['blocks']} | "
-              f"{check['skips']} | {check['overlaps']} | {check['live_erases']} | {'是' if check['legal'] else '否'} |", "",
-              "跳页对应规范 §11.5.2.6 的写顺序错误，覆盖写对应 §11.5.2.2；擦除仍有效的块会丢失其中已写入的 KV。"]
+              f"{check['skips']} | {check['backward']} | {check['overwrites']} | {check['live_erases']} | "
+              f"{'是' if check['legal'] else '否'} |", "",
+              "跳页和回退写（写块内比已写最高页更低、本周期未写过的页）都是规范 §11.5.2.6 的写顺序错误；重复写是同一页"
+              "写两次（§11.5.2.2）；写第 0 页会自动擦除整块，块中已有的数据随之丢失。快照中的数据都仍在使用。"
+              "按层优先预留的历史不含布局的填充页；一次按地址顺序写入整个区间（第 2 阶段 A 的 --prefill）时是合法的。"]
     return report
 
 
@@ -106,13 +109,25 @@ def analysis_report(layer_rows, step_rows):
     return report
 
 
-def request_bytes(cfg, layout, heads):
-    """Stored KV of one request (all tiers; HBF tensors page-granular) and its HBM-tier part."""
-    per_head = sum(count * cfg.page_bytes for count in layout.block_counts)
-    hbm = sum((layout.windows[spec.name][1] - layout.windows[spec.name][0]) * spec.token_bytes
-              for spec in layout.hbm_tensors)
+def request_bytes(cfg, layout, heads, contexts=None):
+    """Stored KV of one request (all tiers; HBF tensors page-granular) and its HBM-tier part, averaged
+    over ``contexts`` (per-request contexts of a placed batch; default the layout's context)."""
+    totals, hbm_totals = [], []
+    for context in contexts or [layout.shape.context]:
+        windows = {}
+        for spec in layout.all_tensors:
+            try:
+                windows[spec.name] = spec.tokens(context)
+            except ValueError:  # empty window at this context
+                windows[spec.name] = (0, 0)
+        per_head = sum(-(-(windows[spec.name][1] - windows[spec.name][0]) // tokens) * cfg.page_bytes
+                       for spec, tokens in zip(layout.tensors, layout.tokens_per_page))
+        hbm = sum((windows[spec.name][1] - windows[spec.name][0]) * spec.token_bytes for spec in layout.hbm_tensors)
+        totals.append(per_head + hbm)
+        hbm_totals.append(hbm)
     scale = layout.shape.layers * heads
-    return {"kv_bytes_per_request": (per_head + hbm) * scale, "hbm_tier_bytes_per_request": hbm * scale}
+    return {"kv_bytes_per_request": round(sum(totals) / len(totals) * scale),
+            "hbm_tier_bytes_per_request": round(sum(hbm_totals) / len(hbm_totals) * scale)}
 
 
 def subbatch_count(layer_rows, plane_groups):
@@ -123,7 +138,7 @@ def subbatch_count(layer_rows, plane_groups):
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
              placement="static", protocol=None, engine="auto", timing=False, system=None, kv_format=None,
-             requests=None):
+             requests=None, check_writes=False):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None.
 
     Without MQSim and with static placement the analysis needs no request schedule, so the numpy
@@ -146,7 +161,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
         accesses = list(generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv))
     write_check = None
-    if isinstance(requests, BatchSpec):
+    if isinstance(requests, BatchSpec) and check_writes:
         snapshot = layout.snapshot if placed else place_batch(
             cfg, Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context),
             requests, layout.tensors, layout.tokens_per_page)
@@ -161,7 +176,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     write_access(access_path, accesses)
     system_meta = None
     if system is not None:
-        system_meta = request_bytes(cfg, layout, system["heads"]) | {
+        contexts = [r.context for r in requests.requests] if isinstance(requests, BatchSpec) else None
+        system_meta = request_bytes(cfg, layout, system["heads"], contexts) | {
             "model": system["model"].name, "gpu": system["gpu"].name, "batch": system["batch"],
             "stacks": system["stacks"], "analysis_batch": system["analysis_batch"], "selection": system["selection"],
             "kv_format": kv_format.name if kv_format else "tensors" if tensors else "bf16",
@@ -391,11 +407,13 @@ def batch_spec(args, per_stack):
         if len(items) != per_stack:
             raise ValueError(f"--{name} lists {len(items)} values for {per_stack} requests per stack")
         return items
+    if args.alloc != "vllm_pool" and (args.block_tokens is not None or args.free_order != "fresh"):
+        raise ValueError("--block-tokens and --free-order apply to --alloc vllm_pool")
     prompts = values(args.contexts, "contexts") if args.contexts is not None else [args.context] * per_stack
     generated = values(args.generated, "generated")
     spec = BatchSpec(tuple(BatchRequest(p, g) for p, g in zip(prompts, generated)), args.alloc, args.partition,
                      args.layout, args.flush_order, args.block_tokens, args.free_order)
-    return None if spec.default and not args.check_writes else spec
+    return None if spec.default and not args.check_writes else spec, max(prompts)
 
 
 def configure(args):
@@ -465,7 +483,9 @@ def configure(args):
     if (args.timing or system) and args.engine == "python":
         raise ValueError("--timing needs the numpy engine")
     requests = (per_stack, heads)
-    spec = batch_spec(args, per_stack)
+    spec, context = batch_spec(args, per_stack)
+    if context != shape.context:  # --contexts sets the stored context (equal prompts keep phase A's path)
+        shape = Shape(shape.layers, shape.kv_heads, shape.head_dim, context)
     if spec is not None:
         if not args.analysis_only or args.access_csv is not None or args.prefill:
             raise ValueError("Request placement (--alloc, --contexts, --generated, --check-writes) is analysis only, "
@@ -476,7 +496,7 @@ def configure(args):
             "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": args.prefill,
             "placement": args.placement, "protocol": protocol, "engine": args.engine,
             "timing": args.timing or system is not None, "system": system, "kv_format": kv_format,
-            "requests": requests}
+            "requests": requests, "check_writes": args.check_writes}
 
 
 def main(argv=None):

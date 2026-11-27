@@ -37,7 +37,7 @@
 
 | 模块 | 文件 | 状态 | 说明 |
 |---|---|---|---|
-| M2 请求放置 | `hbf/batch.py`、`tests/test_batch.py` | ✅ 已提交，审查中 | 四种分配：`layer_major`、`dedicated`、`packed`、`vllm_pool`，可按通道或 die 分区；快照的写入历史；`check_write_order` 按 §5.4.1 检查跳页、覆盖写和擦除有效块；CLI `--alloc` 等 |
+| M2 请求放置 | `hbf/batch.py`、`tests/test_batch.py` | ✅ 已提交，审查问题已修 | 四种分配：`layer_major`、`dedicated`、`packed`、`vllm_pool`，可按通道或 die 分区；快照的写入历史；`check_write_order` 按 §5.4.1 检查跳页、覆盖写和擦除有效块；CLI `--alloc` 等 |
 | M5 写入干扰 | `hbf/interference.py`、`tests/test_interference.py` | ✅ 已提交 | fifo、gaps、suspend、random、correlated 五种模式；`python -m hbf.interference RUN_DIR` |
 | M4a 时钟 | `hbf/endurance.py`（Clock、calibrate） | 🔄 开发中 | 用拟合的估算加 `system.evaluate` 代替每步跑分析 |
 | M4b 解析模型 | `hbf/endurance.py`（analytic） | ⏳ | 稳态公式：写入速率、读干扰刷新、数据保持刷新、擦除放大、到达 P/E 上限的天数 |

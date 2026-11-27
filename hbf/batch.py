@@ -10,7 +10,8 @@ prompts and the tokens generated so far, each request admitted so that all of th
 snapshot step, and places them by one of these allocation policies:
 
 * ``layer_major`` - phase A's emulation: one ``LAYOUTS[intra]`` region per (layer, request, head,
-  tensor), all requests reserved at the largest context.
+  tensor), all requests reserved at the largest context. Its history writes each request's own
+  pages, not the layout's padding (phase A's ``--prefill`` writes the whole span in address order).
 * ``dedicated`` - each request takes whole segments (``partition``: superblocks = one block index
   on every bank, or channel blocks / die blocks) and writes its prompt span, then its generated
   pages, in its own segments.
@@ -133,8 +134,9 @@ class PageTableLayout(Layout):
             raise ValueError("Use the layout directly for phase A's layer-major batch")
         self.spec, self.heads = spec, shape.kv_heads
         contexts = [r.context for r in spec.requests]
-        Layout.__init__(self, cfg, Shape(shape.layers, shape.kv_heads * len(spec.requests), shape.head_dim,
-                                         max(contexts)), tensors=tensors)
+        # The base check covers one request at the largest context; the placed table is checked below.
+        Layout.__init__(self, cfg, Shape(shape.layers, shape.kv_heads, shape.head_dim, max(contexts)), tensors=tensors)
+        self.shape = Shape(shape.layers, shape.kv_heads * len(spec.requests), shape.head_dim, max(contexts))
         if any(self.window_starts):
             raise ValueError("Per-request contexts need HBF tensors that start at token 0")
         self.windows = {name: (0, self.shape.context) if self.specs[name].tier == "hbm" else window
@@ -177,18 +179,38 @@ class PageTableLayout(Layout):
         return layer, r * self.heads + h, t, block
 
 
-def flush_events(spec, layers, heads, tokens_per_page, full_prompt, full_final):
+def full_pages(spec_t, context, tokens_per_page):
+    """Full pages of an HBF tensor when the request holds ``context`` tokens (0 if its window is empty)."""
+    try:
+        return spec_t.tokens(context)[1] // tokens_per_page
+    except ValueError:  # e.g. a KIVI body before the context exceeds the residual window
+        return 0
+
+
+def fill_context(spec_t, tokens):
+    """Smallest context at which the tensor's window holds ``tokens`` tokens (window starting at 0)."""
+    hi = (spec_t.window or (None, None))[1]
+    if hi is None:
+        return tokens
+    if hi < 0:
+        return tokens - hi
+    return tokens if tokens <= hi else float("inf")
+
+
+def flush_events(spec, layers, heads, tokens_per_page, full_prompt, full_final, tensors):
     """Decode flushes of every request: (time, request, tensor, block, layer order).
 
     Request r is admitted at step a_r = max generated - generated_r. Page k of tensor t fills when
-    the request reaches (k + 1) * tokens_per_page tokens; all (layer, head) of that tensor flush
-    together. ``rotate`` starts the g-th flush of a tensor at layer g mod L, ``layer`` at layer 0.
+    the tensor's window reaches (k + 1) * tokens_per_page tokens (for a KIVI body ``[0, -R]`` that is
+    R tokens later than the context); all (layer, head) of that tensor flush together, K's pages before
+    V's when both fill at the same step. ``rotate`` starts the g-th flush of a tensor at layer g mod L,
+    ``layer`` at layer 0.
     """
     longest = max(r.generated for r in spec.requests)
     events = []
     for r, request in enumerate(spec.requests):
         admitted = longest - request.generated
-        pending = sorted(((k + 1) * tokens_per_page[t] - request.prompt, t, k)
+        pending = sorted((fill_context(tensors[t], (k + 1) * tokens_per_page[t]) - request.prompt, t, k)
                          for t in range(len(tokens_per_page)) for k in range(full_prompt[r, t], full_final[r, t]))
         for when, t, k in pending:
             first = (k - full_prompt[r, t]) % layers if spec.flush_order == "rotate" else 0
@@ -208,15 +230,17 @@ def place_batch(cfg, shape, spec, tensors, tokens_per_page):
     full_prompt, full_final = {}, {}
     for r, request in enumerate(spec.requests):
         for t, spec_t in enumerate(tensors):
-            full_prompt[r, t] = spec_t.tokens(request.prompt)[1] // tokens_per_page[t]
-            full_final[r, t] = spec_t.tokens(request.context)[1] // tokens_per_page[t]
+            full_prompt[r, t] = full_pages(spec_t, request.prompt, tokens_per_page[t])
+            full_final[r, t] = full_pages(spec_t, request.context, tokens_per_page[t])
     longest_blocks = max(full_final.values())
-    table = np.full((count, shape.layers, shape.kv_heads, len(tensors), longest_blocks), -1, dtype=np.int64)
+    if cfg.capacity_sectors // cfg.spp >= 2**31:
+        raise ValueError("The page table stores LPAs as int32")
+    table = np.full((count, shape.layers, shape.kv_heads, len(tensors), longest_blocks), -1, dtype=np.int32)
     snapshot = Snapshot(table, dict(full_final))
     longest = max(r.generated for r in spec.requests)
     timeline = [(longest - request.generated, 0, r, None) for r, request in enumerate(spec.requests)]
     timeline += [(event[0], 1, event[1], event) for event in
-                 flush_events(spec, shape.layers, shape.kv_heads, tokens_per_page, full_prompt, full_final)]
+                 flush_events(spec, shape.layers, shape.kv_heads, tokens_per_page, full_prompt, full_final, tensors)]
     timeline.sort(key=lambda item: item[:3])
     placer = {"layer_major": LayerMajor, "vllm_pool": VllmPool}.get(spec.allocation, Segments)
     placer(cfg, shape, spec, tensors, tokens_per_page, snapshot, full_prompt, full_final).run(timeline)
@@ -390,38 +414,58 @@ class VllmPool(Placer):
 
 
 def check_write_order(cfg, lpas):
-    """Count writes that break the per-block order rules of OCP HBF section 5.4.1.
+    """Count writes that break the per-block write rules of OCP HBF section 5.4.1.
 
     In each NAND block (MQSim unit, static offset // pages per block) pages must be written in
-    order from page 0 without skipping; writing page 0 again auto-erases the block, losing the
-    pages written since (``live_erase``, all data of a snapshot is live); writing a page at or
-    below the block's highest written page is an overlap (section 11.5.2.2), above the next page
-    a skip (section 11.5.2.6, sub-code 0x1). Returns counts and the blocks touched.
+    order from page 0 without skipping (items 4 and 9). Writing page 0 auto-erases the block
+    (item 5): if the block already holds pages, they are lost (``live_erases``; all data of a
+    snapshot is live) and a new erase epoch starts. Within an epoch, relative to the highest page
+    written so far:
+
+    * ``skips`` - a page above the next one (section 11.5.2.6, sub-code 0x1);
+    * ``backward`` - a page below the highest one that was not written in this epoch (also an
+      order violation of section 11.5.2.6: the block cannot go back);
+    * ``overwrites`` - a page written again in the same epoch (overlap, section 11.5.2.2).
+
+    Returns these counts, the writes and blocks, and ``legal`` (all counts zero).
     """
     lpas = np.asarray(lpas, dtype=np.int64)
+    empty = {"writes": 0, "blocks": 0, "skips": 0, "backward": 0, "overwrites": 0, "live_erases": 0, "legal": True}
     if not len(lpas):
-        return {"writes": 0, "blocks": 0, "skips": 0, "overlaps": 0, "live_erases": 0, "legal": True}
+        return empty
     placed = place(cfg, lpas)
     block = placed.unit + cfg.units * (placed.offset // cfg.pages_per_block)
-    page = placed.offset % cfg.pages_per_block
-    order = np.argsort(block, kind="stable")
+    page = (placed.offset % cfg.pages_per_block).astype(np.int64)
+    del placed
+    order = np.argsort(block, kind="stable")  # time order kept within each block
     block, page = block[order], page[order]
-    new = np.empty(len(block), dtype=bool)
-    new[:1] = True
-    np.not_equal(block[1:], block[:-1], out=new[1:])
-    group = np.cumsum(new) - 1
+    del order
+    first = np.empty(len(block), dtype=bool)
+    first[:1] = True
+    np.not_equal(block[1:], block[:-1], out=first[1:])
+    erase = (page == 0) & ~first
+    epoch = np.cumsum(first | (page == 0)) - 1  # a block's writes split at every page-0 write
+    del block
     scale = cfg.pages_per_block + 1
-    keyed = group * scale + page
+    keyed = epoch * scale + page
     before = np.empty_like(keyed)
     before[:1] = -1
     np.maximum.accumulate(keyed[:-1], out=before[1:])
-    highest = np.where(new, -1, before - group * scale)  # highest page written earlier in this block
-    erase = (page == 0) & (highest >= 0)
+    start = np.empty(len(epoch), dtype=bool)
+    start[:1] = True
+    np.not_equal(epoch[1:], epoch[:-1], out=start[1:])
+    highest = np.where(start, -1, before - epoch * scale)  # highest page earlier in this epoch
+    del before
     skips = int(np.count_nonzero(page > highest + 1))
-    overlaps = int(np.count_nonzero((page <= highest) & (page > 0)))
+    below = page <= highest
+    # A repeated (epoch, page) is an overwrite (it is always below the highest page); the other writes
+    # below the highest page go back to a page the block has not had in this epoch.
+    overwrites = len(keyed) - len(np.unique(keyed))
+    backward = int(np.count_nonzero(below)) - overwrites
     erases = int(np.count_nonzero(erase))
-    return {"writes": len(lpas), "blocks": int(group[-1]) + 1, "skips": skips, "overlaps": overlaps,
-            "live_erases": erases, "legal": skips == overlaps == erases == 0}
+    return {"writes": len(lpas), "blocks": int(np.count_nonzero(first)), "skips": skips, "backward": backward,
+            "overwrites": overwrites, "live_erases": erases,
+            "legal": skips == backward == overwrites == erases == 0}
 
 
 def generate_batch(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, select_tokens=16):

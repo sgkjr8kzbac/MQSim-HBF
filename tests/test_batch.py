@@ -23,9 +23,14 @@ def test_check_write_order_counts():
     row = lambda k: k * cfg.units  # page k of the block of bank 0
     assert check_write_order(cfg, [row(0), row(1), row(2)])["legal"]
     assert check_write_order(cfg, [row(0), row(2)])["skips"] == 1
-    assert check_write_order(cfg, [row(0), row(1), row(1)])["overlaps"] == 1
+    assert check_write_order(cfg, [row(0), row(1), row(1)])["overwrites"] == 1
     erased = check_write_order(cfg, [row(0), row(1), row(0)])
     assert erased["live_erases"] == 1 and not erased["legal"]
+    # A page-0 write starts a new erase epoch: the rewrite after it is in order, not an overwrite.
+    again = check_write_order(cfg, [row(k) for k in (0, 1, 2, 3, 0, 1, 2, 3)])
+    assert (again["live_erases"], again["overwrites"], again["skips"], again["backward"]) == (1, 0, 0, 0)
+    back = check_write_order(cfg, [row(0), row(2), row(1), row(1)])
+    assert (back["skips"], back["backward"], back["overwrites"]) == (1, 1, 1)
     assert check_write_order(cfg, [row(1)])["skips"] == 1  # a block starts at page 0
     assert check_write_order(cfg, [row(0), row(4), row(1), row(5)])["blocks"] == 2
 
@@ -152,3 +157,49 @@ def test_default_batch_flags_keep_phase_a_outputs(tmp_path):
                           "--timing", "--output", str(tmp_path / name)] + extra)
     for file in ("analysis_layers.csv", "analysis_steps.csv", "access.csv"):
         assert (tmp_path / "plain" / file).read_bytes() == (tmp_path / "explicit" / file).read_bytes()
+
+
+def test_windowed_tensors_flush_after_admission():
+    # kivi2: the body [0, -128] fills a 2-bit K page (128 tokens) only 128 tokens after the context does.
+    cfg = load("ocp")
+    from hbf.formats import parse_format
+    tensors = parse_format("kivi2", 128).tensors
+    for allocation in ("packed", "dedicated", "vllm_pool", "layer_major"):
+        layout = PageTableLayout(cfg, Shape(1, 2, 128, 1), batch(allocation, [(4000, 128), (3000, 300)]),
+                                 tensors=tensors)
+        full = layout.snapshot.full_pages
+        assert full[0, 0] == (4128 - 128) // 128 and full[1, 0] == (3300 - 128) // 128
+        list(generate_batch(cfg, layout, "dense"))
+
+
+def test_equal_contexts_set_the_stored_context(tmp_path):
+    main(HBF_FLAGS + ["--layers", "1", "--batch", "2", "--contexts", "4096,4096", "--output", str(tmp_path / "e")])
+    meta = json.loads((tmp_path / "e" / "meta.json").read_text())
+    assert meta["shape"]["context"] == 4096 and meta["batch"] is None
+
+
+def test_mixed_contexts_check_capacity_per_placed_table():
+    cfg = load("ocp")
+    spec = batch("packed", [(131072, 0)] + [(4096, 0)] * 31, intra="layer_contiguous")
+    layout = PageTableLayout(cfg, Shape(32, 8, 128, 1), spec)  # a dense phase A layout of this would not fit
+    assert layout.snapshot.table.dtype.name == "int32" and layout.span < cfg.capacity_sectors // cfg.spp
+
+
+def test_request_bytes_use_each_context(tmp_path):
+    main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--batch", "2", "--contexts", "4096,1024", "--alloc", "packed",
+                      "--output", str(tmp_path / "b")])
+    system = json.loads((tmp_path / "b" / "meta.json").read_text())["system"]
+    assert system["kv_bytes_per_request"] == (4096 + 1024) // 2 * 128 * 1024  # 128 KiB per token (8B BF16)
+    main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--batch", "2", "--context", "4096", "--format", "kivi2",
+                      "--alloc", "packed", "--generated", "16", "--output", str(tmp_path / "k")])
+    system = json.loads((tmp_path / "k" / "meta.json").read_text())["system"]
+    assert system["hbm_tier_bytes_per_request"] == 2 * 128 * 256 * 32 * 8  # the residual of one request
+
+
+def test_write_check_only_on_request(tmp_path):
+    main(HBF_FLAGS + ["--layers", "1", "--context", "1024", "--batch", "2", "--generated", "16", "--alloc", "packed",
+                      "--output", str(tmp_path / "n")])
+    assert json.loads((tmp_path / "n" / "meta.json").read_text())["batch"]["write_check"] is None
+    with pytest.raises(SystemExit):
+        main(HBF_FLAGS + ["--layers", "1", "--context", "1024", "--batch", "2", "--alloc", "packed",
+                          "--free-order", "shuffled:1", "--output", str(tmp_path / "x")])

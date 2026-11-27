@@ -44,7 +44,8 @@ STEP_KEYS = ("pages", "rounds", "min_rounds", "channel_rounds", "protocol_rounds
 SYSTEM_KEYS = ("tpot_hbf_est_ns", "tpot_hbf_bound_ns", "tpot_hbm_ns", "tokens_per_s_hbf", "tokens_per_s_hbm",
                "hbf_over_hbm", "hbf_wait_share")
 FIT_KEYS = ("hbm_fits", "hbm_fits_hbf")
-WRITE_KEYS = ("write_legal", "write_skips", "write_overlaps", "write_live_erases", "decode_pages", "padding_pages")
+WRITE_KEYS = ("write_legal", "write_skips", "write_backward", "write_overwrites", "write_live_erases", "decode_pages",
+              "padding_pages")
 METRICS = (STEP_KEYS + ("max_block_reads", "bottleneck") + SYSTEM_KEYS + FIT_KEYS + ("effective_gb_s",)
            + WRITE_KEYS)
 
@@ -205,8 +206,9 @@ def summarize_run(directory, head_dim):
     meta = directory / "meta.json"
     check = ((json.loads(meta.read_text()).get("batch") or {}).get("write_check") if meta.exists() else None)
     if check:  # --check-writes: the write order verdict of hbf.batch.check_write_order
-        row |= {"write_legal": check["legal"], "write_skips": check["skips"], "write_overlaps": check["overlaps"],
-                "write_live_erases": check["live_erases"], "decode_pages": check["kinds"]["decode"],
+        row |= {"write_legal": check["legal"], "write_skips": check["skips"], "write_backward": check["backward"],
+                "write_overwrites": check["overwrites"], "write_live_erases": check["live_erases"],
+                "decode_pages": check["kinds"]["decode"],
                 "padding_pages": check["kinds"]["padding"]}
     return row
 
