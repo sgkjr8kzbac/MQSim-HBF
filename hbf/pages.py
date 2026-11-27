@@ -21,8 +21,10 @@ class LayerPages:
     """Read pages of one (step, layer), sorted by LPA (the order ``schedule`` gives requests).
 
     ``useful``, ``burst`` and ``runs`` equal ``Request.useful_bytes``, ``burst_bytes`` and
-    ``burst_runs``. The remaining fields describe reads that do not become HBF pages (HBM-tier
-    tensors) and the attended tokens; they stay at their defaults until tensors declare a tier.
+    ``burst_runs``. The remaining fields are the demand the system model needs: bytes read from
+    HBM-tier tensors, tokens attended (union over the data tensors of each head), attended
+    elements (tokens x dims summed over the data tensors: the K and V elements attention
+    multiplies), tokens read per tensor and dequantization operations.
     """
     step: int
     layer: int
@@ -35,6 +37,7 @@ class LayerPages:
     attended_tokens: int = 0
     tensor_tokens: dict = field(default_factory=dict)
     dequant_ops: float = 0.0
+    attended_elements: int = 0
 
     def __len__(self):
         return len(self.lpa)
@@ -122,6 +125,7 @@ def layer_pages(cfg, layout, step, layer, rows):
     hbm = np.asarray([spec.tier == "hbm" for spec in specs])
     hbm_bytes = sum(tensor_tokens[i] * specs[i].token_bytes for i in np.flatnonzero(hbm).tolist())
     dequant = sum(tensor_tokens[i] * specs[i].dims * specs[i].dequant_ops for i in range(len(specs)))
+    elements = sum(int(tensor_tokens[i]) * specs[i].dims for i in range(len(specs)) if specs[i].role == "data")
     hbf_index = np.asarray([layout.index.get(spec.name, -1) for spec in specs], dtype=np.int64)
     keep = ~hbm[g]
     head, t, lo, hi = head[keep], hbf_index[g[keep]], lo[keep], hi[keep]
@@ -152,7 +156,7 @@ def layer_pages(cfg, layout, step, layer, rows):
     return LayerPages(step, layer, lpa[new], t[new], tokens * token_bytes[new], chunks * BURST_BYTES, runs,
                       hbm_bytes=int(hbm_bytes), attended_tokens=attended,
                       tensor_tokens={specs[i].name: int(tensor_tokens[i]) for i in range(len(specs))},
-                      dequant_ops=float(dequant))
+                      dequant_ops=float(dequant), attended_elements=elements)
 
 
 def per_tensor_tokens(head, g, lo, hi, context, count):

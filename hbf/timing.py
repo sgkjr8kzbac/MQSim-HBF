@@ -39,8 +39,8 @@ def command_ns(cfg, planes):
 
 
 def hbf_command_model(cfg):
-    """Whether ``cfg`` is the command model the estimate was validated on."""
-    return cfg.read_plane_ns == 0 and cfg.coalesce_ns is not None and cfg.cache_read
+    """Whether ``cfg`` is the command model (and tR) the estimate was validated on."""
+    return cfg.read_plane_ns == 0 and cfg.coalesce_ns is not None and cfg.cache_read and cfg.read_ns == 4096
 
 
 def round_pages(cfg, placed, group, part=slice(None)):

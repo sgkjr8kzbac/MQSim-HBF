@@ -28,7 +28,7 @@ class Shape:
 
 
 TIERS = ("hbf", "hbm")
-ROLES = ("data", "meta")
+ROLES = ("data", "aux", "meta")
 
 
 @dataclass(frozen=True)
@@ -44,10 +44,11 @@ class TensorSpec:
       precision: the quantized tensors take ``[0, -R]`` and the full-precision ones ``[-R, None]``.
     * ``tier`` - ``hbf`` (stored in HBF pages) or ``hbm`` (read from HBM, e.g. a residual window
       that changes every step and cannot be rewritten in place on HBF, section 5.4.1).
-    * ``role`` - ``data`` (attended tokens) or ``meta`` (selection metadata such as Quest's page
-      summaries, read in full every step by the generator's selection modes and not attended).
-      Per-block metadata is amortized as a per-token row (e.g. min and max keys of 16-token
-      blocks: 2 x 128 / 16 = 16 elements per token).
+    * ``role`` - ``data`` (attended K or V elements), ``aux`` (per-token data that is read with the
+      selected tokens but not attended, e.g. quantization scales) or ``meta`` (selection metadata
+      such as Quest's page summaries, read in full every step by every generator mode and not
+      attended). Per-block metadata is amortized as a per-token row (e.g. min and max keys of
+      16-token blocks: 2 x 128 / 16 = 16 elements per token).
     * ``dequant_ops`` - GPU vector operations per stored element read (an assumption of the format).
     """
     name: str
@@ -361,9 +362,10 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
              hot_fraction=.5, hot_units=1, select_tokens=16):
     """Seeded accesses of one workload mode.
 
-    Selection modes read HBM-tier tensors (hot windows) and ``meta`` tensors (selection
-    metadata) in full every (step, layer, head), and clip the selected tokens to each tensor's
-    window; with the default tensors this changes nothing.
+    Every mode reads ``meta`` tensors (selection metadata) in full every (step, layer, head);
+    selection modes also read HBM-tier tensors (hot windows) in full and clip the selected tokens
+    to each tensor's window; with the default tensors this changes nothing. ``uniform_pages``
+    samples each tensor's pages independently, so K and V (and scales) cover different tokens.
 
     ``uniform_pages`` picks ``fraction`` of each tensor's storage pages, independently per tensor, so
     the selection unit grows with compression (a 2-bit page holds 128 tokens, a BF16 page 16) and K
@@ -391,7 +393,7 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
 
     if mode == "uniform_tokens":
         blocks = -(-shape.context // select_tokens)
-        selective = [spec for spec in layout.tensors if spec.role == "data"]
+        selective = [spec for spec in layout.tensors if spec.role != "meta"]
         for step in range(steps):
             for layer in range(shape.layers):
                 for head in range(shape.kv_heads):

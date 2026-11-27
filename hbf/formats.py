@@ -92,9 +92,9 @@ def parse_format(text, head_dim):
             notes.append(f"按通道分组量化（每 {group} 个通道一对 scale、zero）")
         notes.append("量化参数（16 bit scale 与 zero）按每 token 一行均摊存放（假设）；反量化每元素 3 次运算（假设）")
         tensors += [TensorSpec("K", bits, k_dims, window, dequant_ops=INT_DEQUANT_OPS),
-                    TensorSpec("K_qp", 16, 2 * k_dims // group, window),
+                    TensorSpec("K_qp", 16, 2 * k_dims // group, window, role="aux"),
                     TensorSpec("V", bits, d, window, dequant_ops=INT_DEQUANT_OPS),
-                    TensorSpec("V_qp", 16, 2 * d // group, window)]
+                    TensorSpec("V_qp", 16, 2 * d // group, window, role="aux")]
         if window is not None:
             tensors += [TensorSpec("K_res", 16, k_dims, (-params["residual"], None), "hbm"),
                         TensorSpec("V_res", 16, d, (-params["residual"], None), "hbm")]

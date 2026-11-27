@@ -300,7 +300,7 @@ PROTOCOL_KEYS = ("commands", "credit_rounds", "link_rounds", "protocol_rounds")
 
 
 TIMING_KEYS = ("est_ns", "est_batches_ns", "bound_ns", "t_balanced_ns", "t_imbalance_ns", "t_protocol_ns",
-               "t_channel_ns", "t_overhead_ns", "attended_tokens", "hbm_bytes", "dequant_ops")
+               "t_channel_ns", "t_overhead_ns", "attended_tokens", "attended_elements", "hbm_bytes", "dequant_ops")
 
 
 def summarize(layers, protocol=None, timing=False):
@@ -394,6 +394,9 @@ def _protocol_part(cfg, pages, placed, group, protocol, part):
 def analyze_pages(cfg, pages, groups=(1,), protocol=None, timing=False):
     """``analyze`` on ``LayerPages`` (numpy engine, static placement): identical rows and totals.
 
+    A layer whose reads are all HBM-tier has no HBF pages and no row, as in ``analyze``; with
+    ``timing`` it keeps a zero row so that the system model sees every layer.
+
     ``timing`` appends the read-time columns of ``hbf.timing`` to every row (device view: the
     whole layer as one burst; ``est_batches_ns`` sums MQSim's sub-batches instead), the demand
     columns that the system model reads, and each step's largest per-block read count.
@@ -409,13 +412,17 @@ def analyze_pages(cfg, pages, groups=(1,), protocol=None, timing=False):
     total_planes = dies * per_die
     limit = cfg.batch_pages
     rows = {group: [] for group in groups}
-    block_reads = {}
+    block_reads, reads, current = {}, None, None
     for layer in pages:
+        if not len(layer) and not timing:
+            continue  # HBM-tier reads only: no HBF row, as the reference engine (timing rows keep it)
         placed = place(cfg, layer.lpa)
         if timing:
-            blocks = cfg.units * cfg.blocks_per_plane
-            reads = block_reads.setdefault(layer.step, np.zeros(blocks, dtype=np.int64))
-            reads += np.bincount(block_ids(cfg, placed), minlength=blocks)
+            if layer.step != current:  # pages arrive in step order: keep only each step's maximum
+                if reads is not None:
+                    block_reads[current] = int(reads.max())
+                current, reads = layer.step, np.zeros(cfg.units * cfg.blocks_per_plane, dtype=np.int64)
+            reads += np.bincount(block_ids(cfg, placed), minlength=len(reads))
         count = len(layer)
         parts = [slice(start, start + limit) for start in range(0, count, limit)]
         channel_max = int(np.bincount(placed.channel).max()) if count else 0
@@ -448,10 +455,12 @@ def analyze_pages(cfg, pages, groups=(1,), protocol=None, timing=False):
                 row.update(_timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max))
             rows[group].append(row)
     layers = [row for group in groups for row in rows[group]]
+    if reads is not None:
+        block_reads[current] = int(reads.max())
     steps = summarize(layers, protocol, timing)
     if timing:
         for total in steps:
-            total["max_block_reads"] = int(block_reads[total["step"]].max())
+            total["max_block_reads"] = block_reads[total["step"]]
     return layers, steps
 
 
@@ -499,7 +508,8 @@ def _timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max
         "t_protocol_ns": (effective - rounds) * cfg.read_ns,
         "t_channel_ns": max(0, channel_ns - effective * cfg.read_ns),
         "t_overhead_ns": None if estimate is None else estimate - bound, "bottleneck": bottleneck,
-        "attended_tokens": layer.attended_tokens, "hbm_bytes": layer.hbm_bytes, "dequant_ops": layer.dequant_ops,
+        "attended_tokens": layer.attended_tokens, "attended_elements": layer.attended_elements,
+        "hbm_bytes": layer.hbm_bytes, "dequant_ops": layer.dequant_ops,
     }
 
 

@@ -122,3 +122,69 @@ def test_system_flags_are_checked(tmp_path):
         with pytest.raises(SystemExit):
             main(base + extra + ["--output", str(tmp_path / str(index))])
         assert not (tmp_path / str(index)).exists()
+
+
+HBF_FLAGS = ["--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read", "--analysis-only"]
+
+
+def test_batched_trace_must_cover_every_request(tmp_path):
+    main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--context", "1024", "--output", str(tmp_path / "one")])
+    with pytest.raises(SystemExit):
+        main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--context", "1024", "--batch", "8",
+                          "--access-csv", str(tmp_path / "one" / "access.csv"), "--output", str(tmp_path / "eight")])
+    assert not (tmp_path / "eight").exists()
+    main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--context", "1024", "--batch", "2", "--output", str(tmp_path / "two")])
+    main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--context", "1024", "--batch", "2",
+                      "--access-csv", str(tmp_path / "two" / "access.csv"), "--output", str(tmp_path / "again")])
+    assert (tmp_path / "again" / "analysis_steps.csv").read_text() == (tmp_path / "two" / "analysis_steps.csv").read_text()
+
+
+def test_reevaluation_infers_the_analysed_batch(tmp_path):
+    from hbf.system import main as system_main
+    run = tmp_path / "r"
+    main(HBF_FLAGS + ["--timing", "--layers", "32", "--context", "1024", "--batch", "4", "--output", str(run)])
+    result = system_main([str(run), "--model", "llama-3.1-8b", "--gpu", "h100-sxm", "--batch", "4",
+                          "--output", str(tmp_path / "ok")])
+    assert result.steps[0]["tpot_hbf_bound_ns"] > 0
+    with pytest.raises(SystemExit):  # 4 requests were analysed, not 8
+        system_main([str(run), "--model", "llama-3.1-8b", "--gpu", "h100-sxm", "--batch", "8",
+                     "--output", str(tmp_path / "bad")])
+
+
+def test_step_without_hbf_pages_still_reports(tmp_path):
+    trace = tmp_path / "trace.csv"
+    trace.write_text("step,layer,kv_head,kind,op,token_start,token_end,bits\n0,0,0,K_res,R,128,256,16\n"
+                     "0,0,0,V_res,R,128,256,16\n")
+    main(HBF_FLAGS + ["--timing", "--format", "kivi2", "--layers", "1", "--heads", "1", "--context", "256",
+                      "--access-csv", str(trace), "--output", str(tmp_path / "hbm")])
+    report = (tmp_path / "hbm" / "report.md").read_text()
+    assert "| 1 | 0 | 1 | 0 | 0 |" in report and "—" in report
+    main(["--topology", "ocp", "--analysis-only", "--format", "kivi2", "--layers", "1", "--heads", "1",
+          "--context", "256", "--access-csv", str(trace), "--output", str(tmp_path / "plain")])
+    assert not (tmp_path / "plain" / "analysis_layers.csv").exists()  # no HBF rows, as the reference engine
+
+
+def test_attended_elements_skip_scales_and_metadata():
+    cfg = load("ocp")
+    layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 8, 128, 32768), tensors=parse_format("kivi2", 128).tensors)
+    (pages,) = iter_layer_pages(cfg, layout, generate(cfg, layout, "uniform_pages", fraction=.1, seed=4))
+    tokens = pages.tensor_tokens
+    assert pages.attended_elements == 128 * (tokens["K"] + tokens["V"] + tokens["K_res"] + tokens["V_res"])
+    assert tokens["K_qp"] > 0 and parse_format("kivi2", 128).tensors[1].role == "aux"
+
+
+def test_format_attention_dims_without_model(tmp_path):
+    main(HBF_FLAGS + ["--timing", "--format", "think", "--context", "1024", "--output", str(tmp_path / "t")])
+    (row, *_) = csv.DictReader((tmp_path / "t" / "analysis_layers.csv").open())
+    assert row["attn_dims"] == "192"
+    assert json.loads((tmp_path / "t" / "meta.json").read_text())["format"]["name"] == "think"
+
+
+def test_unvalidated_settings_are_flagged_and_rejected_early(tmp_path):
+    main(HBF_FLAGS + ["--timing", "--read-ns", "2000", "--context", "1024", "--output", str(tmp_path / "r")])
+    assert "未经验证" in (tmp_path / "r" / "report.md").read_text()
+    for index, extra in enumerate((["--timing", "--placement", "mqsim"], ["--gpu", "h100-sxm"],
+                                   ["--overlap", "ideal"])):
+        with pytest.raises(SystemExit):
+            main(HBF_FLAGS + extra + ["--context", "1024", "--output", str(tmp_path / str(index))])
+        assert not (tmp_path / str(index)).exists()

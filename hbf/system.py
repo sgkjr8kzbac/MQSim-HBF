@@ -17,7 +17,8 @@ NS = 1e9
 KV_CONSUME = ("stream", "staged")
 SELECTIONS = ("static", "dynamic")
 WEIGHTS = ("hbm", "hbf")
-ROW_KEYS = ("step", "layer", "est_ns", "bound_ns", "burst_bytes", "hbm_bytes", "attended_tokens", "dequant_ops")
+ROW_KEYS = ("step", "layer", "est_ns", "bound_ns", "burst_bytes", "hbm_bytes", "attended_tokens", "dequant_ops",
+            "attended_elements")
 REQUIRED_ROW_KEYS = ("step", "layer", "bound_ns", "burst_bytes", "attended_tokens")
 
 
@@ -137,6 +138,7 @@ def _steps(layer_rows, layers):
             "attended_tokens": _number(raw["attended_tokens"], "attended_tokens"),
             "dequant_ops": _number(raw.get("dequant_ops") or 0, "dequant_ops"),
             "attn_dims": _count(raw.get("attn_dims"), "attn_dims", optional=True, positive=True),
+            "attended_elements": _number(raw.get("attended_elements"), "attended_elements", optional=True),
         }
     if not steps:
         raise ValueError("No layer rows to evaluate")
@@ -206,7 +208,10 @@ def evaluate(layer_rows, model, gpu, options, meta):
     for step, rows in _steps(layer_rows, model.layers).items():
         terms = []  # attention per layer: a_l reads only the HBM tier, a_l_staged also the HBF bytes
         for row in rows:
-            attn_flops = 2 * group * (row["attn_dims"] or 2 * model.head_dim) * row["attended_tokens"] * scale
+            elements = row["attended_elements"]
+            if elements is None:
+                elements = (row["attn_dims"] or 2 * model.head_dim) * row["attended_tokens"]
+            attn_flops = 2 * group * elements * scale
             dequant = row["dequant_ops"] * scale / vector * NS
             compute = attn_flops / flops * NS + dequant
             terms.append({
@@ -276,9 +281,9 @@ def assumptions(context):
         f"tensor_flops 取 BF16 稠密峰值；weight_bits = {model.weight_bits} 只决定权重字节，不改变算力。",
         "权重全部放在 HBM（weights = hbm）。norm、bias、RoPE、残差加法、embedding 查表和采样不计时间；"
         "norm 与 bias 权重不计容量。",
-        "注意力 FLOPs = 2 × (q_heads / kv_heads) × attn_dims × A。A 是按 (请求, KV head) 汇总的被注意 token 数"
-        "（所有层级的数据张量）；attn_dims 默认 2 × head_dim（QKᵀ 与 PV）。ThinK 剪枝 K 时由行内 attn_dims 列给出"
-        " d_k + head_dim。softmax、exp、缩放等逐元素运算忽略。",
+        "注意力 FLOPs = 2 × (q_heads / kv_heads) × E。E 是被注意的 K、V 元素数：各数据张量（不含量化参数等"
+        "辅助张量和选择元数据，含 HBM 层）读到的 token 数 × 维数，按 (请求, KV head) 汇总；K、V 读同一批 token 时"
+        "E = A × (d_k + d_v)。没有 attended_elements 列时用 attn_dims × A。softmax、exp、缩放等逐元素运算忽略。",
         "按 query head 选择 token 时，A 按 KV head 汇总，因此是上界。选择打分（如 Quest 页摘要、top-k）的 FLOPs 不计。",
         f"反量化时间 = dequant_ops / (vector_ops × compute_eff)，vector_ops = {gpu.vector_ops / 1e12:g} TFLOP/s "
         "取该 GPU 非 tensor FP32 峰值（假设），与注意力矩阵乘串行相加。",
@@ -292,7 +297,10 @@ def assumptions(context):
         "层时间 = pre + max(KV 字节 / BW, 注意力计算) + post。",
         "容量：hbm_fits = 权重 + B × 每请求 KV 页占用 ≤ HBM 容量（KV 全放 HBM）；"
         "hbm_fits_hbf = 权重 + B × 每请求 HBM 层字节 + 预取缓冲 ≤ HBM 容量。"
-        "HBM 容量按十进制字节；激活、CUDA 上下文和内存碎片不计。",
+        "HBM 容量按标称 GB 的十进制字节，比驱动报告的可用容量约小 7%，偏保守；激活、CUDA 上下文和内存碎片不计。",
+        f"效率不对称：HBM 按 memory_eff = {gpu.memory_eff:g} 折算；HBF 的 est 已含命令、R/B 和传输开销（按 MQSim 的命令"
+        "模型校准），bound 是不含任何开销的下界。公平的对比是 est 对 HBM；bound 对 HBM 偏向 HBF。"
+        "未给 --ucie-grade 时不计主机链路。",
         "decode 追加写（新 token 的 KV 写入 HBF）以及 HBF 编程、擦除对读的干扰不计。",
     ]
     if batch % stacks:
@@ -401,11 +409,11 @@ def read_layers(path):
 
 
 def check_shape(shape, model, analysis_batch):
-    """The analysed storage shape must belong to the model (kv_heads may include the batch emulation)."""
+    """The analysed storage shape must be the model's, with kv_heads = model KV heads x analysis batch."""
     if not shape:
         return
     if (shape.get("layers") != model.layers or shape.get("head_dim") != model.head_dim
-            or shape.get("kv_heads") not in (model.kv_heads, model.kv_heads * analysis_batch)):
+            or shape.get("kv_heads") != model.kv_heads * analysis_batch):
         raise ValueError(f"meta.json shape {shape} does not match model {model.name} "
                          f"({model.layers} layers, {model.kv_heads} KV heads, head_dim {model.head_dim}) "
                          f"with analysis batch {analysis_batch}")
@@ -421,11 +429,13 @@ def main(argv=None):
     parser.add_argument("--stacks", type=int, help="HBF stacks N (default: meta.json)")
     parser.add_argument("--overlap", help="serial, prefetch:<d> or ideal (default: meta.json or serial)")
     parser.add_argument("--kv-consume", choices=KV_CONSUME, help="default: meta.json or stream")
+    parser.add_argument("--selection", choices=SELECTIONS,
+                        help="static or dynamic page selection (default: meta.json); prefetch needs static")
     parser.add_argument("--output", type=Path, help="output directory (default: RUN_DIR)")
     args = parser.parse_args(argv)
     meta = json.loads((args.run_dir / "meta.json").read_text())
     system = dict(meta.get("system") or {})
-    for key in ("model", "gpu", "batch", "stacks"):
+    for key in ("model", "gpu", "batch", "stacks", "selection"):
         if getattr(args, key) is not None:
             system[key] = getattr(args, key)
     for key in ("model", "gpu"):
@@ -435,6 +445,13 @@ def main(argv=None):
         parser.error("--batch is required: meta.json has no system.batch")
     try:
         model, gpu = load_model(system["model"]), load_gpu(system["gpu"])
+        shape = meta.get("shape")
+        if system.get("analysis_batch") is None and shape:
+            # A run without system metadata analysed shape.kv_heads / model KV heads requests per stack.
+            if shape.get("kv_heads", 0) % model.kv_heads:
+                raise ValueError(f"meta.json shape has {shape.get('kv_heads')} KV heads, not a multiple of "
+                                 f"{model.name}'s {model.kv_heads}")
+            system["analysis_batch"] = shape["kv_heads"] // model.kv_heads
         options = SystemOptions(overlap=args.overlap or system.get("overlap") or "serial",
                                 kv_consume=args.kv_consume or system.get("kv_consume") or "stream")
         check_shape(meta.get("shape"), model, system_meta(system)["analysis_batch"])

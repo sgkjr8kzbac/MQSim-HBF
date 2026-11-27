@@ -13,6 +13,11 @@ from .controller import schedule_run, unwritten_reads
 from .simulator import build, dump, simulate, write_table
 
 
+def fixed(value, digits):
+    """A number with ``digits`` decimals, or a dash when there is none (a step without HBF pages)."""
+    return "—" if value is None else f"{value:.{digits}f}"
+
+
 def protocol_report(step_rows, protocol):
     report = ["## 协议约束（每主机通道命令额度）", "",
               f"MOCS = {protocol.mocs or '不限'}，读突发：{'支持' if protocol.read_burst else '不支持（每条读 64 B）'}，"
@@ -24,11 +29,11 @@ def protocol_report(step_rows, protocol):
               "|---:|---:|---:|---:|---:|---:|---:|"]
     for row in step_rows:
         report.append(f"| {row['group']} | {row['step']} | {row['commands']} | {row['credit_rounds']} | "
-                      f"{row['link_rounds']} | {row['protocol_rounds']} | {row['protocol_utilization']:.3f} |")
+                      f"{row['link_rounds']} | {row['protocol_rounds']} | {fixed(row['protocol_utilization'], 3)} |")
     return report
 
 
-def timing_report(cfg, step_rows):
+def timing_report(cfg, step_rows, plane_groups=(1,), protocol=None):
     from .timing import HBF_COMMAND_MODEL, hbf_command_model
     report = ["## 读时间估计", "",
               f"tR = {cfg.read_ns} ns，每页传输 {cfg.transfer_ns} ns。理想下界：有效轮数 × tR、最忙核心通道的传输、"
@@ -39,6 +44,13 @@ def timing_report(cfg, step_rows):
     elif not hbf_command_model(cfg):
         report.append(f"注意：估算只在 HBF 命令模型（`{HBF_COMMAND_MODEL}`）、tR = 4,096 ns 下与 MQSim 校准过，"
                       "当前配置下未经验证。")
+    if cfg.dies != cfg.planes or cfg.planes > 1:
+        per_die = cfg.planes
+        if any(1 < group < per_die for group in plane_groups):
+            report.append("联动组小于一个 die 时的估算没有 MQSim 对照（MQSim 的 lockstep 规则对应整个 die）。")
+        if protocol is not None:
+            report.append("协议约束（额度、链路）只按轮数拉长估算，没有 MQSim 对照（MQSim 没有 MOCS），"
+                          "轮数只与 HBF-EventLab 的波次核对过。")
     report += ["", "| 并行组 | Step | 理想下界 ns | 估算 ns | 按子批估算 ns | 均衡部分 ns | 不均衡 ns | 协议 ns | 核心通道 ns | "
                "开销 ns | 单块最多读次数 |", "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for row in step_rows:
@@ -67,8 +79,9 @@ def analysis_report(layer_rows, step_rows):
         report.append(
             f"| {row['group']} | {row['step']} | {row['layers']} | {row['pages']} | {row['rounds']} | "
             f"{row['batch_rounds']} | "
-            f"{row['min_rounds']} | {row['channel_rounds']} | {row['utilization']:.3f} | {row['balance_loss']:.2f} | "
-            f"{row['sense_amplification']:.2f} | {page / useful:.2f} | {burst / useful:.2f} |")
+            f"{row['min_rounds']} | {row['channel_rounds']} | {fixed(row['utilization'], 3)} | "
+            f"{fixed(row['balance_loss'], 2)} | {fixed(row['sense_amplification'], 2)} | "
+            f"{fixed(page / useful if useful else None, 2)} | {fixed(burst / useful if useful else None, 2)} |")
     return report
 
 
@@ -88,11 +101,14 @@ def subbatch_count(layer_rows, plane_groups):
 
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
-             placement="static", protocol=None, engine="auto", timing=False, system=None):
+             placement="static", protocol=None, engine="auto", timing=False, system=None, kv_format=None,
+             requests=None):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None.
 
     Without MQSim and with static placement the analysis needs no request schedule, so the numpy
-    engine works on the accesses directly; the rows are identical either way.
+    engine works on the accesses directly; the rows are identical either way. ``requests`` is
+    (requests per stack, KV heads per request) of a ``--batch`` emulation: an imported trace must
+    use every request's heads.
     """
     generation = {
         "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
@@ -100,6 +116,11 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     } | (generation or {})
     layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
     accesses = list(generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv))
+    if input_csv is not None and requests is not None and requests[0] > 1:
+        seen = {access.kv_head // requests[1] for access in accesses}
+        if len(seen) < requests[0]:
+            raise ValueError(f"The access trace reads {len(seen)} of the {requests[0]} requests that --batch puts on "
+                             f"a stack (KV heads r x {requests[1]} + h); a batched trace must cover them all")
     directory.mkdir(parents=True, exist_ok=False)  # after the inputs are known to be valid
     access_path = directory / "access.csv"
     write_access(access_path, accesses)
@@ -108,11 +129,13 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         system_meta = request_bytes(cfg, layout, system["heads"]) | {
             "model": system["model"].name, "gpu": system["gpu"].name, "batch": system["batch"],
             "stacks": system["stacks"], "analysis_batch": system["analysis_batch"], "selection": system["selection"],
-            "kv_format": system["kv_format"].name if system["kv_format"] else "tensors" if tensors else "bf16",
+            "kv_format": kv_format.name if kv_format else "tensors" if tensors else "bf16",
             "overlap": system["options"].overlap, "kv_consume": system["options"].kv_consume}
-    fmt = system and system["kv_format"]
+    fmt = kv_format
     dump(directory / "meta.json", {"shape": asdict(shape), "layout": layout_name,
                                    "system": system_meta,
+                                   "format": None if fmt is None else {"name": fmt.name, "params": fmt.params,
+                                                                       "attn_dims": fmt.attn_dims},
                                    "tensors": tensors_meta(layout),
                                    "generator": {"mode": mode, **generation} if input_csv is None else None,
                                    "input_csv": str(input_csv) if input_csv else None,
@@ -155,7 +178,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         if protocol is not None:
             report += protocol_report(step_rows, protocol) + [""]
         if timing:
-            report += timing_report(cfg, step_rows) + [""]
+            report += timing_report(cfg, step_rows, plane_groups, protocol) + [""]
     if system is not None:
         from .system import evaluate, report_lines, write_table as write_system_table
         rows = [row for row in layer_rows if row["group"] == 1] if 1 in plane_groups else []
@@ -276,7 +299,7 @@ def build_parser():
     system = parser.add_argument_group("system model (decode TPOT; needs --model, implies --timing)")
     system.add_argument("--model", help="model preset (hbf/configs/models.json) or JSON; sets --layers, --heads "
                                         "and --head-dim unless they are given")
-    system.add_argument("--gpu", default="b200", help="GPU preset (hbf/configs/gpus.json) or JSON (default b200)")
+    system.add_argument("--gpu", help="GPU preset (hbf/configs/gpus.json) or JSON (default b200)")
     system.add_argument("--batch", type=int, default=1,
                         help="decode batch B: the analysed storage holds ceil(B / stacks) requests per stack, "
                              "placed layer-major as extra KV heads (an emulation of a batch)")
@@ -331,6 +354,11 @@ def configure(args):
     generation = {key: getattr(args, key) for key in (
         "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units", "select_tokens"
     )}
+    if args.placement != "static" and (args.timing or model is not None):
+        raise ValueError("--timing and --model need static placement (the numpy engine)")
+    if model is None and (args.gpu is not None or args.overlap != "serial" or args.kv_consume != "stream"
+                          or args.selection != "auto"):
+        raise ValueError("--gpu, --overlap, --kv-consume and --selection need --model")
     system = None
     if model is not None:
         from .model import load_gpu
@@ -347,7 +375,7 @@ def configure(args):
                              "or --selection static)")
         if 1 not in (args.plane_groups or (1,)):
             raise ValueError("The system model needs plane group 1 (independent planes) in --plane-group")
-        system = {"model": model, "gpu": load_gpu(args.gpu), "options": options, "batch": args.batch,
+        system = {"model": model, "gpu": load_gpu(args.gpu or "b200"), "options": options, "batch": args.batch,
                   "stacks": args.stacks, "analysis_batch": per_stack, "selection": selection,
                   "kv_format": kv_format, "heads": heads}
     if (args.timing or system) and args.engine == "python":
@@ -356,7 +384,8 @@ def configure(args):
             "input_csv": args.access_csv, "physical": args.physical, "tensors": tensors,
             "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": args.prefill,
             "placement": args.placement, "protocol": protocol, "engine": args.engine,
-            "timing": args.timing or system is not None, "system": system}
+            "timing": args.timing or system is not None, "system": system, "kv_format": kv_format,
+            "requests": (per_stack, heads)}
 
 
 def main(argv=None):

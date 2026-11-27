@@ -86,7 +86,8 @@ def test_summary_equals_run_csv_values(tmp_path):
         assert len(steps) == 2
         for key in ("pages", "rounds", "min_rounds", "channel_rounds", "est_ns", "est_batches_ns", "bound_ns",
                     "t_balanced_ns", "t_imbalance_ns", "t_protocol_ns", "t_channel_ns", "t_overhead_ns",
-                    "useful_bytes", "burst_bytes", "hbm_bytes", "attended_tokens", "dequant_ops", "utilization"):
+                    "useful_bytes", "burst_bytes", "hbm_bytes", "attended_tokens", "attended_elements", "dequant_ops",
+                    "utilization"):
             assert number(row[key]) == pytest.approx(sum(float(step[key]) for step in steps) / 2), key
         assert row["protocol_rounds"] == ""  # no protocol flags
         assert int(row["max_block_reads"]) == max(int(step["max_block_reads"]) for step in steps)
@@ -99,7 +100,7 @@ def test_summary_equals_run_csv_values(tmp_path):
         for key in ("hbm_fits", "hbm_fits_hbf"):
             assert row[key] == str(all(step[key] == "True" for step in system))
         assert number(row["effective_gb_s"]) == pytest.approx(
-            number(row["attended_tokens"]) * 2 * 64 * 2 / number(row["est_ns"]))
+            number(row["attended_elements"]) * 2 / number(row["est_ns"]))
         meta = json.loads((run / "meta.json").read_text())
         assert "--analysis-only" in meta["argv"] and meta["system"]["batch"] == int(row["batch"])
     # A larger batch attends more tokens on the same stack.
