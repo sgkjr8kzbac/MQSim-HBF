@@ -13,3 +13,5 @@
 `eventlab/`：HBF-EventLab 对照探针的输入、配置、重跑脚本和重跑结果摘要，见其中的 README。`scripts/`：`protocol_credit_scan.py` 和 `selection_granularity.py` 生成同名的 CSV（`python3 evidence/scripts/<脚本> <输出.csv>`）。
 
 第 2 阶段 A：`time-calibration.csv` 用当前代码重算第 8 轮保存的 79 个 MQSim 层（`ocp` 和 `Cx1 --planes 16/64`，独立与联动、开关 cache read、合并窗口 1–3,000 ns、384–3,072 GB/s）的读时间估算，与 MQSim 实测逐层对照；`hbf_command_model` 列标出是否为校准所用的 HBF 命令模型（`--read-plane-ns 0`、有合并窗口、cache read）。由 `scripts/time_calibration.py RUN_DIR...` 生成；原始运行目录在当时会话的临时目录中，未入库。
+
+`phase2a/`：第 2 阶段 A 的四个扫描汇总（`item1-device.csv`、`item1-system.csv`、`item1-layout-protocol.csv`、`item2-compression.csv`，网格见 `grids/`，表格由 `scripts/phase2a_tables.py` 生成），以及 15 个 MQSim 核对点逐层与估算的对照 `mqsim-confirm.csv`（`scripts/mqsim_confirm.sh` 运行，`scripts/time_calibration.py` 对照）。
