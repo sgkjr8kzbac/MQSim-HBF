@@ -122,12 +122,16 @@ def cell(value):
 
 
 def slug(varied, limit=48):
-    text = "-".join(str(cell(value)) for key, value in varied.items())
-    return re.sub(r"[^A-Za-z0-9.=+]+", "-", text).strip("-")[:limit] or "base"
+    text = "-".join(str(cell(value)) for value in varied.values())
+    return re.sub(r"[^A-Za-z0-9._=+]+", "-", text).strip("-")[:limit] or "base"
 
 
 def _raise(message):
     raise ValueError(message)
+
+
+def _status(kind, error):
+    return " ".join(f"{kind}: {error}".split())
 
 
 def _group1(path):
@@ -204,16 +208,16 @@ def run_one(task):
         row["seed"] = args.seed
         run = configure(args)
     except (OSError, TypeError, ValueError) as error:  # as hbf.cli.main
-        row["status"] = f"infeasible: {error}"
+        row["status"] = _status("infeasible", error)
         return row, time.monotonic() - started
     saved, sys.argv = sys.argv, ["hbf.cli", *argv]  # meta.json records the run's own arguments
     try:
         pipeline(directory=directory, binary=None, **run)
         row |= summarize_run(directory, run["shape"].head_dim)
     except ValueError as error:
-        row["status"] = f"infeasible: {error}"
+        row["status"] = _status("infeasible", error)
     except Exception as error:  # keep the sweep going; reported at the end
-        row["status"] = f"error: {type(error).__name__}: {error}"
+        row["status"] = _status("error", f"{type(error).__name__}: {error}")
     finally:
         sys.argv = saved
     if directory.is_dir():
@@ -221,7 +225,6 @@ def run_one(task):
             shutil.rmtree(directory)
         elif skip_access:
             (directory / "access.csv").unlink(missing_ok=True)
-    row["status"] = " ".join(row["status"].split())
     return row, time.monotonic() - started
 
 
@@ -257,7 +260,8 @@ def sweep(grid, output, jobs=1, keep=True, skip_access=False, progress=None):
     rows.sort(key=lambda row: row["index"])
     varied_keys = list(dict.fromkeys(key for _, varied in runs for key in varied if key != "seed"))
     fields = ["index", "run", *varied_keys, "seed", "status", *METRICS]
-    write_table(output / "summary.csv", [{key: row.get(key) for key in fields} for row in rows])
+    rows = [{key: row.get(key) for key in fields} for row in rows]
+    write_table(output / "summary.csv", rows)
     if not keep and not any((output / "runs").iterdir()):
         (output / "runs").rmdir()
     return rows
