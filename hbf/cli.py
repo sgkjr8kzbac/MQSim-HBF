@@ -305,9 +305,11 @@ def configure(args):
     if args.model is not None:
         from .model import load_model
         model = load_model(args.model)
-    layers = args.layers or (model.layers if model else 1)
-    heads = args.heads or (model.kv_heads if model else 8)
-    head_dim = args.head_dim or (model.head_dim if model else 128)
+    def given(value, from_model, default):
+        return value if value is not None else from_model if model else default
+    layers = given(args.layers, model and model.layers, 1)
+    heads = given(args.heads, model and model.kv_heads, 8)
+    head_dim = given(args.head_dim, model and model.head_dim, 128)
     if args.kv_format is not None and args.tensors is not None:
         raise ValueError("--format and --tensors are mutually exclusive")
     kv_format = None
