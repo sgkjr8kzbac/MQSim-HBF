@@ -1,0 +1,23 @@
+{
+  "chat": {
+    "input": "lognormal:median=1020,sigma=0.8,min=16,max=32768",
+    "output": "lognormal:median=129,sigma=0.8,min=1,max=4096",
+    "source": "Medians from the Azure LLM inference trace, conversation (prompt 1,020, output 129 tokens): Patel et al., Splitwise, ISCA 2024, https://arxiv.org/abs/2311.18677 [W] (params.md section 6). Lognormal sigma 0.8 and the clipping bounds are assumptions [G]."
+  },
+  "long32k": {
+    "input": "fixed:32768",
+    "output": "fixed:338",
+    "source": "32K uncached prompt: params.md section 8 nominal context (agentic prefixes 32K-256K, TraceLab https://arxiv.org/abs/2606.30560 [W]); output 338 tokens = ShareGPT mean output (vLLM paper, https://arxiv.org/abs/2309.06180) [M]; the design-B worked example uses the same pair."
+  },
+  "agentic": {
+    "input": "fixed:875",
+    "output": "fixed:214",
+    "sessions": {"calls": 64, "history": "fixed:32768", "think_s": 5.0},
+    "source": "Per call 875 new input and 214 output tokens (TraceLab median call, https://arxiv.org/abs/2606.30560 [W]). An initial history of 32,768 tokens and 64 calls give a mean prompt of about 68K tokens, the SWE-bench Pro Codex trace mean of 68,329 (https://huggingface.co/datasets/Inferact/codex_swebenchpro_traces [S]); the call count and the 5 s think time between calls are assumptions [G]."
+  },
+  "reasoning": {
+    "input": "lognormal:median=1020,sigma=0.8,min=16,max=32768",
+    "output": "fixed:2048",
+    "source": "Input as chat (Azure conversation median 1,020 [W], sigma [G]); output 2,048 tokens is params.md section 8's reasoning value, an assumption [G] (no trace with reasoning output lengths was found)."
+  }
+}
