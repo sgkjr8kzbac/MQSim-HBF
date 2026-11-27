@@ -383,6 +383,8 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 
 ## 路线图
 
+阶段安排、各模块状态和可以认领的任务见 [PLAN.md](PLAN.md)，设计讨论记录见 [docs/design/](docs/design/)，参数来源见 [docs/research/params.md](docs/research/params.md)。下面是较早期的长期方向：
+
 1. **真实模型前端**：在 GPU 上用 HF transformers 跑 Llama-3.1-8B（RULER、LongBench、PG-19），逐步记录选择决策，导出访问记录和张量规格。
 2. **方法适配器**：KIVI、StreamingLLM、SnapKV、Quest、ThinK、Quest + 4-bit。KIVI 和 StreamingLLM 读哪些位置是确定的，不需要 GPU 就能先跑。
 3. **接口补全**：decode 追加写、分段位宽、按块存的元数据、读部分通道所需的通道主序布局。
