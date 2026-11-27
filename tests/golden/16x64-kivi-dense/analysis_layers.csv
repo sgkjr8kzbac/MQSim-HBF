@@ -1,0 +1,5 @@
+step,layer,group,planes,pages,active_planes,rounds,min_rounds,channel_rounds,utilization,balance_loss,sensed_pages,sense_amplification,useful_bytes,page_bytes,burst_bytes,read_amplification,transfer_amplification,subbatches,batch_rounds
+0,0,1,1024,192,192,1,1,1,0.1875,1.0,192,1.0,786432,786432,786432,1.0,1.0,1,1
+0,1,1,1024,192,192,1,1,1,0.1875,1.0,192,1.0,786432,786432,786432,1.0,1.0,1,1
+0,0,4,1024,192,192,1,1,1,0.1875,1.0,192,1.0,786432,786432,786432,1.0,1.0,1,1
+0,1,4,1024,192,192,1,1,1,0.1875,1.0,192,1.0,786432,786432,786432,1.0,1.0,1,1
