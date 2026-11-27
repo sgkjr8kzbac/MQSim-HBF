@@ -1,0 +1,11 @@
+{
+  "base": {"topology": "ocp", "read_plane_ns": 0, "coalesce_ns": 1, "cache_read": true,
+           "model": "llama-3.1-8b", "gpu": "b200"},
+  "vary": {"context": [32768, 131072], "batch": [1, 8], "layout": ["striped_contiguous", "layer_contiguous"],
+           "format": ["bf16", "fp8", "int4", "kivi4", "kivi2", "think", "kivi2:think=0.5", "quest"]},
+  "zip": [{"mode": "dense"}, {"mode": "sink_recent", "fraction": 0.05, "count": 4},
+          {"mode": "uniform_tokens", "fraction": 0.01, "select_tokens": 16},
+          {"mode": "uniform_tokens", "fraction": 0.05, "select_tokens": 16},
+          {"mode": "uniform_tokens", "fraction": 0.05, "select_tokens": 128}],
+  "seeds": [11, 12, 13]
+}

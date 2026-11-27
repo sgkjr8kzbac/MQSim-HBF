@@ -1,0 +1,10 @@
+{
+  "base": {"topology": "ocp", "read_plane_ns": 0, "coalesce_ns": 1, "cache_read": true,
+           "model": "llama-3.1-8b", "gpu": "b200", "context": 32768, "batch": 4},
+  "vary": {"mode": ["dense", "uniform_tokens"]},
+  "zip": [{"layout": "striped_contiguous"}, {"layout": "layer_contiguous"}, {"layout": "vllm_interleaved"},
+          {"layout": "striped_contiguous", "mocs": 256, "host_order": "fcfs", "ucie_grade": 2},
+          {"layout": "striped_contiguous", "mocs": 256, "host_order": "trigger", "ucie_grade": 2},
+          {"layout": "striped_contiguous", "mocs": 256, "host_order": "trigger", "ucie_grade": 1}],
+  "seeds": [11, 12, 13]
+}
