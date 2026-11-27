@@ -44,14 +44,27 @@ task_interference() {  # E5.6: 4 system runs and 960 re-timings, a few minutes
     cp "$root/interference/interference-summary.csv" evidence/phase2b/interference.csv
 }
 
-task_endurance() {  # E3.1/E4.1 analytic curves; needs hbf/endurance.py (phase 2B part 1)
-    if [ ! -f evidence/grids/phase2b-endurance.json ]; then
-        echo "endurance: evidence/grids/phase2b-endurance.json is not there yet (endurance model in progress)" >&2
-        return 1
-    fi
-    rm -rf "$root/endurance"
-    python3 -m hbf.endurance --grid evidence/grids/phase2b-endurance.json --output "$root/endurance"
-    cp "$root/endurance/endurance_summary.csv" evidence/phase2b/endurance-analytic.csv
+task_endurance() {  # E3.1/E4.1 analytic curves, about 1-2 min (small calibration runs, cached)
+    rm -rf "$root/endurance-bf16" "$root/endurance-formats"
+    python3 -m hbf.endurance --analytic --model llama-3.1-8b,llama-3.1-70b --format bf16 \
+        --workload chat,long32k,agentic,reasoning --concurrency 8 --rd-threshold 1e5,1e6,1e7 \
+        --pe-limit 1e4,1e5,1e6 --pages-per-block 192,256,512,1024 --output "$root/endurance-bf16" \
+        --calibration-dir "$root/calibration" > /dev/null
+    cp "$root/endurance-bf16/endurance_summary.csv" evidence/phase2b/endurance-analytic.csv
+    for fmt in bf16 fp8 int4 kivi4 kivi2 kivi2:think=0.5; do  # E4.1: compression, 8B, long32k and agentic
+        python3 -m hbf.endurance --analytic --model llama-3.1-8b --format "$fmt" --workload long32k,agentic \
+            --concurrency 8 --rd-threshold 1e5,1e6,1e7 --pe-limit 1e4,1e5,1e6 \
+            --output "$root/endurance-formats/${fmt//[:=.]/-}" --calibration-dir "$root/calibration" > /dev/null
+    done
+    python3 - "$root/endurance-formats" evidence/phase2b/endurance-formats.csv <<'PY'
+import csv, sys
+from pathlib import Path
+rows = [row for path in sorted(Path(sys.argv[1]).glob("*/endurance_summary.csv")) for row in csv.DictReader(path.open())]
+with open(sys.argv[2], "w", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+PY
 }
 
 [ $# -gt 0 ] || { sed -n '2,6p' "$0"; exit 2; }

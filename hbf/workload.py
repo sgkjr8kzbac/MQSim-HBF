@@ -1,4 +1,4 @@
-"""Seeded serving workloads for the endurance model (M4): lengths, arrivals, shared prefixes, sessions.
+"""Serving workloads for the endurance model (M4): lengths, arrivals, shared prefixes, sessions.
 
 Lengths are ``fixed:N`` (or ``N``), ``lognormal:median=M,sigma=S[,min=A,max=B]`` or
 ``uniform:lo=A,hi=B``. Arrivals are closed-loop (``concurrency`` requests, or sessions, in flight;
@@ -8,8 +8,11 @@ history plus its new input, later calls reuse the history as a cached prefix and
 new input and output to it; calls are ``think_s`` apart. Shared prefixes: a request uses one of
 ``prefix_groups`` system prompts of ``prefix_tokens`` with probability ``prefix_share``, the group
 drawn from a Zipf law. Presets are in hbf/configs/workloads.json, each with its source tag.
+
+The closed-form model (``endurance.analytic``) uses the length means (``Length.mean``, a
+deterministic quantile grid) and the arrival parameters; ``Length.sample`` (seeded numpy
+generators) is for the event simulation.
 """
-import heapq
 import json
 import math
 from dataclasses import dataclass, field, fields, replace
@@ -44,8 +47,17 @@ class Length:
 
     def mean(self):
         """Mean of the sampled (rounded, clipped) values; deterministic (quantile grid)."""
+        return self.mean_max(1)
+
+    def mean_max(self, k):
+        """Expected largest of k independent samples (k = 1: the mean); deterministic quantile grid."""
         if self.kind == "fixed":
             return float(self.get("n"))
+        values = self._grid()
+        weights = np.diff(np.linspace(0, 1, len(values) + 1) ** k)
+        return float((values * weights).sum())
+
+    def _grid(self):
         q = (np.arange(20000) + .5) / 20000
         if self.kind == "uniform":
             values = self.get("lo") + q * (self.get("hi") - self.get("lo"))
@@ -55,7 +67,7 @@ class Length:
         values = np.maximum(lo, np.round(values))
         if hi is not None:
             values = np.minimum(hi, values)
-        return float(values.mean())
+        return values  # sorted, as the quantiles are
 
     def __str__(self):
         if self.kind == "fixed":
@@ -142,8 +154,6 @@ class Workload:
     think_s: float = 0.0
     retain_s: float = 0.0
     seed: int = 1
-    max_requests: int | None = None
-    script: tuple = ()
     source: str = ""
 
     def __post_init__(self):
@@ -155,7 +165,7 @@ class Workload:
             raise ValueError(f"arrival must be one of {', '.join(ARRIVALS)}")
         if self.arrival == "closed" and (type(self.concurrency) is not int or self.concurrency < 1):
             raise ValueError("A closed-loop workload needs a positive integer concurrency")
-        if self.arrival == "poisson" and not self.script and (self.rate is None or self.rate <= 0):
+        if self.arrival == "poisson" and (self.rate is None or self.rate <= 0):
             raise ValueError("A Poisson workload needs a positive rate")
         if type(self.max_batch) is not int or self.max_batch < 1:
             raise ValueError("max_batch must be a positive integer")
@@ -181,9 +191,8 @@ class Workload:
                      f"命中比例 {self.prefix_share:g}，Zipf {self.zipf:g}")
         if self.retain_s:
             text += f"，空闲 KV 保留 {self.retain_s:g} s"
-        arrival = (f"闭环并发 {self.concurrency}" if self.arrival == "closed" and not self.script
-                   else f"泊松到达 {self.rate:g}/s（最多 {self.max_batch} 个同时解码）" if not self.script
-                   else f"脚本 {len(self.script)} 个请求")
+        arrival = (f"闭环并发 {self.concurrency}" if self.arrival == "closed"
+                   else f"泊松到达 {self.rate:g}/s（最多 {self.max_batch} 个同时解码）")
         return text + f"；{arrival}，种子 {self.seed}"
 
 
@@ -210,142 +219,6 @@ def load_workload(name, **overrides):
     if unknown:
         raise ValueError(f"Unknown workload fields: {', '.join(sorted(unknown))}")
     return Workload(**(values | {key: value for key, value in overrides.items() if value is not None}))
-
-
-@dataclass
-class Request:
-    """One decode request (a call of a session, or a standalone request)."""
-    id: int
-    arrival: float
-    input: int  # uncached tokens written at prefill
-    output: int
-    history: int = 0  # cached session tokens at the call's start
-    prefix: int = -1  # shared-prefix group, or -1
-    session: int = -1
-    call: int = 0
-    last: bool = True  # the session's last call (standalone requests: True)
-    retain_s: float = 0.0  # idle lifetime of the request's entry after it completes
-
-
-class Stream:
-    """Request source for ``endurance.simulate``.
-
-    Closed-loop standalone requests are drawn on demand (``closed_new``); Poisson arrivals,
-    session calls and scripted requests sit in a time-ordered heap (``arrived``).
-    """
-
-    def __init__(self, workload):
-        self.workload = workload
-        root = np.random.SeedSequence(workload.seed)
-        lengths, arrivals, prefixes = root.spawn(3)
-        self.rng_len = np.random.Generator(np.random.PCG64(lengths))
-        self.rng_arr = np.random.Generator(np.random.PCG64(arrivals))
-        self.rng_pre = np.random.Generator(np.random.PCG64(prefixes))
-        self.ids = 0
-        self.sessions = 0
-        self.heap = []  # (time, order, request)
-        self.order = 0
-        self.next_poisson = None
-        self.session_state = {}  # session -> (history tokens, calls done)
-        if workload.prefix_groups:
-            weights = 1.0 / np.arange(1, workload.prefix_groups + 1) ** workload.zipf
-            self.prefix_p = weights / weights.sum()
-        if workload.script:
-            for item in workload.script:
-                item = dict(item)
-                self._push(Request(self._id(), float(item.get("arrival", 0.0)), int(item["input"]),
-                                   int(item["output"]), retain_s=float(item.get("retain_s", workload.retain_s)),
-                                   prefix=int(item.get("prefix", -1))))
-        elif workload.arrival == "poisson":
-            self.next_poisson = self.rng_arr.exponential(1 / workload.rate)
-        elif workload.sessions:
-            for _ in range(workload.concurrency):
-                self._new_session(0.0)
-
-    def _id(self):
-        self.ids += 1
-        return self.ids - 1
-
-    def _push(self, request):
-        heapq.heappush(self.heap, (request.arrival, self.order, request))
-        self.order += 1
-
-    def exhausted(self):
-        limit = self.workload.max_requests
-        return limit is not None and self.ids >= limit
-
-    def _prefix(self):
-        w = self.workload
-        if w.prefix_share and self.rng_pre.random() < w.prefix_share:
-            return int(self.rng_pre.choice(w.prefix_groups, p=self.prefix_p))
-        return -1
-
-    def _standalone(self, now):
-        w = self.workload
-        return Request(self._id(), now, w.input.sample(self.rng_len), w.output.sample(self.rng_len),
-                       prefix=self._prefix(), retain_s=w.retain_s)
-
-    def _new_session(self, now):
-        w = self.workload
-        session = self.sessions
-        self.sessions += 1
-        initial = w.history.sample(self.rng_len) if w.history is not None else 0
-        self.session_state[session] = 0
-        self._push(Request(self._id(), now, initial + w.input.sample(self.rng_len), w.output.sample(self.rng_len),
-                           session=session, call=0, last=w.calls == 1, retain_s=w.retain_s))
-
-    def closed_new(self, now):
-        """A new standalone request for a freed closed-loop slot (None when exhausted or not closed)."""
-        w = self.workload
-        if w.arrival != "closed" or w.sessions or w.script or self.exhausted():
-            return None
-        return self._standalone(now)
-
-    def _fill_poisson(self, until):
-        w = self.workload
-        while self.next_poisson is not None and self.next_poisson <= until and not self.exhausted():
-            if w.sessions:
-                self._new_session(self.next_poisson)
-            else:
-                self._push(self._standalone(self.next_poisson))
-            self.next_poisson += self.rng_arr.exponential(1 / w.rate)
-
-    def arrived(self, now):
-        """Queued requests whose arrival time is <= now, in arrival order."""
-        self._fill_poisson(now)
-        out = []
-        while self.heap and self.heap[0][0] <= now + 1e-12:
-            out.append(heapq.heappop(self.heap)[2])
-        return out
-
-    def next_time(self):
-        """Time of the next queued or Poisson arrival (inf when none)."""
-        times = [self.heap[0][0]] if self.heap else []
-        if self.next_poisson is not None and not self.exhausted():
-            times.append(self.next_poisson)
-        return min(times) if times else math.inf
-
-    def call_done(self, request, now):
-        """Schedule the session's next call (or, closed-loop, a replacement session)."""
-        w = self.workload
-        if request.session < 0:
-            return
-        total = request.history + request.input + request.output
-        if request.last:
-            self.session_state.pop(request.session, None)
-            if w.arrival == "closed" and not self.exhausted():
-                self._new_session(now)
-            return
-        call = request.call + 1
-        self._push(Request(self._id(), now + w.think_s, w.input.sample(self.rng_len), w.output.sample(self.rng_len),
-                           history=total, session=request.session, call=call, last=call == w.calls - 1,
-                           retain_s=w.retain_s))
-
-
-def scripted(requests, **overrides):
-    """A workload of explicit requests: dicts with arrival (s), input, output and optional retain_s."""
-    return Workload(**({"name": "script", "arrival": "poisson", "script": tuple(dict(r) for r in requests)}
-                       | overrides))
 
 
 def with_overrides(workload, **overrides):

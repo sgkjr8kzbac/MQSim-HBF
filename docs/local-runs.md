@@ -37,7 +37,7 @@ evidence/scripts/run_local.sh tests
 | `mqsim` | 15 个 MQSim 核对点 | 约 5 分钟 | 4.2 GB，严格单进程 | `evidence/phase2a/mqsim-confirm.csv` | `error` 列都在 −5.5% 到 0.5% 之间 |
 | `placement` | E5.1/E5.2：各分配方式的写顺序合法性与读并行度（96 个点） | 2 进程约 15 分钟 | 最大的点约 5 GB/进程 | `evidence/phase2b/placement.csv` | `status` 都是 ok；`layer_major`、`vllm_pool` 在有生成 token 时 `write_legal` 为 False，`dedicated`、`packed` 为 True |
 | `interference` | E5.6：写入、刷新、擦除对 TPOT 的影响（960 个组合） | 几分钟 | < 1 GB | `evidence/phase2b/interference.csv` | 没有 inf（inf 表示写入量超出 HBF 的空闲时间，结果也有意义，记下即可） |
-| `endurance` | E3.1/E4.1：寿命的解析曲线 | 待定 | 小 | `evidence/phase2b/endurance-analytic.csv` | 寿命模型完成后才能跑，届时更新本表 |
+| `endurance` | E3.1：寿命解析曲线（8B、70B × 4 种负载 × 3 个读干扰阈值 × 4 种块大小，P/E 上限为列）；E4.1：6 种格式（8B，long32k 与 agentic） | 1–3 分钟 | 小 | `evidence/phase2b/endurance-analytic.csv`、`endurance-formats.csv` | `days_to_limit_*` 列有数值；报告 `runs/local/endurance-bf16/report.md` 的假设列表完整 |
 
 ## 跑完以后
 
@@ -66,4 +66,4 @@ git push origin claude/hbf-kv-study
 
 | 日期 | 原因 | 需要重跑 |
 |---|---|---|
-| 第 2 阶段 B（一）开始 | 新增分配方式、写入干扰 | `tests`、`placement`、`interference` |
+| 第 2 阶段 B（一）开始 | 新增分配方式、写入干扰、寿命解析模型；M2 审查修复 | `tests`、`placement`、`interference`、`endurance` |

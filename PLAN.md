@@ -2,7 +2,7 @@
 
 本文件记录研究目标、阶段安排、各模块状态和可以认领的任务，供人和 agent 协作时使用。实验结果写在 [REPORT.md](REPORT.md)，用法写在 [README.md](README.md)。设计讨论的原始记录在 [docs/design/](docs/design/)，参数来源在 [docs/research/params.md](docs/research/params.md)。
 
-最后更新：第 2 阶段 B 进行中（分支 `claude/hbf-kv-study`）。
+最后更新：第 2 阶段 B（一）代码完成，实验待本地运行（分支 `claude/hbf-kv-study`）。测试和实验在本地运行，见 [docs/local-runs.md](docs/local-runs.md)。
 
 ---
 
@@ -39,9 +39,9 @@
 |---|---|---|---|
 | M2 请求放置 | `hbf/batch.py`、`tests/test_batch.py` | ✅ 已提交，审查问题已修 | 四种分配：`layer_major`、`dedicated`、`packed`、`vllm_pool`，可按通道或 die 分区；快照的写入历史；`check_write_order` 按 §5.4.1 检查跳页、覆盖写和擦除有效块；CLI `--alloc` 等 |
 | M5 写入干扰 | `hbf/interference.py`、`tests/test_interference.py` | ✅ 已提交 | fifo、gaps、suspend、random、correlated 五种模式；`python -m hbf.interference RUN_DIR` |
-| M4a 时钟 | `hbf/endurance.py`（Clock、calibrate） | 🔄 开发中 | 用拟合的估算加 `system.evaluate` 代替每步跑分析 |
-| M4b 解析模型 | `hbf/endurance.py`（analytic） | ⏳ | 稳态公式：写入速率、读干扰刷新、数据保持刷新、擦除放大、到达 P/E 上限的天数 |
-| M4c 事件模拟 | `hbf/endurance.py`（simulate）、`hbf/workload.py` | ⏳ | 段级状态、按量子推进：到达、写回、读计数、刷新、回收、磨损均衡 |
+| M4a 时钟 | `hbf/endurance.py`（Clock、calibrate） | ✅ 已提交 | 用拟合的估算加 `system.evaluate` 代替每步跑分析；与阶段 A 的 TPOT 相差 < 0.01% |
+| M4b 解析模型 | `hbf/endurance.py`（analytic）、`hbf/workload.py` | ✅ 已提交 | `python -m hbf.endurance --analytic`：写入速率、读干扰刷新、数据保持刷新、擦除放大、到达 P/E 上限的天数；参数可逗号分隔批量扫描 |
+| M4c 事件模拟 | `hbf/endurance.py`（simulate）、`hbf/workload.py` | ⏳ 第 2 阶段 B（二） | 段级状态、按量子推进：到达、写回、读计数、刷新、回收、磨损均衡；未测试的草稿在 `docs/design/drafts/` |
 | 扫描接入 | `hbf/sweep.py`（`"tool"` 键） | ⏳ | 让扫描脚本也能驱动寿命模型 |
 | 实验 | `evidence/phase2b/` | ⏳ | 见下表 |
 | 报告 | REPORT"第 2 阶段 B" | ⏳ | |
@@ -87,10 +87,13 @@
 
 | ID | 任务 | 要改的文件 | 依赖 | 验收标准 | 状态 |
 |---|---|---|---|---|---|
-| T-B1 | 寿命模型 M4（时钟、解析、模拟、CLI） | 新文件 `hbf/endurance.py`、`hbf/workload.py`、`tests/test_endurance.py` | M5 | 设计 §7 的测试 8–16；E3.1 的解析曲线 | 🔄 进行中（子代理 impl-m4） |
+| T-B1 | 寿命模型 M4：时钟、解析、CLI | `hbf/endurance.py`、`hbf/workload.py`、`tests/test_endurance.py` | M5 | 设计 §7 的测试 8–9；E3.1 的解析曲线 | ✅ |
+| T-B1d | 寿命模型 M4：事件模拟 | 同上，草稿在 `docs/design/drafts/` | T-B1 | 设计 §7 的测试 10–16；与解析模型在稳态下一致 | ⏳ 第 2 阶段 B（二） |
+| T-B7 | `packed` 分配的请求起点错开：现在每个请求从行边界开始，短上下文时各请求同一层落在同一批 bank 上（KIVI-2、2K 时轮数是理想的 5.3 倍） | `hbf/batch.py` | — | 黄金文件不变；短上下文的 κ 接近 1 | ⏳ 可认领 |
 | T-B2 | 扫描脚本支持 `"tool": "endurance"` | `hbf/sweep.py`、`tests/test_sweep.py` | T-B1 的 CLI | 一个寿命网格能跑出 summary.csv | ⏳ |
-| T-B3 | E5.1、E5.2 实验：各分配方式的写顺序合法性与读并行度 | 新网格 `evidence/grids/phase2b-*.json` | M2 | 汇总表与 REPORT 段落 | ⏳ 可认领 |
-| T-B4 | E5.6 实验：写入干扰对 TPOT 的影响（tPROG、tBERS、模式扫描） | 新脚本 `evidence/scripts/` | M5 | 表格与 REPORT 段落 | ⏳ 可认领 |
+| T-B3 | E5.1、E5.2 实验：各分配方式的写顺序合法性与读并行度 | `evidence/grids/phase2b-placement.json` | M2 | 本地运行（docs/local-runs.md 的 `placement`），汇总表与 REPORT 段落 | 🔄 脚本已就绪，待本地运行 |
+| T-B4 | E5.6 实验：写入干扰对 TPOT 的影响（tPROG、tBERS、模式扫描） | `evidence/scripts/interference_scan.py` | M5 | 本地运行（`interference`），表格与 REPORT 段落 | 🔄 脚本已就绪，待本地运行 |
+| T-B4e | E3.1、E4.1 实验：寿命解析曲线与压缩的寿命收益 | `evidence/scripts/run_local.sh endurance` | T-B1 | 本地运行，表格与 REPORT 段落 | 🔄 脚本已就绪，待本地运行 |
 | T-B5 | E3.x、E4.x、E5.3–E5.7 实验与报告 | 网格、REPORT | T-B1、T-B2 | REPORT"第 2 阶段 B" | ⏳ |
 | T-B6 | 第 2 阶段 B 的审查（代码与报告） | 只读 | T-B1–T-B5 | 按严重程度排序的问题列表，附复现方法 | ⏳ |
 | T-C1 | M6 导出脚本（HF transformers，GPU） | 新目录 `frontends/` | — | 对一个小模型导出 `access.csv`，能被 `--access-csv` 读入 | ⏳ 可认领 |
