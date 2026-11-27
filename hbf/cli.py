@@ -72,6 +72,15 @@ def analysis_report(layer_rows, step_rows):
     return report
 
 
+def request_bytes(cfg, layout, heads):
+    """Stored KV of one request (all tiers; HBF tensors page-granular) and its HBM-tier part."""
+    per_head = sum(count * cfg.page_bytes for count in layout.block_counts)
+    hbm = sum((layout.windows[spec.name][1] - layout.windows[spec.name][0]) * spec.token_bytes
+              for spec in layout.hbm_tensors)
+    scale = layout.shape.layers * heads
+    return {"kv_bytes_per_request": (per_head + hbm) * scale, "hbm_tier_bytes_per_request": hbm * scale}
+
+
 def subbatch_count(layer_rows, plane_groups):
     """Sub-batches of a run without a schedule (no writes): the read sub-batches of every layer."""
     return sum(row["subbatches"] for row in layer_rows if row["group"] == plane_groups[0])
@@ -79,7 +88,7 @@ def subbatch_count(layer_rows, plane_groups):
 
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
-             placement="static", protocol=None, engine="auto", timing=False):
+             placement="static", protocol=None, engine="auto", timing=False, system=None):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None.
 
     Without MQSim and with static placement the analysis needs no request schedule, so the numpy
@@ -94,7 +103,16 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     directory.mkdir(parents=True, exist_ok=False)  # after the inputs are known to be valid
     access_path = directory / "access.csv"
     write_access(access_path, accesses)
+    system_meta = None
+    if system is not None:
+        system_meta = request_bytes(cfg, layout, system["heads"]) | {
+            "model": system["model"].name, "gpu": system["gpu"].name, "batch": system["batch"],
+            "stacks": system["stacks"], "analysis_batch": system["analysis_batch"], "selection": system["selection"],
+            "kv_format": system["kv_format"].name if system["kv_format"] else "tensors" if tensors else "bf16",
+            "overlap": system["options"].overlap, "kv_consume": system["options"].kv_consume}
+    fmt = system and system["kv_format"]
     dump(directory / "meta.json", {"shape": asdict(shape), "layout": layout_name,
+                                   "system": system_meta,
                                    "tensors": tensors_meta(layout),
                                    "generator": {"mode": mode, **generation} if input_csv is None else None,
                                    "input_csv": str(input_csv) if input_csv else None,
@@ -110,6 +128,10 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     batches = schedule_run(cfg, layout, accesses, prefill_layout) if needs_schedule else []
     layer_rows, step_rows = analyze_accesses(cfg, layout, accesses, plane_groups, placement, protocol, engine,
                                              batches=batches if needs_schedule else None, timing=timing)
+    if timing:
+        attn_dims = fmt.attn_dims if fmt else 2 * shape.head_dim
+        for row in layer_rows:
+            row["attn_dims"] = attn_dims
     if layer_rows:
         write_table(directory / "analysis_layers.csv", layer_rows)
         write_table(directory / "analysis_steps.csv", step_rows)
@@ -134,6 +156,17 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
             report += protocol_report(step_rows, protocol) + [""]
         if timing:
             report += timing_report(cfg, step_rows) + [""]
+    if system is not None:
+        from .system import evaluate, report_lines, write_table as write_system_table
+        rows = [row for row in layer_rows if row["group"] == 1] if 1 in plane_groups else []
+        if not rows:
+            raise ValueError("The system model needs plane group 1 (independent planes) in --plane-group")
+        outcome = evaluate(rows, system["model"], system["gpu"], system["options"], system_meta)
+        write_system_table(directory / "system_layers.csv", outcome.layers)
+        write_system_table(directory / "system_steps.csv", outcome.steps)
+        report += report_lines(outcome) + [""]
+        if fmt and fmt.notes:
+            report += ["KV 格式假设：", ""] + [f"- {note}" for note in fmt.notes] + [""]
     result = None
     if binary is not None:
         result = simulate(cfg, batches, directory, binary, physical=physical)
@@ -159,9 +192,9 @@ def build_parser():
                              "<channels>x<chips per channel>")
     parser.add_argument("--layout", choices=LAYOUTS, default="layer_contiguous")
     parser.add_argument("--mode", choices=MODES, default="dense")
-    parser.add_argument("--layers", type=int, default=1)
-    parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--layers", type=int, help="default 1, or the --model's layers")
+    parser.add_argument("--heads", type=int, help="KV heads per request (default 8, or the --model's)")
+    parser.add_argument("--head-dim", type=int, help="default 128, or the --model's")
     parser.add_argument("--context", type=int, default=8192)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1)
@@ -176,6 +209,9 @@ def build_parser():
                         help=f"maximum pages per sub-batch (1–{MAX_BATCH_PAGES})")
     parser.add_argument("--physical", action="store_true")
     parser.add_argument("--access-csv", type=Path)
+    parser.add_argument("--format", dest="kv_format",
+                        help="named KV storage format NAME[:key=value,...]: bf16, fp8, int4, int2, kivi4, kivi2 "
+                             "(group, residual, think), think (ratio), quest (page); see hbf/formats.py")
     parser.add_argument("--tensors", help="JSON list or file of stored tensor formats, "
                         'e.g. \'[{"name":"K","bits":2,"dims":128},{"name":"V","bits":16,"dims":128}]\'; '
                         "default BF16 K and V with head_dim channels")
@@ -237,6 +273,21 @@ def build_parser():
     parser.add_argument("--timing", action="store_true",
                         help="analysis: add read-time estimates (ideal bound and MQSim-calibrated estimate), "
                              "their breakdown, demand columns and per-block read counts")
+    system = parser.add_argument_group("system model (decode TPOT; needs --model, implies --timing)")
+    system.add_argument("--model", help="model preset (hbf/configs/models.json) or JSON; sets --layers, --heads "
+                                        "and --head-dim unless they are given")
+    system.add_argument("--gpu", default="b200", help="GPU preset (hbf/configs/gpus.json) or JSON (default b200)")
+    system.add_argument("--batch", type=int, default=1,
+                        help="decode batch B: the analysed storage holds ceil(B / stacks) requests per stack, "
+                             "placed layer-major as extra KV heads (an emulation of a batch)")
+    system.add_argument("--stacks", type=int, default=1, help="HBF stacks sharing the batch (default 1)")
+    system.add_argument("--overlap", default="serial", help="serial, prefetch:<d> or ideal")
+    system.add_argument("--kv-consume", choices=("stream", "staged"), default="stream",
+                        help="serial/ideal: attention consumes HBF pages as they arrive, or after staging in HBM")
+    system.add_argument("--selection", choices=("auto", "static", "dynamic"), default="auto",
+                        help="whether the pages a layer reads are known before its query (static: dense, "
+                             "sink_recent) or not (dynamic: uniform_* selections, imported traces); prefetch "
+                             "needs static")
     return parser
 
 
@@ -250,7 +301,23 @@ def configure(args):
     # Only flags given on the command line override the topology's own settings (e.g. ocp).
     cfg = load(args.topology, batch_pages=args.batch_pages,
                **{key: value for key, value in given.items() if value is not None})
-    tensors = parse_tensors(args.tensors)
+    model = None
+    if args.model is not None:
+        from .model import load_model
+        model = load_model(args.model)
+    layers = args.layers or (model.layers if model else 1)
+    heads = args.heads or (model.kv_heads if model else 8)
+    head_dim = args.head_dim or (model.head_dim if model else 128)
+    if args.kv_format is not None and args.tensors is not None:
+        raise ValueError("--format and --tensors are mutually exclusive")
+    kv_format = None
+    if args.kv_format is not None:
+        from .formats import parse_format
+        kv_format = parse_format(args.kv_format, head_dim)
+    tensors = kv_format.tensors if kv_format else parse_tensors(args.tensors)
+    if type(args.batch) is not int or args.batch < 1 or type(args.stacks) is not int or args.stacks < 1:
+        raise ValueError("--batch and --stacks must be positive")
+    per_stack = -(-args.batch // args.stacks)
     for group in args.plane_groups or (1,):
         check_group(cfg, group)
     protocol = None
@@ -258,16 +325,36 @@ def configure(args):
             or args.ucie_grade is not None or args.group_sense != "arrived"):
         protocol = Protocol(args.mocs, args.read_burst, args.read_unit,
                             args.host_order, args.ucie_grade, args.group_sense)
-    shape = Shape(args.layers, args.heads, args.head_dim, args.context)
+    shape = Shape(layers, heads * per_stack, head_dim, args.context)
     generation = {key: getattr(args, key) for key in (
         "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units", "select_tokens"
     )}
-    if args.timing and args.engine == "python":
+    system = None
+    if model is not None:
+        from .model import load_gpu
+        from .system import SystemOptions
+        if (layers, heads, head_dim) != (model.layers, model.kv_heads, model.head_dim):
+            raise ValueError(f"--model {model.name} has {model.layers} layers, {model.kv_heads} KV heads and "
+                             f"head_dim {model.head_dim}; do not override them")
+        selection = args.selection
+        if selection == "auto":
+            selection = "static" if args.access_csv is None and args.mode in ("dense", "sink_recent") else "dynamic"
+        options = SystemOptions(overlap=args.overlap, kv_consume=args.kv_consume)
+        if options.mode == "prefetch" and selection != "static":
+            raise ValueError("Prefetching the next layer's KV needs a static selection (dense or sink_recent, "
+                             "or --selection static)")
+        if 1 not in (args.plane_groups or (1,)):
+            raise ValueError("The system model needs plane group 1 (independent planes) in --plane-group")
+        system = {"model": model, "gpu": load_gpu(args.gpu), "options": options, "batch": args.batch,
+                  "stacks": args.stacks, "analysis_batch": per_stack, "selection": selection,
+                  "kv_format": kv_format, "heads": heads}
+    if (args.timing or system) and args.engine == "python":
         raise ValueError("--timing needs the numpy engine")
     return {"cfg": cfg, "shape": shape, "layout_name": args.layout, "mode": args.mode, "generation": generation,
             "input_csv": args.access_csv, "physical": args.physical, "tensors": tensors,
             "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": args.prefill,
-            "placement": args.placement, "protocol": protocol, "engine": args.engine, "timing": args.timing}
+            "placement": args.placement, "protocol": protocol, "engine": args.engine,
+            "timing": args.timing or system is not None, "system": system}
 
 
 def main(argv=None):
@@ -280,7 +367,10 @@ def main(argv=None):
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     binary = None if args.analysis_only else build()
-    pipeline(directory=directory, binary=binary, **run)
+    try:
+        pipeline(directory=directory, binary=binary, **run)
+    except ValueError as error:
+        parser.error(str(error))
     print(directory.resolve())
 
 

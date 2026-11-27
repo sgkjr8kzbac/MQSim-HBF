@@ -319,11 +319,13 @@ def summarize(layers, protocol=None, timing=False):
             total[key] = None if total[key] is None or row[key] is None else total[key] + row[key]
     steps = list(totals.values())
     for total in steps:
-        total["utilization"] = total["pages"] / (total["rounds"] * total["planes"])
-        total["balance_loss"] = total["rounds"] / total["min_rounds"]
-        total["sense_amplification"] = total["sensed_pages"] / total["pages"]
+        # A step with HBM-tier reads only has no HBF pages (numpy engine with tiered tensors).
+        total["utilization"] = total["pages"] / (total["rounds"] * total["planes"]) if total["rounds"] else None
+        total["balance_loss"] = total["rounds"] / total["min_rounds"] if total["min_rounds"] else None
+        total["sense_amplification"] = total["sensed_pages"] / total["pages"] if total["pages"] else None
         if protocol is not None:
-            total["protocol_utilization"] = total["pages"] / (total["protocol_rounds"] * total["planes"])
+            total["protocol_utilization"] = (total["pages"] / (total["protocol_rounds"] * total["planes"])
+                                             if total["protocol_rounds"] else None)
     return steps
 
 
@@ -353,6 +355,8 @@ def _protocol_part(cfg, pages, placed, group, protocol, part):
     np = _numpy()
     from .controller import Request
     useful, burst, runs = pages.useful[part], pages.burst[part], pages.runs[part]
+    if not len(useful):
+        return 0, 0, 0, 0
     if protocol.read_unit == "page":
         commands = np.full(len(useful), 1 if protocol.read_burst else cfg.page_bytes // BURST_BYTES, dtype=np.int64)
         data = np.full(len(useful), cfg.page_bytes, dtype=np.int64)
@@ -438,7 +442,8 @@ def analyze_pages(cfg, pages, groups=(1,), protocol=None, timing=False):
                 row["credit_rounds"] = sum(item[1] for item in limited)
                 row["link_rounds"] = sum(item[3] for item in limited)
                 row["protocol_rounds"] = sum(max(item[0], item[3]) for item in limited)
-                row["protocol_utilization"] = row["pages"] / (row["protocol_rounds"] * row["planes"])
+                row["protocol_utilization"] = (row["pages"] / (row["protocol_rounds"] * row["planes"])
+                                               if row["protocol_rounds"] else None)
             if timing:
                 row.update(_timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max))
             rows[group].append(row)
@@ -468,6 +473,8 @@ def _timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max
     channel_ns = channel_max * cfg.transfer_ns
     if channel_ns > effective * cfg.read_ns:
         bottleneck = "channel"
+    if not len(layer):
+        bottleneck = "none"
     bound = max(effective * cfg.read_ns, channel_ns, link_ns)
     single = int(command_ns(cfg, 1)) + cfg.read_ns + cfg.rb_ns
     floor = (cfg.coalesce_ns or 0) + cfg.host_ns + cfg.transfer_ns
@@ -492,7 +499,7 @@ def _timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max
         "t_protocol_ns": (effective - rounds) * cfg.read_ns,
         "t_channel_ns": max(0, channel_ns - effective * cfg.read_ns),
         "t_overhead_ns": None if estimate is None else estimate - bound, "bottleneck": bottleneck,
-        "attended_tokens": layer.attended_tokens, "hbm_bytes": layer.hbm_bytes, "dequant_ops": 0.0,
+        "attended_tokens": layer.attended_tokens, "hbm_bytes": layer.hbm_bytes, "dequant_ops": layer.dequant_ops,
     }
 
 

@@ -34,6 +34,7 @@ class LayerPages:
     hbm_bytes: int = 0
     attended_tokens: int = 0
     tensor_tokens: dict = field(default_factory=dict)
+    dequant_ops: float = 0.0
 
     def __len__(self):
         return len(self.lpa)
@@ -109,17 +110,30 @@ def _union(group, lo, hi, scale):
 
 
 def layer_pages(cfg, layout, step, layer, rows):
-    """Pages of one (step, layer) from an (n, 4) int64 array of (head, tensor, token_start, token_end)."""
-    head, t, lo, hi = rows.T
-    attended = attended_tokens(head, lo, hi, layout.shape.context)
+    """Pages of one (step, layer) from an (n, 4) int64 array of (head, tensor, token_start, token_end),
+    where tensor indexes ``layout.all_tensors``. HBM-tier rows become ``hbm_bytes``; every row counts
+    towards the tokens read per tensor (``tensor_tokens``, for dequantization) and data rows towards
+    ``attended_tokens``."""
+    specs = layout.all_tensors
+    head, g, lo, hi = rows.T
+    data = np.asarray([spec.role == "data" for spec in specs])[g]
+    attended = attended_tokens(head[data], lo[data], hi[data], layout.shape.context)
+    tensor_tokens = per_tensor_tokens(head, g, lo, hi, layout.shape.context, len(specs))
+    hbm = np.asarray([spec.tier == "hbm" for spec in specs])
+    hbm_bytes = sum(tensor_tokens[i] * specs[i].token_bytes for i in np.flatnonzero(hbm).tolist())
+    dequant = sum(tensor_tokens[i] * specs[i].dims * specs[i].dequant_ops for i in range(len(specs)))
+    hbf_index = np.asarray([layout.index.get(spec.name, -1) for spec in specs], dtype=np.int64)
+    keep = ~hbm[g]
+    head, t, lo, hi = head[keep], hbf_index[g[keep]], lo[keep], hi[keep]
     tpp = np.asarray(layout.tokens_per_page, dtype=np.int64)[t]
-    first, last = lo // tpp, (hi - 1) // tpp
+    origin = np.asarray(layout.window_starts, dtype=np.int64)[t]
+    first, last = (lo - origin) // tpp, (hi - 1 - origin) // tpp
     count = last - first + 1
-    index = np.repeat(np.arange(len(rows)), count)
+    index = np.repeat(np.arange(len(t)), count)
     within = np.arange(int(count.sum()), dtype=np.int64) - np.repeat(np.cumsum(count) - count, count)
     block = first[index] + within
     tpp = tpp[index]
-    start = block * tpp
+    start = origin[index] + block * tpp
     lo = np.maximum(lo[index], start) - start
     hi = np.minimum(hi[index], start + tpp) - start
     t, head = t[index], head[index]
@@ -131,13 +145,28 @@ def layer_pages(cfg, layout, step, layer, rows):
     np.not_equal(lpa[1:], lpa[:-1], out=new[1:])
     group = np.cumsum(new) - 1
     tokens, _ = _union(group, lo, hi, int(tpp.max()) + 1 if len(tpp) else 1)
-    token_bytes = np.asarray([layout.token_bytes(i) for i in range(len(layout.tensors))], dtype=np.int64)[t]
+    token_bytes = np.asarray([spec.token_bytes for spec in layout.tensors], dtype=np.int64)[t]
     chunk_lo = lo * token_bytes // BURST_BYTES
     chunk_hi = -(-(hi * token_bytes) // BURST_BYTES)
     chunks, runs = _union(group, chunk_lo, chunk_hi, cfg.page_bytes // BURST_BYTES + 1)
-    page_t = t[new]
-    return LayerPages(step, layer, lpa[new], page_t, tokens * token_bytes[new], chunks * BURST_BYTES, runs,
-                      attended_tokens=attended)
+    return LayerPages(step, layer, lpa[new], t[new], tokens * token_bytes[new], chunks * BURST_BYTES, runs,
+                      hbm_bytes=int(hbm_bytes), attended_tokens=attended,
+                      tensor_tokens={specs[i].name: int(tensor_tokens[i]) for i in range(len(specs))},
+                      dequant_ops=float(dequant))
+
+
+def per_tensor_tokens(head, g, lo, hi, context, count):
+    """Tokens read per tensor, summed over heads (unions within each (head, tensor))."""
+    if not len(head):
+        return np.zeros(count, dtype=np.int64)
+    key = head * count + g
+    order = np.lexsort((lo, key))
+    key, lo, hi = key[order], lo[order], hi[order]
+    new = np.empty(len(key), dtype=bool)
+    new[:1] = True
+    np.not_equal(key[1:], key[:-1], out=new[1:])
+    tokens, _ = _union(np.cumsum(new) - 1, lo, hi, context + 1)
+    return np.bincount(key[new] % count, tokens, count).astype(np.int64)
 
 
 def attended_tokens(head, lo, hi, context):
@@ -161,13 +190,14 @@ def iter_layer_pages(cfg, layout, accesses):
     """
     groups = defaultdict(lambda: array("q"))
     writes = []
+    index = {spec.name: g for g, spec in enumerate(layout.all_tensors)}
     for access in accesses:
         access.validate(layout)
         if access.op == "W":
             writes.append(access)
             continue
         groups[access.step, access.layer].extend(
-            (access.kv_head, layout.tensor_index(access.kind), access.token_start, access.token_end))
+            (access.kv_head, index[access.kind], access.token_start, access.token_end))
     if writes:
         schedule(cfg, layout, writes)
     for step, layer in sorted(groups):

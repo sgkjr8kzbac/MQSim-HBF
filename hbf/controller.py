@@ -64,11 +64,14 @@ def schedule(cfg, layout, accesses):
         access.validate(layout)
         if access.op == "W" and access.step != -1:
             raise ValueError("Phase 0 only accepts prefill writes")
+        if layout.specs[access.kind].tier != "hbf":
+            continue  # HBM-tier tensors have no HBF pages
         group = logical[access.step, access.layer, access.op]
         t = layout.tensor_index(access.kind)
         tokens = layout.tokens(t)
-        for block in range(access.token_start // tokens, (access.token_end - 1) // tokens + 1):
-            start = block * tokens
+        blocks, first = layout.token_blocks(t, access.token_start, access.token_end)
+        for block in blocks:
+            start = first + block * tokens
             lpa = layout.lpa(access.layer, access.kv_head, t, block)
             group.setdefault(lpa, (t, start, []))[2].append((
                 max(access.token_start, start), min(access.token_end, start + tokens)
@@ -80,7 +83,7 @@ def schedule(cfg, layout, accesses):
         requests = []
         for lpa, (t, start, intervals) in sorted(pages.items()):
             useful = union_size(intervals) * layout.token_bytes(t)
-            filled = min(start + layout.tokens(t), layout.shape.context) - start
+            filled = min(start + layout.tokens(t), layout.windows[layout.tensors[t].name][1]) - start
             if op == "W" and useful != filled * layout.token_bytes(t):
                 raise ValueError("Partial-page prefill write would cause an update read")
             token = layout.token_bytes(t)

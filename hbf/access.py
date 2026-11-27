@@ -27,18 +27,36 @@ class Shape:
             raise ValueError("Model dimensions and context must be positive integers")
 
 
+TIERS = ("hbf", "hbm")
+ROLES = ("data", "meta")
+
+
 @dataclass(frozen=True)
 class TensorSpec:
     """Stored format of one per-head KV tensor: one row of ``dims`` elements of ``bits`` per token.
 
     The defaults are BF16 K and V. Compressed methods declare their own tensors, e.g. 2-bit
     quantized K plus a 16-bit scale tensor (KIVI), K with pruned channels (ThinK) or a low-rank
-    latent. Pages hold tokens of a single tensor. Per-block metadata such as Quest's page
-    summaries has one row per block rather than per token and is not expressible yet.
+    latent. Pages hold tokens of a single tensor. Optional fields:
+
+    * ``window`` - the tokens [lo, hi) the tensor holds; negative values count from the end of
+      the context and None means the context's start or end. KIVI keeps the last R tokens in full
+      precision: the quantized tensors take ``[0, -R]`` and the full-precision ones ``[-R, None]``.
+    * ``tier`` - ``hbf`` (stored in HBF pages) or ``hbm`` (read from HBM, e.g. a residual window
+      that changes every step and cannot be rewritten in place on HBF, section 5.4.1).
+    * ``role`` - ``data`` (attended tokens) or ``meta`` (selection metadata such as Quest's page
+      summaries, read in full every step by the generator's selection modes and not attended).
+      Per-block metadata is amortized as a per-token row (e.g. min and max keys of 16-token
+      blocks: 2 x 128 / 16 = 16 elements per token).
+    * ``dequant_ops`` - GPU vector operations per stored element read (an assumption of the format).
     """
     name: str
     bits: int
     dims: int
+    window: tuple | None = None
+    tier: str = "hbf"
+    role: str = "data"
+    dequant_ops: float = 0
 
     def __post_init__(self):
         if (not isinstance(self.name, str) or not self.name.isidentifier()
@@ -46,10 +64,28 @@ class TensorSpec:
                 or self.bits > 64 or self.dims * self.bits % 8):
             raise ValueError(f"Invalid tensor spec {self}: need an identifier name, "
                              "positive bits <= 64 and whole bytes per token")
+        if self.window is not None:
+            if (not isinstance(self.window, (list, tuple)) or len(self.window) != 2
+                    or any(end is not None and type(end) is not int for end in self.window)):
+                raise ValueError(f"Invalid window {self.window!r} of tensor {self.name}: need [lo, hi]")
+            object.__setattr__(self, "window", tuple(self.window))
+        if self.tier not in TIERS or self.role not in ROLES:
+            raise ValueError(f"Tensor {self.name}: tier must be one of {TIERS} and role one of {ROLES}")
+        if isinstance(self.dequant_ops, bool) or not isinstance(self.dequant_ops, (int, float)) or self.dequant_ops < 0:
+            raise ValueError(f"Tensor {self.name}: dequant_ops must be a nonnegative number")
 
     @property
     def token_bytes(self):
         return self.dims * self.bits // 8
+
+    def tokens(self, context):
+        """The window as absolute token indices [lo, hi) of a ``context``-token sequence."""
+        lo, hi = self.window or (None, None)
+        lo = 0 if lo is None else lo + context if lo < 0 else lo
+        hi = context if hi is None else hi + context if hi < 0 else hi
+        if not 0 <= lo < hi <= context:
+            raise ValueError(f"Window {self.window} of tensor {self.name} is empty or outside {context} tokens")
+        return lo, hi
 
 
 def default_tensors(shape):
@@ -89,8 +125,8 @@ class Access:
         if any(type(n) is not int for n in numbers) or spec is None or not (
             self.step >= -1 and 0 <= self.layer < shape.layers and
             0 <= self.kv_head < shape.kv_heads and
-            self.op in {"R", "W"} and 0 <= self.token_start < self.token_end <= shape.context
-            and self.bits == spec.bits
+            self.op in {"R", "W"} and layout.windows[self.kind][0] <= self.token_start < self.token_end
+            <= layout.windows[self.kind][1] and self.bits == spec.bits
         ):
             raise ValueError(f"Invalid logical access: {self}")
 
@@ -103,7 +139,7 @@ def write_access(path, accesses):
 
 
 def tensors_meta(layout):
-    return [asdict(spec) for spec in layout.tensors]
+    return [asdict(spec) for spec in layout.all_tensors]
 
 
 def read_access(path):
@@ -119,20 +155,31 @@ def read_access(path):
 
 
 class Layout:
-    """Maps (layer, tensor index, head, block) to LPAs. A block is one page of one tensor."""
+    """Maps (layer, tensor index, head, block) to LPAs. A block is one page of one tensor.
+
+    ``tensors`` are the HBF-tier tensors, the ones with pages; ``all_tensors`` adds the HBM tier.
+    A tensor's block b holds the tokens ``window_lo + b * tokens_per_page`` onwards.
+    """
 
     def __init__(self, cfg: Config, shape: Shape, base=0, tensors=None):
         self.shape, self.base = shape, base
-        self.tensors = tuple(tensors) if tensors is not None else default_tensors(shape)
-        names = [spec.name for spec in self.tensors]
-        if not self.tensors or len(set(names)) != len(names):
+        self.all_tensors = tuple(tensors) if tensors is not None else default_tensors(shape)
+        names = [spec.name for spec in self.all_tensors]
+        if not self.all_tensors or len(set(names)) != len(names):
             raise ValueError("Tensor names must be unique and nonempty")
-        self.specs = {spec.name: spec for spec in self.tensors}
-        self.index = {name: t for t, name in enumerate(names)}
+        self.tensors = tuple(spec for spec in self.all_tensors if spec.tier == "hbf")
+        self.hbm_tensors = tuple(spec for spec in self.all_tensors if spec.tier == "hbm")
+        if not self.tensors:
+            raise ValueError("At least one tensor must be stored on HBF")
+        self.specs = {spec.name: spec for spec in self.all_tensors}
+        self.windows = {spec.name: spec.tokens(shape.context) for spec in self.all_tensors}
+        self.index = {spec.name: t for t, spec in enumerate(self.tensors)}
         self.tokens_per_page = tuple(cfg.page_bytes // spec.token_bytes for spec in self.tensors)
         if base < 0 or 0 in self.tokens_per_page:
             raise ValueError("A token row must fit in one page and base must be nonnegative")
-        self.block_counts = tuple(-(-shape.context // tokens) for tokens in self.tokens_per_page)
+        self.window_starts = tuple(self.windows[spec.name][0] for spec in self.tensors)
+        self.block_counts = tuple(-(-(self.windows[spec.name][1] - self.windows[spec.name][0]) // tokens)
+                                  for spec, tokens in zip(self.tensors, self.tokens_per_page))
         self.pages = shape.layers * shape.kv_heads * sum(self.block_counts)
         self.span = self.pages  # LPAs [base, base + span) belong to the layout, padding included
         cfg.lba(base + self.pages - 1)
@@ -157,10 +204,15 @@ class Layout:
 
     def page_access(self, lpa, step=0, op="R"):
         layer, head, t, block = self.decode(lpa)
-        lo = block * self.tokens(t)
         spec = self.tensors[t]
-        return Access(step, layer, head, spec.name, op, lo, min(lo + self.tokens(t), self.shape.context),
+        lo = self.window_starts[t] + block * self.tokens(t)
+        return Access(step, layer, head, spec.name, op, lo, min(lo + self.tokens(t), self.windows[spec.name][1]),
                       spec.bits)
+
+    def token_blocks(self, t, lo, hi):
+        """Blocks of HBF tensor ``t`` that hold tokens [lo, hi), and the first token of block 0."""
+        start, tokens = self.window_starts[t], self.tokens(t)
+        return range((lo - start) // tokens, (hi - 1 - start) // tokens + 1), start
 
 
 class LayerContiguous(Layout):
@@ -203,8 +255,8 @@ class VllmInterleaved(Layout):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if len(set(self.tokens_per_page)) != 1:
-            raise ValueError("vllm_interleaved requires the same tokens per page for every tensor")
+        if len(set(self.tokens_per_page)) != 1 or len({self.windows[spec.name] for spec in self.tensors}) != 1:
+            raise ValueError("vllm_interleaved requires the same tokens per page and window for every tensor")
 
     def lpa(self, layer, head, t, block):
         if not 0 <= block < self.block_counts[t]:
@@ -309,6 +361,10 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
              hot_fraction=.5, hot_units=1, select_tokens=16):
     """Seeded accesses of one workload mode.
 
+    Selection modes read HBM-tier tensors (hot windows) and ``meta`` tensors (selection
+    metadata) in full every (step, layer, head), and clip the selected tokens to each tensor's
+    window; with the default tensors this changes nothing.
+
     ``uniform_pages`` picks ``fraction`` of each tensor's storage pages, independently per tensor, so
     the selection unit grows with compression (a 2-bit page holds 128 tokens, a BF16 page 16) and K
     and V pages of one head cover different tokens. ``uniform_tokens`` picks ``fraction`` of the
@@ -323,15 +379,28 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
             or not 0 <= unit < cfg.units or type(select_tokens) is not int or select_tokens <= 0):
         raise ValueError("Invalid generator parameters")
     rng = Random(seed)
+    windows = layout.windows
+    always = [spec for spec in layout.all_tensors if spec.role == "meta" or spec.tier == "hbm"]
+
+    def whole(step, layer, head, spec):
+        return Access(step, layer, head, spec.name, "R", *windows[spec.name], spec.bits)
+
+    def clipped(step, layer, head, spec, lo, hi):
+        lo, hi = max(lo, windows[spec.name][0]), min(hi, windows[spec.name][1])
+        return [Access(step, layer, head, spec.name, "R", lo, hi, spec.bits)] if lo < hi else []
+
     if mode == "uniform_tokens":
         blocks = -(-shape.context // select_tokens)
+        selective = [spec for spec in layout.tensors if spec.role == "data"]
         for step in range(steps):
             for layer in range(shape.layers):
                 for head in range(shape.kv_heads):
                     for block in sorted(rng.sample(range(blocks), share(blocks, fraction))):
                         lo, hi = block * select_tokens, min((block + 1) * select_tokens, shape.context)
-                        for spec in layout.tensors:
-                            yield Access(step, layer, head, spec.name, "R", lo, hi, spec.bits)
+                        for spec in selective:
+                            yield from clipped(step, layer, head, spec, lo, hi)
+                    for spec in always:
+                        yield whole(step, layer, head, spec)
         return
     if mode == "sink_recent":
         # StreamingLLM-style: the first ``count`` tokens plus the last ``fraction`` of the context.
@@ -339,24 +408,32 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
         for step in range(steps):
             for layer in range(shape.layers):
                 for head in range(shape.kv_heads):
-                    for spec in layout.tensors:
+                    for spec in layout.all_tensors:
+                        if spec in always:
+                            yield whole(step, layer, head, spec)
+                            continue
                         sink = min(count, shape.context - recent)
                         if sink > 0:
-                            yield Access(step, layer, head, spec.name, "R", 0, sink, spec.bits)
-                        yield Access(step, layer, head, spec.name, "R", shape.context - recent, shape.context,
-                                     spec.bits)
+                            yield from clipped(step, layer, head, spec, 0, sink)
+                        yield from clipped(step, layer, head, spec, shape.context - recent, shape.context)
         return
     if mode in {"dense", "uniform_pages"}:
         for step in range(steps):
             for layer in range(shape.layers):
                 for head in range(shape.kv_heads):
+                    if mode == "dense":
+                        for spec in layout.all_tensors:
+                            yield whole(step, layer, head, spec)
+                        continue
                     for t, spec in enumerate(layout.tensors):
-                        if mode == "dense":
-                            yield Access(step, layer, head, spec.name, "R", 0, shape.context, spec.bits)
-                        else:
-                            blocks = layout.blocks(t)
-                            for block in sorted(rng.sample(range(blocks), share(blocks, fraction))):
-                                yield layout.page_access(layout.lpa(layer, head, t, block), step)
+                        if spec.role == "meta":
+                            yield whole(step, layer, head, spec)
+                            continue
+                        blocks = layout.blocks(t)
+                        for block in sorted(rng.sample(range(blocks), share(blocks, fraction))):
+                            yield layout.page_access(layout.lpa(layer, head, t, block), step)
+                    for spec in layout.hbm_tensors:
+                        yield whole(step, layer, head, spec)
         return
 
     if mode == "same_unit":
