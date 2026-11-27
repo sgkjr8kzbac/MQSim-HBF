@@ -299,16 +299,24 @@ STEP_KEYS = ("pages", "rounds", "batch_rounds", "min_rounds", "channel_rounds", 
 PROTOCOL_KEYS = ("commands", "credit_rounds", "link_rounds", "protocol_rounds")
 
 
-def summarize(layers, protocol=None):
-    """Per-step totals of layer rows ordered by plane organization, then (step, layer)."""
-    keys = STEP_KEYS + (PROTOCOL_KEYS if protocol is not None else ())
+TIMING_KEYS = ("est_ns", "est_batches_ns", "bound_ns", "t_balanced_ns", "t_imbalance_ns", "t_protocol_ns",
+               "t_channel_ns", "t_overhead_ns", "attended_tokens", "hbm_bytes", "dequant_ops")
+
+
+def summarize(layers, protocol=None, timing=False):
+    """Per-step totals of layer rows ordered by plane organization, then (step, layer).
+
+    Timing columns sum over layers (a step reads its layers one after another); an estimate that
+    is missing for any layer leaves the step's estimate empty.
+    """
+    keys = STEP_KEYS + (PROTOCOL_KEYS if protocol is not None else ()) + (TIMING_KEYS if timing else ())
     totals = {}
     for row in layers:
         total = totals.setdefault((row["group"], row["step"]), {
             "group": row["group"], "step": row["step"], "planes": row["planes"], "layers": 0, **dict.fromkeys(keys, 0)})
         total["layers"] += 1
         for key in keys:
-            total[key] += row[key]
+            total[key] = None if total[key] is None or row[key] is None else total[key] + row[key]
     steps = list(totals.values())
     for total in steps:
         total["utilization"] = total["pages"] / (total["rounds"] * total["planes"])
@@ -379,9 +387,15 @@ def _protocol_part(cfg, pages, placed, group, protocol, part):
     return rounds, credit, total, link
 
 
-def analyze_pages(cfg, pages, groups=(1,), protocol=None):
-    """``analyze`` on ``LayerPages`` (numpy engine, static placement): identical rows and totals."""
+def analyze_pages(cfg, pages, groups=(1,), protocol=None, timing=False):
+    """``analyze`` on ``LayerPages`` (numpy engine, static placement): identical rows and totals.
+
+    ``timing`` appends the read-time columns of ``hbf.timing`` to every row (device view: the
+    whole layer as one burst; ``est_batches_ns`` sums MQSim's sub-batches instead), the demand
+    columns that the system model reads, and each step's largest per-block read count.
+    """
     from .pages import check_host_channels, place
+    from .timing import block_ids
     np = _numpy()
     for group in groups:
         check_group(cfg, group)
@@ -391,8 +405,13 @@ def analyze_pages(cfg, pages, groups=(1,), protocol=None):
     total_planes = dies * per_die
     limit = cfg.batch_pages
     rows = {group: [] for group in groups}
+    block_reads = {}
     for layer in pages:
         placed = place(cfg, layer.lpa)
+        if timing:
+            blocks = cfg.units * cfg.blocks_per_plane
+            reads = block_reads.setdefault(layer.step, np.zeros(blocks, dtype=np.int64))
+            reads += np.bincount(block_ids(cfg, placed), minlength=blocks)
         count = len(layer)
         parts = [slice(start, start + limit) for start in range(0, count, limit)]
         channel_max = int(np.bincount(placed.channel).max()) if count else 0
@@ -420,12 +439,65 @@ def analyze_pages(cfg, pages, groups=(1,), protocol=None):
                 row["link_rounds"] = sum(item[3] for item in limited)
                 row["protocol_rounds"] = sum(max(item[0], item[3]) for item in limited)
                 row["protocol_utilization"] = row["pages"] / (row["protocol_rounds"] * row["planes"])
+            if timing:
+                row.update(_timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max))
             rows[group].append(row)
     layers = [row for group in groups for row in rows[group]]
-    return layers, summarize(layers, protocol)
+    steps = summarize(layers, protocol, timing)
+    if timing:
+        for total in steps:
+            total["max_block_reads"] = int(block_reads[total["step"]].max())
+    return layers, steps
 
 
-def analyze_accesses(cfg, layout, accesses, groups=(1,), mode="static", protocol=None, engine="auto", batches=None):
+def _timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max):
+    """Read-time columns of one layer row (see ``hbf.timing``)."""
+    from .timing import command_ns, estimate_ns
+    np = _numpy()
+    rounds = row["rounds"]
+    effective, bottleneck, link_ns = rounds, "bank", 0
+    if protocol is not None:
+        sensed, _, _, link = _protocol_part(cfg, layer, placed, group, protocol, slice(None))
+        effective = max(sensed, link)
+        if effective > rounds:
+            bottleneck = "link" if link >= sensed else "credit"
+        if protocol.ucie_grade is not None and len(layer):
+            data = (np.full(len(layer), cfg.page_bytes, dtype=np.int64) if protocol.read_unit == "page"
+                    else layer.burst)
+            link_ns = -(-int(np.bincount(placed.host, data).max()) // UCIE_GRADES[protocol.ucie_grade])
+    channel_ns = channel_max * cfg.transfer_ns
+    if channel_ns > effective * cfg.read_ns:
+        bottleneck = "channel"
+    bound = max(effective * cfg.read_ns, channel_ns, link_ns)
+    single = int(command_ns(cfg, 1)) + cfg.read_ns + cfg.rb_ns
+    floor = (cfg.coalesce_ns or 0) + cfg.host_ns + cfg.transfer_ns
+
+    def limited(estimate, protocol_rounds):
+        # Credit or link limits stretch the rounds; not MQSim-validated (MQSim has no MOCS).
+        return estimate if protocol is None or estimate is None else max(estimate, floor + protocol_rounds * single)
+
+    estimate = limited(estimate_ns(cfg, placed, group), effective) if len(layer) else 0
+    if estimate is None:
+        batches = None
+    elif protocol is None:
+        batches = sum(estimate_ns(cfg, placed, group, part) for part in parts)
+    else:
+        batches = 0
+        for part in parts:
+            sensed, _, _, link = _protocol_part(cfg, layer, placed, group, protocol, part)
+            batches += limited(estimate_ns(cfg, placed, group, part), max(sensed, link))
+    return {
+        "est_ns": estimate, "est_batches_ns": batches, "bound_ns": bound,
+        "t_balanced_ns": row["min_rounds"] * cfg.read_ns, "t_imbalance_ns": (rounds - row["min_rounds"]) * cfg.read_ns,
+        "t_protocol_ns": (effective - rounds) * cfg.read_ns,
+        "t_channel_ns": max(0, channel_ns - effective * cfg.read_ns),
+        "t_overhead_ns": None if estimate is None else estimate - bound, "bottleneck": bottleneck,
+        "attended_tokens": layer.attended_tokens, "hbm_bytes": layer.hbm_bytes, "dequant_ops": 0.0,
+    }
+
+
+def analyze_accesses(cfg, layout, accesses, groups=(1,), mode="static", protocol=None, engine="auto", batches=None,
+                     timing=False):
     """Mechanism analysis straight from logical accesses.
 
     ``numpy`` (``auto`` when numpy is importable and the placement is static) vectorises the
@@ -442,11 +514,13 @@ def analyze_accesses(cfg, layout, accesses, groups=(1,), mode="static", protocol
             engine = "numpy" if mode == "static" else "python"
         except ImportError:
             engine = "python"
+    if timing and (engine == "python" or mode != "static"):
+        raise ValueError("Read-time estimates need the numpy engine and static placement")
     if engine == "numpy":
         if mode != "static":
             raise ValueError("The numpy engine supports static placement only; use --engine python")
         from .pages import iter_layer_pages
-        return analyze_pages(cfg, iter_layer_pages(cfg, layout, accesses), groups, protocol)
+        return analyze_pages(cfg, iter_layer_pages(cfg, layout, accesses), groups, protocol, timing)
     if batches is None:
         from .controller import schedule
         batches = schedule(cfg, layout, accesses)

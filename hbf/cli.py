@@ -28,6 +28,27 @@ def protocol_report(step_rows, protocol):
     return report
 
 
+def timing_report(cfg, step_rows):
+    from .timing import HBF_COMMAND_MODEL, hbf_command_model
+    report = ["## 读时间估计", "",
+              f"tR = {cfg.read_ns} ns，每页传输 {cfg.transfer_ns} ns。理想下界：有效轮数 × tR、最忙核心通道的传输、"
+              "最忙主机链路三者取大，不计命令开销，感测与传输完全重叠。估算：按核心通道逐轮累加命令、感测、R/B 和"
+              "传输（含 cache read 的重叠），整层作为一次突发；按子批相加的估算与 MQSim 的运行方式对应。"]
+    if cfg.dies == cfg.planes == 1:
+        report.append("chip 当 plane 的拓扑每页一条命令，没有估算，只给理想下界。")
+    elif not hbf_command_model(cfg):
+        report.append(f"注意：估算只在 HBF 命令模型（`{HBF_COMMAND_MODEL}`）、tR = 4,096 ns 下与 MQSim 校准过，"
+                      "当前配置下未经验证。")
+    report += ["", "| 并行组 | Step | 理想下界 ns | 估算 ns | 按子批估算 ns | 均衡部分 ns | 不均衡 ns | 协议 ns | 核心通道 ns | "
+               "开销 ns | 单块最多读次数 |", "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for row in step_rows:
+        cells = [row[key] for key in ("group", "step", "bound_ns", "est_ns", "est_batches_ns", "t_balanced_ns",
+                                      "t_imbalance_ns", "t_protocol_ns", "t_channel_ns", "t_overhead_ns",
+                                      "max_block_reads")]
+        report.append("| " + " | ".join("—" if cell is None else str(cell) for cell in cells) + " |")
+    return report
+
+
 def topology_name(cfg):
     return "ocp" if cfg.address_map == "ocp" else f"{cfg.channels}x{cfg.chips}"
 
@@ -58,7 +79,7 @@ def subbatch_count(layer_rows, plane_groups):
 
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
-             placement="static", protocol=None, engine="auto"):
+             placement="static", protocol=None, engine="auto", timing=False):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None.
 
     Without MQSim and with static placement the analysis needs no request schedule, so the numpy
@@ -88,7 +109,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                       or any(access.op == "W" for access in accesses))
     batches = schedule_run(cfg, layout, accesses, prefill_layout) if needs_schedule else []
     layer_rows, step_rows = analyze_accesses(cfg, layout, accesses, plane_groups, placement, protocol, engine,
-                                             batches=batches if needs_schedule else None)
+                                             batches=batches if needs_schedule else None, timing=timing)
     if layer_rows:
         write_table(directory / "analysis_layers.csv", layer_rows)
         write_table(directory / "analysis_steps.csv", step_rows)
@@ -111,6 +132,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         report += analysis_report(layer_rows, step_rows) + [""]
         if protocol is not None:
             report += protocol_report(step_rows, protocol) + [""]
+        if timing:
+            report += timing_report(cfg, step_rows) + [""]
     result = None
     if binary is not None:
         result = simulate(cfg, batches, directory, binary, physical=physical)
@@ -129,7 +152,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     return result
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", default="64x16",
                         help="ocp (the spec's Figure 4 example), 16x64, 64x16, 256x4 or any "
@@ -204,35 +227,60 @@ def main():
     parser.add_argument("--analysis-only", action="store_true",
                         help="write the mechanism analysis without building or running MQSim")
     parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
-    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    directory = args.output or Path("runs") / f"{now}-{uuid4().hex[:8]}"
+    device = parser.add_argument_group("device parameters (defaults from hbf/configs/parameters.json; the OCP "
+                                       "spec leaves them product specific)")
+    device.add_argument("--read-ns", type=int, help="page sense time tR (default 4096, from SPLASH)")
+    device.add_argument("--program-ns", type=int, help="page program time (default 100000)")
+    device.add_argument("--erase-ns", type=int, help="block erase time (default 1000000)")
+    device.add_argument("--pages-per-block", type=int, help="pages per erase block (default 256)")
+    device.add_argument("--blocks-per-plane", type=int, help="blocks per plane (default 512)")
+    parser.add_argument("--timing", action="store_true",
+                        help="analysis: add read-time estimates (ideal bound and MQSim-calibrated estimate), "
+                             "their breakdown, demand columns and per-block read counts")
+    return parser
+
+
+def configure(args):
+    """Pipeline arguments from parsed command-line arguments (raises ValueError on bad input)."""
+    given = {"aggregate_gb_s": args.aggregate_gb_s, "planes": args.planes, "plane_rule": args.plane_rule,
+             "dbsy_ns": args.dbsy_ns, "coalesce_ns": args.coalesce_ns, "read_plane_ns": args.read_plane_ns,
+             "cache_read": args.cache_read or None, "read_ns": args.read_ns, "program_ns": args.program_ns,
+             "erase_ns": args.erase_ns, "pages_per_block": args.pages_per_block,
+             "blocks_per_plane": args.blocks_per_plane}
+    # Only flags given on the command line override the topology's own settings (e.g. ocp).
+    cfg = load(args.topology, batch_pages=args.batch_pages,
+               **{key: value for key, value in given.items() if value is not None})
+    tensors = parse_tensors(args.tensors)
+    for group in args.plane_groups or (1,):
+        check_group(cfg, group)
+    protocol = None
+    if (args.mocs is not None or args.read_burst or args.read_unit != "page" or args.host_order != "fcfs"
+            or args.ucie_grade is not None or args.group_sense != "arrived"):
+        protocol = Protocol(args.mocs, args.read_burst, args.read_unit,
+                            args.host_order, args.ucie_grade, args.group_sense)
+    shape = Shape(args.layers, args.heads, args.head_dim, args.context)
     generation = {key: getattr(args, key) for key in (
         "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units", "select_tokens"
     )}
+    if args.timing and args.engine == "python":
+        raise ValueError("--timing needs the numpy engine")
+    return {"cfg": cfg, "shape": shape, "layout_name": args.layout, "mode": args.mode, "generation": generation,
+            "input_csv": args.access_csv, "physical": args.physical, "tensors": tensors,
+            "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": args.prefill,
+            "placement": args.placement, "protocol": protocol, "engine": args.engine, "timing": args.timing}
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    directory = args.output or Path("runs") / f"{now}-{uuid4().hex[:8]}"
     try:
-        given = {"aggregate_gb_s": args.aggregate_gb_s, "planes": args.planes, "plane_rule": args.plane_rule,
-                 "dbsy_ns": args.dbsy_ns, "coalesce_ns": args.coalesce_ns, "read_plane_ns": args.read_plane_ns,
-                 "cache_read": args.cache_read or None}
-        # Only flags given on the command line override the topology's own settings (e.g. ocp).
-        cfg = load(args.topology, batch_pages=args.batch_pages,
-                   **{key: value for key, value in given.items() if value is not None})
-        tensors = parse_tensors(args.tensors)
-        for group in args.plane_groups or (1,):
-            check_group(cfg, group)
-        protocol = None
-        if (args.mocs is not None or args.read_burst or args.read_unit != "page" or args.host_order != "fcfs"
-                or args.ucie_grade is not None or args.group_sense != "arrived"):
-            protocol = Protocol(args.mocs, args.read_burst, args.read_unit,
-                                args.host_order, args.ucie_grade, args.group_sense)
-        shape = Shape(args.layers, args.heads, args.head_dim, args.context)
+        run = configure(args)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     binary = None if args.analysis_only else build()
-    pipeline(cfg, shape, args.layout, directory, binary, mode=args.mode, generation=generation,
-             input_csv=args.access_csv, physical=args.physical, tensors=tensors,
-             plane_groups=tuple(args.plane_groups or (1,)), prefill_layout=args.prefill,
-             placement=args.placement, protocol=protocol, engine=args.engine)
+    pipeline(directory=directory, binary=binary, **run)
     print(directory.resolve())
 
 

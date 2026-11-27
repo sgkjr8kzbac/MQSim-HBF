@@ -111,6 +111,7 @@ def _union(group, lo, hi, scale):
 def layer_pages(cfg, layout, step, layer, rows):
     """Pages of one (step, layer) from an (n, 4) int64 array of (head, tensor, token_start, token_end)."""
     head, t, lo, hi = rows.T
+    attended = attended_tokens(head, lo, hi, layout.shape.context)
     tpp = np.asarray(layout.tokens_per_page, dtype=np.int64)[t]
     first, last = lo // tpp, (hi - 1) // tpp
     count = last - first + 1
@@ -135,7 +136,21 @@ def layer_pages(cfg, layout, step, layer, rows):
     chunk_hi = -(-(hi * token_bytes) // BURST_BYTES)
     chunks, runs = _union(group, chunk_lo, chunk_hi, cfg.page_bytes // BURST_BYTES + 1)
     page_t = t[new]
-    return LayerPages(step, layer, lpa[new], page_t, tokens * token_bytes[new], chunks * BURST_BYTES, runs)
+    return LayerPages(step, layer, lpa[new], page_t, tokens * token_bytes[new], chunks * BURST_BYTES, runs,
+                      attended_tokens=attended)
+
+
+def attended_tokens(head, lo, hi, context):
+    """Sum over KV heads of the tokens read by any tensor of the head (the tokens attention covers)."""
+    if not len(head):
+        return 0
+    order = np.lexsort((lo, head))
+    head, lo, hi = head[order], lo[order], hi[order]
+    new = np.empty(len(head), dtype=bool)
+    new[:1] = True
+    np.not_equal(head[1:], head[:-1], out=new[1:])
+    tokens, _ = _union(np.cumsum(new) - 1, lo, hi, context + 1)
+    return int(tokens.sum())
 
 
 def iter_layer_pages(cfg, layout, accesses):
