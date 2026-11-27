@@ -1,0 +1,9 @@
+{
+  "base": {"topology": "ocp", "read_plane_ns": 0, "coalesce_ns": 1, "cache_read": true, "model": "llama-3.1-8b",
+           "gpu": "b200", "layout": "striped_contiguous", "check_writes": true},
+  "vary": {"batch": [8, 32], "context": [4096, 32768], "generated": [0, 338, 2048]},
+  "zip": [{"alloc": "layer_major"}, {"alloc": "dedicated"}, {"alloc": "packed"},
+          {"alloc": "packed", "flush_order": "layer"},
+          {"alloc": "dedicated", "partition": "channel"}, {"alloc": "packed", "partition": "die"},
+          {"alloc": "vllm_pool"}, {"alloc": "vllm_pool", "free_order": "shuffled:7"}]
+}
