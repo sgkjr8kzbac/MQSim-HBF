@@ -61,6 +61,27 @@ def timing_report(cfg, step_rows, plane_groups=(1,), protocol=None):
     return report
 
 
+ALLOCATION_NAMES = {"layer_major": "按层优先预留（第 2 阶段 A 的批近似）", "dedicated": "每个请求独占整段",
+                    "packed": "全局写前沿顺序追加", "vllm_pool": "vLLM 式块池"}
+
+
+def write_check_report(cfg, spec, check):
+    kinds = check["kinds"]
+    report = ["## 写入顺序检查", "",
+              f"分配方式：{ALLOCATION_NAMES[spec.allocation]}（`{spec.allocation}`，分区 `{spec.partition}`），"
+              f"{len(spec.requests)} 个请求，提示 token {', '.join(str(r.prompt) for r in spec.requests)}，"
+              f"已生成 {', '.join(str(r.generated) for r in spec.requests)}。按快照的写入历史（prefill 整段写入，"
+              "生成的 token 满一页时写入），逐块核对 OCP 规范 §5.4.1：块内从第 0 页起按页顺序写、不得跳页；"
+              "写第 0 页会自动擦除整块。每块 "
+              f"{cfg.pages_per_block} 页（假设）。", "",
+              "| 写入页 | 其中 prefill | 填充页 | decode 写回 | 涉及块 | 跳页 | 覆盖写 | 擦除仍有效的块 | 合法 |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
+              f"| {check['writes']} | {kinds['prefill']} | {kinds['padding']} | {kinds['decode']} | {check['blocks']} | "
+              f"{check['skips']} | {check['overlaps']} | {check['live_erases']} | {'是' if check['legal'] else '否'} |", "",
+              "跳页对应规范 §11.5.2.6 的写顺序错误，覆盖写对应 §11.5.2.2；擦除仍有效的块会丢失其中已写入的 KV。"]
+    return report
+
+
 def topology_name(cfg):
     return "ocp" if cfg.address_map == "ocp" else f"{cfg.channels}x{cfg.chips}"
 
@@ -114,9 +135,23 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
         "hot_fraction": .5, "hot_units": 1, "select_tokens": 16,
     } | (generation or {})
-    layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
-    accesses = list(generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv))
-    if input_csv is not None and requests is not None and requests[0] > 1:
+    from .batch import BatchSpec, PageTableLayout, check_write_order, generate_batch, place_batch
+    placed = isinstance(requests, BatchSpec) and not requests.default
+    if placed:
+        per_request = Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context)
+        layout = PageTableLayout(cfg, per_request, requests, tensors=tensors)
+        accesses = list(generate_batch(cfg, layout, mode, **{key: generation[key] for key in (
+            "steps", "seed", "fraction", "count", "select_tokens")}))
+    else:
+        layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
+        accesses = list(generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv))
+    write_check = None
+    if isinstance(requests, BatchSpec):
+        snapshot = layout.snapshot if placed else place_batch(
+            cfg, Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context),
+            requests, layout.tensors, layout.tokens_per_page)
+        write_check = check_write_order(cfg, snapshot.written()) | {"kinds": snapshot.kinds}
+    if input_csv is not None and isinstance(requests, tuple) and requests[0] > 1:
         seen = {access.kv_head // requests[1] for access in accesses}
         if len(seen) < requests[0]:
             raise ValueError(f"The access trace reads {len(seen)} of the {requests[0]} requests that --batch puts on "
@@ -136,6 +171,12 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                    "system": system_meta,
                                    "format": None if fmt is None else {"name": fmt.name, "params": fmt.params,
                                                                        "attn_dims": fmt.attn_dims},
+                                   "batch": None if not isinstance(requests, BatchSpec) else {
+                                       "allocation": requests.allocation, "partition": requests.partition,
+                                       "intra": requests.intra, "flush_order": requests.flush_order,
+                                       "block_tokens": requests.block_tokens, "free_order": requests.free_order,
+                                       "requests": [[r.prompt, r.generated] for r in requests.requests],
+                                       "write_check": write_check},
                                    "tensors": tensors_meta(layout),
                                    "generator": {"mode": mode, **generation} if input_csv is None else None,
                                    "input_csv": str(input_csv) if input_csv else None,
@@ -179,6 +220,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
             report += protocol_report(step_rows, protocol) + [""]
         if timing:
             report += timing_report(cfg, step_rows, plane_groups, protocol) + [""]
+    if write_check is not None:
+        report += write_check_report(cfg, requests, write_check) + [""]
     if system is not None:
         from .system import evaluate, report_lines, write_table as write_system_table
         rows = [row for row in layer_rows if row["group"] == 1] if 1 in plane_groups else []
@@ -311,7 +354,48 @@ def build_parser():
                         help="whether the pages a layer reads are known before its query (static: dense, "
                              "sink_recent) or not (dynamic: uniform_* selections, imported traces); prefetch "
                              "needs static")
+    batch = parser.add_argument_group("request placement (phase B; analysis only)")
+    batch.add_argument("--alloc", choices=("layer_major", "dedicated", "packed", "vllm_pool"), default="layer_major",
+                       help="how each request's KV is placed: layer_major (phase A's emulation), dedicated "
+                            "segments, a packed write frontier, or vLLM-style block pools; see hbf/batch.py")
+    batch.add_argument("--partition", choices=("none", "channel", "die"), default="none",
+                       help="dedicated/packed: stripe each request over all banks, or keep it in one host "
+                            "channel (64 banks) or one die (16 banks)")
+    batch.add_argument("--contexts", help="prompt tokens of each request of a stack, comma separated "
+                                          "(default: --context for every request)")
+    batch.add_argument("--generated", default="0",
+                       help="tokens generated so far by each request (one value or a comma separated list); "
+                            "full pages are flushed to HBF, the partial page stays in HBM")
+    batch.add_argument("--flush-order", choices=("rotate", "layer"), default="rotate",
+                       help="page order of a decode flush: start at layer (flush mod L) or always at layer 0")
+    batch.add_argument("--block-tokens", type=int, help="vllm_pool: tokens per vLLM block (default: largest "
+                                                        "tokens per page)")
+    batch.add_argument("--free-order", default="fresh", help="vllm_pool: fresh (ascending ids) or shuffled:<seed>")
+    batch.add_argument("--check-writes", action="store_true",
+                       help="check the batch's write history against the per-block write order of OCP section "
+                            "5.4.1 and report skips, overlaps and erases of live blocks")
     return parser
+
+
+def batch_spec(args, per_stack):
+    """The BatchSpec of the placement flags, or None for phase A's plain --batch emulation."""
+    from .batch import BatchRequest, BatchSpec
+
+    def values(text, name):
+        try:
+            items = [int(item) for item in str(text).split(",")]
+        except ValueError:
+            raise ValueError(f"--{name} needs integers") from None
+        if len(items) == 1:
+            items *= per_stack
+        if len(items) != per_stack:
+            raise ValueError(f"--{name} lists {len(items)} values for {per_stack} requests per stack")
+        return items
+    prompts = values(args.contexts, "contexts") if args.contexts is not None else [args.context] * per_stack
+    generated = values(args.generated, "generated")
+    spec = BatchSpec(tuple(BatchRequest(p, g) for p, g in zip(prompts, generated)), args.alloc, args.partition,
+                     args.layout, args.flush_order, args.block_tokens, args.free_order)
+    return None if spec.default and not args.check_writes else spec
 
 
 def configure(args):
@@ -380,12 +464,19 @@ def configure(args):
                   "kv_format": kv_format, "heads": heads}
     if (args.timing or system) and args.engine == "python":
         raise ValueError("--timing needs the numpy engine")
+    requests = (per_stack, heads)
+    spec = batch_spec(args, per_stack)
+    if spec is not None:
+        if not args.analysis_only or args.access_csv is not None or args.prefill:
+            raise ValueError("Request placement (--alloc, --contexts, --generated, --check-writes) is analysis only, "
+                             "with generated accesses and without --prefill")
+        requests = spec
     return {"cfg": cfg, "shape": shape, "layout_name": args.layout, "mode": args.mode, "generation": generation,
             "input_csv": args.access_csv, "physical": args.physical, "tensors": tensors,
             "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": args.prefill,
             "placement": args.placement, "protocol": protocol, "engine": args.engine,
             "timing": args.timing or system is not None, "system": system, "kv_format": kv_format,
-            "requests": (per_stack, heads)}
+            "requests": requests}
 
 
 def main(argv=None):
