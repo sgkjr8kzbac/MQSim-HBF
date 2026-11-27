@@ -94,13 +94,17 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 |---|---|
 | [`hbf/access.py`](hbf/access.py) | 访问记录格式与校验、张量规格 `TensorSpec`、三种布局、9 种生成模式（含 StreamingLLM 式 `sink_recent`、Quest 式按 token 块选择的 `uniform_tokens`）、整体 prefill |
 | [`hbf/controller.py`](hbf/controller.py) | token 区间到页的转换、批内去重、有用字节按区间并集计算、64 B 突发传输字节、子批划分、两个估算器和负载指标 |
-| [`hbf/analysis.py`](hbf/analysis.py) | 机制分析：不跑 MQSim，按层计算读轮数、最少轮数、plane 利用率、均衡损失和感测放大，支持独立 plane 与同偏移联动两种组织 |
+| [`hbf/analysis.py`](hbf/analysis.py) | 机制分析：不跑 MQSim，按层计算读轮数、最少轮数、plane 利用率、均衡损失和感测放大，支持独立 plane 与同偏移联动两种组织；纯 Python 参考实现与 numpy 引擎结果逐行相同 |
+| [`hbf/pages.py`](hbf/pages.py) | numpy 引擎的页集合：把访问记录直接变成每层去重后的页数组（有用字节、64 B 突发、连续段数）及其位置，HBM 层字节、被注意 token 数、反量化运算量 |
+| [`hbf/timing.py`](hbf/timing.py) | 读时间估计（`--timing`）：理想下界，以及按核心通道逐轮累加、与 MQSim 校准过的估算；每块读次数 |
+| [`hbf/formats.py`](hbf/formats.py) | 命名的 KV 存储格式（`--format`）：bf16、fp8、int4/int2、kivi4/kivi2、think、quest |
+| [`hbf/model.py`](hbf/model.py)、[`hbf/system.py`](hbf/system.py) | 模型与 GPU 预设；系统级评估：线性层与注意力计算、HBF 读与计算的重叠、TPOT、KV 全放 HBM 的基线、HBM 容量 |
 | [`hbf/simulator.py`](hbf/simulator.py) | 校验源码散列、打补丁、编译 MQSim；GC 预算检查；写轨迹；运行并对回逐请求完成日志；聚合结果 |
 | [`hbf/config.py`](hbf/config.py) | 参数文件、三套 chip 当 plane 拓扑与 `ocp` 规范示例拓扑、设备与 workload XML 的生成和互相校验、CWDP 与 OCP 地址映射、主机通道、逻辑容量上界 |
 | [`hbf/cli.py`](hbf/cli.py) | 一键入口：生成或导入 → 轨迹 → MQSim → 解析 → 简报 |
 | [`hbf/mqsim/`](hbf/mqsim) | MQSim 上游原版源码，逐文件 SHA-256 校验，不直接修改 |
 | [`hbf/patches/`](hbf/patches) | I1–I4 仪表与修复补丁，T-SUSP、T-ONFI 时序对照补丁，T-PLANE 多 plane 补丁，T-CMD HBF 命令模型，T-CACHE cache read；`series` 规定应用顺序 |
-| [`hbf/configs/`](hbf/configs) | 参数 JSON、设备模板、三种拓扑的设备和 workload XML |
+| [`hbf/configs/`](hbf/configs) | 参数 JSON、设备模板、三种拓扑的设备和 workload XML、模型与 GPU 预设（每项注明来源） |
 | [`tests/`](tests) | T0–T10 验证测试、机制分析与 T-PLANE 测试、上游行为探针、规模测试 |
 | [`evidence/`](evidence) | 随仓库保存的实测摘要和测试日志 |
 
@@ -115,11 +119,13 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | 页级读时序 | 逐请求的到达、入队、完成时间；可选物理时间线，精确到每条命令的通道、chip、块、页 |
 | 拓扑扫描 | 16×64、64×16、256×4 三种"chip 当 plane"配置，`ocp` 规范示例拓扑（见上），或任意"通道数x每通道 chip 数"（例如 16x16 即 256 个 plane，可作为对规范表 3 的另一种读法） |
 | 真实 die/plane 层级 | T-PLANE：每 die 最多 64 个 plane，multi-plane 读写，独立或同偏移两种地址规则；`--prefill` 按地址顺序写满整个布局区间（含条带布局的填充页），使 MQSim 的物理位置与规范的静态映射一致。多 plane 配置下读未写过的页会被拒绝（规范对它返回错误 0x7） |
-| 机制分析 | 页位置默认按 OCP 规范的静态映射（地址决定 bank 和页，`--placement static`），也可按 MQSim 的分配顺序（`--placement mqsim`）；`--analysis-only` 不跑 MQSim，数秒到数十秒内（32 层 × 128K 全量读约 33 s）算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
+| 机制分析 | 页位置默认按 OCP 规范的静态映射（地址决定 bank 和页，`--placement static`），也可按 MQSim 的分配顺序（`--placement mqsim`）；`--analysis-only` 不跑 MQSim，默认用 numpy 引擎（32 层 × 128K 全量读约 0.7 s，纯 Python 参考实现约 40 s，两者结果逐行相同，`--engine` 可选），算出每层的读轮数、最少轮数 ⌈N/P⌉、plane 利用率 N/(R·P)、均衡损失和感测放大；`--plane-group` 可同时比较多种组织 |
 | 协议约束 | 分析模式可选：每主机通道的命令额度（`--mocs`，规范 MOCS 寄存器取值 1 或 256–16,384）、是否支持读突发（`--read-burst`）、读整页还是只读需要的 64 B 段（`--read-unit`）、主机发送顺序（`--host-order fcfs` 一页命令一起排队，`trigger` 先发一条触发感测）、联动组的感测假设（`--group-sense arrived|whole`，默认 arrived 只感测命令已到的页；whole 在第一条命令到达时感测整组，规范和 HBF-EventLab 都没有规定）、主机链路档位（`--ucie-grade`，48/94/188 GB/s）。给出任一协议参数就启用协议约束；不给 `--mocs` 时不限额度。不支持读突发时每页要 64 条 64 B 读命令（规范 §5.3.1）；fcfs 主机下额度会限制同时在读的页数，trigger 主机下基本不会。机制取自 HBF-EventLab，并用它的实测结果核对 |
 | 容量 | 默认每 plane 512 块，物理容量 512 GiB，与规范表 3 的数字相同；但表 3 是"用户容量"，MQSim 按 SSD 习惯预留 7%（OP），用户可见的逻辑容量为 476 GiB。HBF 没有 GC，规范中主机看不到预留空间。1,024 plane 时 MQSim 峰值内存约 4.2 GB |
 | 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照）；`striped_contiguous`（SPLASH 式条带：每层从相位 0 开始，各 (张量, 头) 区域之间留 P/(T·H) 页的间隔；区域长度是 P 的倍数时（如 32K BF16），头之间错开 P/(2H)，V 与 K 相隔 P/2，消除各头同一块落在同一 plane 的冲突）；`striped_staggered`（同上，间隔取奇数，相邻区域还落在不同的主机通道上，在 fcfs 额度限制下更均衡） |
-| 压缩后的存储格式 | 用 `TensorSpec(name, bits, dims)` 声明，例如 KIVI 的 2 bit K 加量化参数张量、ThinK 的静态通道裁剪、低秩 latent。每页 token 数和有用字节按各张量计算 |
+| 压缩后的存储格式 | 用 `TensorSpec` 声明，或用 `--format` 选预设（bf16、fp8、int4/int2、kivi4/kivi2、think、quest，见 [`hbf/formats.py`](hbf/formats.py)）。张量可以只存一段 token（`window`，如 KIVI 量化部分 `[0, -R]`）、放在 HBM（`tier: hbm`，如 KIVI 的全精度残差窗口）、或作为每步整体读取的选择元数据（`role: meta`，如 Quest 页摘要，按每 token 一行均摊）。每页 token 数和有用字节按各张量计算 |
+| 读时间估计 | `--timing`：每层的理想下界（有效轮数 × tR、最忙核心通道传输、最忙主机链路取大）和估算（按核心通道逐轮累加命令、感测、R/B、传输及 cache read 重叠）。估算在 HBF 命令模型下与第 8 轮保存的 MQSim 运行逐层对照，误差不超过 4.7%（[evidence/time-calibration.csv](evidence/time-calibration.csv)）。另给出时间分解、瓶颈和每块读次数 |
+| 系统级评估 | `--model`、`--gpu`：线性层和注意力按 roofline 计时，HBF 读与计算可串行、预取或理想重叠，得到 TPOT、tokens/s，并与 KV 全放 HBM 对比、检查 HBM 容量；`--batch`、`--stacks` 近似多请求批；`python3 -m hbf.system RUN_DIR` 可换模型、GPU 或重叠方式重新评估。效率系数等假设列在报告中 |
 | 选择类方法 | StreamingLLM、SnapKV、动态选页等：访问记录本身就能表达读哪些 token 区间，部分覆盖的页按整页读并统计读放大 |
 | 指标 | 读页数、有用字节、读放大、按 64 B 突发计的传输字节和传输放大、最忙单元和最忙通道的页数、不均衡度、MQSim makespan、两个估算值及比值，按子批、层、步输出 |
 | prefill 写与写读干扰 | 整页写入；写读干扰对照（T6，配合 T-SUSP 补丁） |
@@ -133,10 +139,10 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 |---|---|
 | 真实模型数据和方法适配器 | 接口已就绪：任何能产出访问记录和张量规格的前端都可以接入。KIVI、Quest 等适配器尚未编写 |
 | decode 逐 token 追加写 | 只支持 prefill 整页写。MQSim 中非整页写会触发 update read，建议先在 HBM 攒满一页再写 |
-| 层间依赖与 GPU 计算 | 每步时延等于各层时延直接相加；读页和计算的交叠、预取都没有建模 |
+| 真实的请求维度 | `--batch` 只把请求按层优先排成额外的 KV 头，各请求上下文相同；请求按需分配、上下文不同、释放与擦除在下一阶段 |
+| GPU 计算的实测 | 系统级评估用 roofline 和效率假设；实测的 GPU 时间表尚未接入 |
 | 读一个张量的部分通道 | 需要通道主序的布局，目前不支持 |
-| 同一张量分段使用不同位宽 | 例如 KIVI 的全精度残差窗口，目前要声明成两个张量 |
-| 按块存的元数据 | 例如 Quest 的页摘要，它每块一行而不是每 token 一行，需要单独的块索引维度 |
+| 按块存的元数据的精确布局 | Quest 页摘要等按每 token 一行均摊存放，没有单独的块索引维度 |
 | HBF 专有器件行为 | 读计数与刷新、坏块、ECC、读重试、数据保持、温控均未建模。按 OCP 规范，读计数在 base die、刷新是主机的责任（§11.5），坏块和 ECC 在 base die 内部处理，读重试可配置；不出故障时它们都不改变读轮数和 plane 利用率，所以留在范围外。cache read 由 T-CACHE 提供，但只覆盖用户读 |
 | 按 bank 调度 | 规范按 bank 排列感测顺序、每 bank 两个缓冲（§5.3.1）。多 plane 模式（T-PLANE、T-CACHE）以 die 为单位门控和记账，时延偏保守，轮数不变；要按 bank 独立调度，用"chip 当 plane"的拓扑（16×64 等），每个 bank 是独立的 chip，代价是每页一条命令占用总线 |
 
@@ -180,7 +186,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 
 ## 快速开始
 
-环境：Linux，Python 3.10+、g++、make、git、GNU time（`/usr/bin/time`）。核心包只依赖 Python 标准库，测试另需 pytest。仓库自带固定版本的 MQSim 源码，构建不需要联网；首次运行会在当前目录的 `.build/` 下校验源码、打补丁并编译，约 10–30 秒。
+环境：Linux，Python 3.10+、numpy、g++、make、git、GNU time（`/usr/bin/time`）。核心包只依赖 numpy，测试另需 pytest。仓库自带固定版本的 MQSim 源码，构建不需要联网；首次运行会在当前目录的 `.build/` 下校验源码、打补丁并编译，约 10–30 秒。
 
 ```bash
 python3 -m hbf.cli --topology 64x16 --mode uniform_pages --seed 234 --fraction 0.1
@@ -218,6 +224,18 @@ python3 -m hbf.cli --analysis-only --topology ocp --layers 32 --context 32768 --
 
 ```bash
 python3 -m hbf.cli --topology 16x1 --planes 64 --plane-rule independent --read-plane-ns 10 --coalesce-ns 1 --cache-read --prefill --mode uniform_pages --fraction 0.05 --context 8192
+```
+
+读时间估计（`--timing`）：给出每层、每步的理想下界和与 MQSim 校准过的估算，并把时间拆成均衡部分、不均衡、协议、核心通道和开销。估算只在 HBF 命令模型下校准过，所以多 plane 拓扑请带上这三个参数：
+
+```bash
+python3 -m hbf.cli --analysis-only --timing --topology ocp --read-plane-ns 0 --coalesce-ns 1 --cache-read --layout striped_contiguous --layers 32 --context 131072
+```
+
+系统级评估：按模型和 GPU 预设计算 decode 的 TPOT，并与 KV 全放 HBM 的方案对比。`--batch` 把一个 stack 上的 ceil(B / stacks) 个请求按层优先排成额外的 KV 头（批的近似），`--format` 选择 KV 存储格式：
+
+```bash
+python3 -m hbf.cli --analysis-only --topology ocp --read-plane-ns 0 --coalesce-ns 1 --cache-read --layout striped_contiguous --model llama-3.1-8b --gpu b200 --context 32768 --batch 8 --format kivi2 --overlap serial
 ```
 
 导入已有的访问记录：
@@ -267,7 +285,15 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 
 ### 张量规格
 
-用 `--tensors` 传入 JSON（或 JSON 文件路径），默认是 BF16 的 `K` 和 `V`，dims 等于 head_dim，每页 16 个 token。每页 token 数 = 页字节 × 8 ÷ (dims × bits)，要求每个 token 是整字节。
+用 `--tensors` 传入 JSON（或 JSON 文件路径），或用 `--format` 选预设，默认是 BF16 的 `K` 和 `V`，dims 等于 head_dim，每页 16 个 token。每页 token 数 = 页字节 × 8 ÷ (dims × bits)，要求每个 token 是整字节。可选字段：
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `window` | 整个上下文 | 张量存的 token 区间 `[lo, hi]`，负数从上下文末尾数起，`null` 表示开头或末尾 |
+| `tier` | `hbf` | `hbm` 表示从 HBM 读，不占 HBF 页（如每步都变的残差窗口；HBF 块内只能顺序写，§5.4.1） |
+| `role` | `data` | `meta` 表示选择元数据，选择类生成模式每步整体读取，不计入被注意的 token |
+| `dequant_ops` | 0 | 每读一个元素的 GPU 反量化运算数（假设），用于系统级评估 |
+
 
 - `layer_contiguous` 按 (层, 张量, 头) 依次预留连续区域，各张量的块数可以不同。
 - `vllm_interleaved` 要求所有张量每页 token 数相同。
@@ -284,7 +310,8 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 | `stdout.log`、`workload_scenario_1.xml`、`completions.csv` | MQSim 原始输出和逐请求完成日志（I1） |
 | `physical.csv` | 物理时间线（I2），需要加 `--physical` |
 | `batches.csv`、`layers.csv`、`steps.csv`、`report.md` | 子批、层、步的指标，以及简报 |
-| `analysis_layers.csv`、`analysis_steps.csv` | 机制分析：每层和每步的读轮数、plane 利用率、感测放大等，每种 plane 组织各一组 |
+| `analysis_layers.csv`、`analysis_steps.csv` | 机制分析：每层和每步的读轮数、plane 利用率、感测放大等，每种 plane 组织各一组；加 `--timing` 时另有读时间列（`bound_ns`、`est_ns`、`est_batches_ns`、`t_*` 分解、`bottleneck`）、需求列（`attended_tokens`、`hbm_bytes`、`dequant_ops`、`attn_dims`）和每步的 `max_block_reads` |
+| `system_layers.csv`、`system_steps.csv` | 系统级评估（`--model`）：每层的计算、HBF 读、等待时间，每步的 TPOT、tokens/s、HBF/HBM 比值和 HBM 容量是否够用 |
 
 ### 运行约束
 

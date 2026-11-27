@@ -11,3 +11,5 @@
 实验排查：`selection-granularity.csv` 比较按页抽样（`uniform_pages`）与按 16-token 块选择（`uniform_tokens`），`ocp`、32 层、32K，BF16、2 bit 与 KIVI 格式，比例 0.1%–5%，每格 5 个种子（11–15）的平均、最小和最大轮数，由 `hbf/analysis.py` 生成；`mqsim-vs-rounds.csv` 是 `ocp` 上 MQSim 每层时延与分析轮数的对照（2 层、32K、`--fraction 0.05`、T-CMD + T-CACHE）。`protocol-credit-scan.csv` 已按修正后的协议模型重算。
 
 `eventlab/`：HBF-EventLab 对照探针的输入、配置、重跑脚本和重跑结果摘要，见其中的 README。`scripts/`：`protocol_credit_scan.py` 和 `selection_granularity.py` 生成同名的 CSV（`python3 evidence/scripts/<脚本> <输出.csv>`）。
+
+第 2 阶段 A：`time-calibration.csv` 用当前代码重算第 8 轮保存的 79 个 MQSim 层（`ocp` 和 `Cx1 --planes 16/64`，独立与联动、开关 cache read、合并窗口 1–3,000 ns、384–3,072 GB/s）的读时间估算，与 MQSim 实测逐层对照；`hbf_command_model` 列标出是否为校准所用的 HBF 命令模型（`--read-plane-ns 0`、有合并窗口、cache read）。由 `scripts/time_calibration.py RUN_DIR...` 生成；原始运行目录在当时会话的临时目录中，未入库。
