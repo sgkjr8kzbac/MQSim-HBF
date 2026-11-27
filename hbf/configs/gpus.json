@@ -1,0 +1,17 @@
+{
+  "h100-sxm": {
+    "tensor_flops": 989e12, "vector_ops": 67e12, "hbm_bytes_s": 3.35e12, "hbm_capacity": 80000000000,
+    "compute_eff": 0.5, "memory_eff": 0.8, "layer_overhead_ns": 0,
+    "source": "NVIDIA H100 datasheet, https://www.nvidia.com/en-us/data-center/h100/ : BF16 989 TFLOPS dense (1,979 with sparsity), FP32 67 TFLOPS, 80 GB HBM3, 3.35 TB/s. Assumptions: vector_ops = the non-tensor FP32 rate (dequantization runs on CUDA cores); capacity in decimal bytes; compute_eff 0.5 is a prefill MFU figure (MInference 1.0, https://arxiv.org/abs/2407.02490, reaches 50 % of A100 BF16; FlashAttention-3, https://arxiv.org/abs/2407.08608, reaches 75-85 % in the attention kernel); memory_eff 0.8 is a decode HBM efficiency (about 84-86 % of peak near B = 128 on H100, https://discuss.vllm.ai/t/why-is-ttft-worse-for-decode-1-than-decode-100/2590); layer_overhead_ns 0."
+  },
+  "h200": {
+    "tensor_flops": 989e12, "vector_ops": 67e12, "hbm_bytes_s": 4.8e12, "hbm_capacity": 141000000000,
+    "compute_eff": 0.5, "memory_eff": 0.8, "layer_overhead_ns": 0,
+    "source": "NVIDIA H200 page and datasheet, https://www.nvidia.com/h200 : BF16 989 TFLOPS dense (1,979 with sparsity), FP32 67 TFLOPS, 141 GB HBM3e, 4.8 TB/s (SXM). Assumptions: vector_ops = the non-tensor FP32 rate; capacity in decimal bytes; compute_eff 0.5 is a prefill MFU figure (MInference 1.0, https://arxiv.org/abs/2407.02490, reaches 50 % of A100 BF16; FlashAttention-3, https://arxiv.org/abs/2407.08608, reaches 75-85 % in the attention kernel); memory_eff 0.8 is a decode HBM efficiency (about 84-86 % of peak near B = 128 on H100, https://discuss.vllm.ai/t/why-is-ttft-worse-for-decode-1-than-decode-100/2590); layer_overhead_ns 0."
+  },
+  "b200": {
+    "tensor_flops": 2.25e15, "vector_ops": 75e12, "hbm_bytes_s": 8e12, "hbm_capacity": 180000000000,
+    "compute_eff": 0.5, "memory_eff": 0.8, "layer_overhead_ns": 0,
+    "source": "NVIDIA DGX B200, https://www.nvidia.com/en-us/data-center/dgx-b200/ (64 TB/s over 8 GPUs, 1,440 GB) and Lenovo Press LP2226, https://lenovopress.lenovo.com/LP2226 (HGX B200: BF16 2,250 TFLOPS dense, FP32 75 TFLOPS, 180 GB HBM3e, 8 TB/s; some tables say 7.7 TB/s). Assumptions: vector_ops = the non-tensor FP32 rate; capacity in decimal bytes; compute_eff 0.5 is a prefill MFU figure (MInference 1.0, https://arxiv.org/abs/2407.02490, reaches 50 % of A100 BF16; FlashAttention-3, https://arxiv.org/abs/2407.08608, reaches 75-85 % in the attention kernel); memory_eff 0.8 is a decode HBM efficiency (about 84-86 % of peak near B = 128 on H100, https://discuss.vllm.ai/t/why-is-ttft-worse-for-decode-1-than-decode-100/2590); layer_overhead_ns 0."
+  }
+}

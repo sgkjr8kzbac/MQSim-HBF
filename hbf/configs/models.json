@@ -1,0 +1,27 @@
+{
+  "llama-3.1-8b": {
+    "layers": 32, "hidden": 4096, "q_heads": 32, "kv_heads": 8, "head_dim": 128,
+    "intermediate": 14336, "vocab": 128256, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
+    "source": "Hugging Face meta-llama/Llama-3.1-8B config.json (read through mirrors), https://huggingface.co/meta-llama/Llama-3.1-8B; 8.03 B parameters, untied embeddings. BF16 weights. Norm weights are not counted."
+  },
+  "llama-3.1-70b": {
+    "layers": 80, "hidden": 8192, "q_heads": 64, "kv_heads": 8, "head_dim": 128,
+    "intermediate": 28672, "vocab": 128256, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
+    "source": "Hugging Face meta-llama/Llama-3.1-70B config.json (read through mirrors), https://huggingface.co/meta-llama/Llama-3.1-70B; 70.6 B parameters, untied embeddings. BF16 weights. Norm weights are not counted."
+  },
+  "qwen2.5-7b": {
+    "layers": 28, "hidden": 3584, "q_heads": 28, "kv_heads": 4, "head_dim": 128,
+    "intermediate": 18944, "vocab": 152064, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
+    "source": "Qwen2.5 Technical Report Table 1, https://arxiv.org/abs/2412.15115 (28 layers, 28/4 heads, untied embeddings for 7B); hidden, intermediate and vocab from Hugging Face Qwen/Qwen2.5-7B config.json mirrors. BF16 weights. QKV biases and norm weights are not counted."
+  },
+  "qwen3-8b": {
+    "layers": 36, "hidden": 4096, "q_heads": 32, "kv_heads": 8, "head_dim": 128,
+    "intermediate": 12288, "vocab": 151936, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
+    "source": "Hugging Face Qwen/Qwen3-8B config.json, https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json; Qwen3 Technical Report Table 1, https://arxiv.org/abs/2505.09388 (36 layers, 32/8 heads, untied embeddings). BF16 weights. Q/K norm and norm weights are not counted."
+  },
+  "qwen3-32b": {
+    "layers": 64, "hidden": 5120, "q_heads": 64, "kv_heads": 8, "head_dim": 128,
+    "intermediate": 25600, "vocab": 151936, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
+    "source": "Qwen3 Technical Report Table 1, https://arxiv.org/abs/2505.09388 (64 layers, 64/8 heads, untied embeddings); hidden 5120, intermediate 25600 and vocab from a Qwen3-architecture config mirror, https://huggingface.co/OpenBuddy/SimpleChat-32B-V1/blob/main/config.json (secondary; check https://huggingface.co/Qwen/Qwen3-32B). q_heads x head_dim = 8192 differs from hidden. BF16 weights. Q/K norm and norm weights are not counted."
+  }
+}
