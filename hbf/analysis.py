@@ -276,13 +276,8 @@ def analyze(cfg, batches, groups=(1,), mode="static", protocol=None):
         part = [req for req in batch.requests if req.op == "R"]
         if part:
             parts[batch.step, batch.layer].append(part)
-    keys = ("pages", "rounds", "batch_rounds", "min_rounds", "channel_rounds", "sensed_pages", "useful_bytes",
-            "burst_bytes")
-    if protocol is not None:
-        keys += ("commands", "credit_rounds", "link_rounds", "protocol_rounds")
-    layers, steps = [], []
+    layers = []
     for group in groups:
-        totals = {}
         for (step, layer), chunks in sorted(parts.items()):
             requests = [req for chunk in chunks for req in chunk]
             row = {"step": step, "layer": layer, **analyze_group(cfg, requests, group, offsets)}
@@ -296,16 +291,168 @@ def analyze(cfg, batches, groups=(1,), mode="static", protocol=None):
                 row["protocol_rounds"] = sum(max(item[0], item[3]) for item in limited)
                 row["protocol_utilization"] = row["pages"] / (row["protocol_rounds"] * row["planes"])
             layers.append(row)
-            total = totals.setdefault(step, {"group": group, "step": step, "planes": row["planes"],
-                                             "layers": 0, **dict.fromkeys(keys, 0)})
-            total["layers"] += 1
-            for key in keys:
-                total[key] += row[key]
-        for total in totals.values():
-            total["utilization"] = total["pages"] / (total["rounds"] * total["planes"])
-            total["balance_loss"] = total["rounds"] / total["min_rounds"]
-            total["sense_amplification"] = total["sensed_pages"] / total["pages"]
+    return layers, summarize(layers, protocol)
+
+
+STEP_KEYS = ("pages", "rounds", "batch_rounds", "min_rounds", "channel_rounds", "sensed_pages", "useful_bytes",
+             "burst_bytes")
+PROTOCOL_KEYS = ("commands", "credit_rounds", "link_rounds", "protocol_rounds")
+
+
+def summarize(layers, protocol=None):
+    """Per-step totals of layer rows ordered by plane organization, then (step, layer)."""
+    keys = STEP_KEYS + (PROTOCOL_KEYS if protocol is not None else ())
+    totals = {}
+    for row in layers:
+        total = totals.setdefault((row["group"], row["step"]), {
+            "group": row["group"], "step": row["step"], "planes": row["planes"], "layers": 0, **dict.fromkeys(keys, 0)})
+        total["layers"] += 1
+        for key in keys:
+            total[key] += row[key]
+    steps = list(totals.values())
+    for total in steps:
+        total["utilization"] = total["pages"] / (total["rounds"] * total["planes"])
+        total["balance_loss"] = total["rounds"] / total["min_rounds"]
+        total["sense_amplification"] = total["sensed_pages"] / total["pages"]
+        if protocol is not None:
+            total["protocol_utilization"] = total["pages"] / (total["protocol_rounds"] * total["planes"])
+    return steps
+
+
+ENGINES = ("auto", "numpy", "python")
+
+
+def _group_rounds(cfg, placed, group, part=slice(None)):
+    """(rounds, sensed pages, active planes) of the pages ``part`` of a layer, as ``analyze_group``."""
+    np = _numpy()
+    _, per_die = plane_geometry(cfg)
+    die, plane, offset = placed.die[part], placed.plane[part], placed.offset[part]
+    if not len(die):
+        return 0, 0, 0
+    if group == 1:
+        counts = np.bincount(die * per_die + plane)
+        return int(counts.max()), len(die), int(np.count_nonzero(counts))
+    span = int(offset.max()) + 1
+    needed = np.unique((die * (per_die // group) + plane // group) * span + offset)
+    active = int(np.unique(die * per_die + plane).size)
+    return int(np.bincount(needed // span).max()), group * len(needed), active
+
+
+def _protocol_part(cfg, pages, placed, group, protocol, part):
+    """``protocol_rounds`` of one sub-batch: closed form for independent planes with equal credits
+    per host channel (greedy longest-queue-first reaches max(longest bank queue, ceil(n / k))),
+    otherwise the reference scheduler on rebuilt requests."""
+    np = _numpy()
+    from .controller import Request
+    useful, burst, runs = pages.useful[part], pages.burst[part], pages.runs[part]
+    if protocol.read_unit == "page":
+        commands = np.full(len(useful), 1 if protocol.read_burst else cfg.page_bytes // BURST_BYTES, dtype=np.int64)
+        data = np.full(len(useful), cfg.page_bytes, dtype=np.int64)
+    else:
+        commands = runs if protocol.read_burst else burst // BURST_BYTES
+        data = burst
+    credits = np.ones_like(commands) if protocol.host_order == "trigger" else commands
+    host = placed.host[part]
+    link = 0
+    if protocol.ucie_grade is not None and len(host):
+        per_round = UCIE_GRADES[protocol.ucie_grade] * cfg.read_ns
+        link = -(-int(np.bincount(host, data).max()) // per_round)
+    total = int(commands.sum())
+    order = np.argsort(host, kind="stable")
+    hosts, starts = np.unique(host[order], return_index=True)
+    low = np.minimum.reduceat(credits[order], starts)
+    high = np.maximum.reduceat(credits[order], starts)
+    if group != 1 or (low != high).any():
+        reads = [Request(int(lpa), "R", int(u), int(b), int(r))
+                 for lpa, u, b, r in zip(pages.lpa[part], useful, burst, runs)]
+        rounds, credit, _, _ = protocol_rounds(cfg, reads, group, None, protocol)
+        return rounds, credit, total, link
+    _, per_die = plane_geometry(cfg)
+    bank = placed.die[part] * per_die + placed.plane[part]
+    sizes = np.diff(np.append(starts, len(order)))
+    rounds = credit = 0
+    for start, size, cost in zip(starts.tolist(), sizes.tolist(), low.tolist()):
+        longest = int(np.bincount(bank[order[start:start + size]]).max())
+        per_round = size if protocol.mocs is None else min(size, -(-protocol.mocs // cost))
+        needed = -(-size // per_round)
+        rounds, credit = max(rounds, longest, needed), max(credit, needed)
+    return rounds, credit, total, link
+
+
+def analyze_pages(cfg, pages, groups=(1,), protocol=None):
+    """``analyze`` on ``LayerPages`` (numpy engine, static placement): identical rows and totals."""
+    from .pages import check_host_channels, place
+    np = _numpy()
+    for group in groups:
+        check_group(cfg, group)
+    if protocol is not None:
+        check_host_channels(cfg)
+    dies, per_die = plane_geometry(cfg)
+    total_planes = dies * per_die
+    limit = cfg.batch_pages
+    rows = {group: [] for group in groups}
+    for layer in pages:
+        placed = place(cfg, layer.lpa)
+        count = len(layer)
+        parts = [slice(start, start + limit) for start in range(0, count, limit)]
+        channel_max = int(np.bincount(placed.channel).max()) if count else 0
+        useful, bursts = int(layer.useful.sum()), int(layer.burst.sum())
+        for group in groups:
+            rounds, senses, active = _group_rounds(cfg, placed, group)
+            best = -(-count // total_planes)
+            row = {
+                "step": layer.step, "layer": layer.layer, "group": group, "planes": total_planes, "pages": count,
+                "active_planes": active, "rounds": rounds, "min_rounds": best,
+                "channel_rounds": -(-channel_max * cfg.transfer_ns // cfg.read_ns),
+                "utilization": count / (rounds * total_planes) if rounds else None,
+                "balance_loss": rounds / best if rounds else None,
+                "sensed_pages": senses, "sense_amplification": senses / count if count else None,
+                "useful_bytes": useful, "page_bytes": count * cfg.page_bytes, "burst_bytes": bursts,
+                "read_amplification": count * cfg.page_bytes / useful if useful else None,
+                "transfer_amplification": bursts / useful if useful else None,
+                "subbatches": len(parts),
+                "batch_rounds": sum(_group_rounds(cfg, placed, group, part)[0] for part in parts),
+            }
             if protocol is not None:
-                total["protocol_utilization"] = total["pages"] / (total["protocol_rounds"] * total["planes"])
-            steps.append(total)
-    return layers, steps
+                limited = [_protocol_part(cfg, layer, placed, group, protocol, part) for part in parts]
+                row["commands"] = sum(item[2] for item in limited)
+                row["credit_rounds"] = sum(item[1] for item in limited)
+                row["link_rounds"] = sum(item[3] for item in limited)
+                row["protocol_rounds"] = sum(max(item[0], item[3]) for item in limited)
+                row["protocol_utilization"] = row["pages"] / (row["protocol_rounds"] * row["planes"])
+            rows[group].append(row)
+    layers = [row for group in groups for row in rows[group]]
+    return layers, summarize(layers, protocol)
+
+
+def analyze_accesses(cfg, layout, accesses, groups=(1,), mode="static", protocol=None, engine="auto", batches=None):
+    """Mechanism analysis straight from logical accesses.
+
+    ``numpy`` (``auto`` when numpy is importable and the placement is static) vectorises the
+    page sets; ``python`` schedules ``Request`` objects and runs ``analyze``. Both give identical
+    rows. ``batches`` reuses an existing schedule for the python engine.
+    """
+    if engine not in ENGINES:
+        raise ValueError(f"engine must be one of {ENGINES}")
+    if mode not in PLACEMENTS:
+        raise ValueError(f"placement must be one of {PLACEMENTS}")
+    if engine == "auto":
+        try:
+            _numpy()
+            engine = "numpy" if mode == "static" else "python"
+        except ImportError:
+            engine = "python"
+    if engine == "numpy":
+        if mode != "static":
+            raise ValueError("The numpy engine supports static placement only; use --engine python")
+        from .pages import iter_layer_pages
+        return analyze_pages(cfg, iter_layer_pages(cfg, layout, accesses), groups, protocol)
+    if batches is None:
+        from .controller import schedule
+        batches = schedule(cfg, layout, accesses)
+    return analyze(cfg, batches, groups, mode, protocol)
+
+
+def _numpy():
+    import numpy
+    return numpy

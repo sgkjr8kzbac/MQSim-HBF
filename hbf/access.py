@@ -9,6 +9,12 @@ from random import Random
 from .config import Config
 
 
+def numpy():
+    """numpy, imported on first use so the reference (pure-Python) path does not need it."""
+    import numpy as np
+    return np
+
+
 @dataclass(frozen=True)
 class Shape:
     layers: int
@@ -178,6 +184,13 @@ class LayerContiguous(Layout):
         return (self.base + layer * self.layer_pages + self.offsets[t]
                 + head * self.block_counts[t] + block)
 
+    def lpa_array(self, layer, head, t, block):
+        """``lpa`` for numpy arrays of heads, tensor indices and blocks (blocks assumed in range)."""
+        np = numpy()
+        counts = np.asarray(self.block_counts, dtype=np.int64)[t]
+        return (self.base + layer * self.layer_pages + np.asarray(self.offsets, dtype=np.int64)[t]
+                + head * counts + block)
+
     def decode(self, lpa):
         layer, rest = divmod(lpa - self.base, self.layer_pages)
         t = max(i for i, offset in enumerate(self.offsets) if offset <= rest)
@@ -198,6 +211,9 @@ class VllmInterleaved(Layout):
             raise ValueError("Block outside the block table")
         count = len(self.tensors)
         return self.base + (((block * self.shape.layers + layer) * self.shape.kv_heads + head) * count + t)
+
+    def lpa_array(self, layer, head, t, block):
+        return self.base + (((block * self.shape.layers + layer) * self.shape.kv_heads + head) * len(self.tensors) + t)
 
     def decode(self, lpa):
         group, t = divmod(lpa - self.base, len(self.tensors))
@@ -243,12 +259,22 @@ class StripedContiguous(Layout):
                     self.regions.append((start, layer, t, head))
                     cursor = start + self.block_counts[t]
         self.span = cursor
+        self._start_table = None
         cfg.lba(base + self.span - 1)
 
     def lpa(self, layer, head, t, block):
         if not 0 <= block < self.block_counts[t]:
             raise ValueError("Block outside the tensor's reserved region")
         return self.base + self.starts[layer, t, head] + block
+
+    def lpa_array(self, layer, head, t, block):
+        np = numpy()
+        if self._start_table is None:
+            table = np.zeros((self.shape.layers, len(self.tensors), self.shape.kv_heads), dtype=np.int64)
+            for (row_layer, row_t, row_head), start in self.starts.items():
+                table[row_layer, row_t, row_head] = start
+            self._start_table = table
+        return self.base + self._start_table[layer][t, head] + block
 
     def decode(self, lpa):
         offset = lpa - self.base

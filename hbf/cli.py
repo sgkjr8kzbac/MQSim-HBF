@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .access import LAYOUTS, MODES, Shape, generate, parse_tensors, read_access, tensors_meta, write_access
-from .analysis import GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze, check_group
+from .analysis import ENGINES, GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule_run, unwritten_reads
 from .simulator import build, dump, simulate, write_table
@@ -51,10 +51,19 @@ def analysis_report(layer_rows, step_rows):
     return report
 
 
+def subbatch_count(layer_rows, plane_groups):
+    """Sub-batches of a run without a schedule (no writes): the read sub-batches of every layer."""
+    return sum(row["subbatches"] for row in layer_rows if row["group"] == plane_groups[0])
+
+
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
-             placement="static", protocol=None):
-    """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None."""
+             placement="static", protocol=None, engine="auto"):
+    """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None.
+
+    Without MQSim and with static placement the analysis needs no request schedule, so the numpy
+    engine works on the accesses directly; the rows are identical either way.
+    """
     generation = {
         "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
         "hot_fraction": .5, "hot_units": 1, "select_tokens": 16,
@@ -73,12 +82,17 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                    "placement": placement,
                                    "protocol": None if protocol is None else asdict(protocol),
                                    "argv": sys.argv})
-    batches = schedule_run(cfg, layout, read_access(access_path), prefill_layout)
-    layer_rows, step_rows = analyze(cfg, batches, plane_groups, placement, protocol)
+    if prefill_layout and any(access.op == "W" for access in accesses):
+        raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
+    needs_schedule = (binary is not None or placement == "mqsim" or engine == "python" or prefill_layout
+                      or any(access.op == "W" for access in accesses))
+    batches = schedule_run(cfg, layout, accesses, prefill_layout) if needs_schedule else []
+    layer_rows, step_rows = analyze_accesses(cfg, layout, accesses, plane_groups, placement, protocol, engine,
+                                             batches=batches if needs_schedule else None)
     if layer_rows:
         write_table(directory / "analysis_layers.csv", layer_rows)
         write_table(directory / "analysis_steps.csv", step_rows)
-    unwritten = unwritten_reads(batches)
+    unwritten = unwritten_reads(batches) if needs_schedule else 0
     hierarchy = (f"{cfg.channels} 通道 × {cfg.chips} chip × {cfg.dies} die × {cfg.planes} plane"
                  f"（地址映射 {cfg.address_map}）")
     switches = [f"核心通道合计 {cfg.aggregate_gb_s} GB/s", f"plane 规则 {cfg.plane_rule or '上游'}"]
@@ -88,7 +102,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     if cfg.cache_read:
         switches.append("T-CACHE 开")
     report = ["# 本次运行", "", f"布局 `{layout_name}`，拓扑 `{topology_name(cfg)}`：{hierarchy}；"
-              f"{'，'.join(switches)}。子批 {len(batches)} 个。机制分析的页位置：{placement}。", ""]
+              f"{'，'.join(switches)}。子批 {len(batches) if needs_schedule else subbatch_count(layer_rows, plane_groups)} 个。"
+              f"机制分析的页位置：{placement}。", ""]
     if unwritten and (binary is not None or placement == "mqsim"):
         report += [f"有 {unwritten} 次读的页在本次运行中没有写过。OCP 规范对这种读返回错误 0x7（表 12）；"
                    "机制分析按静态位置计算时假定数据已在 HBF 中。需要 MQSim 按规范放置时请加 `--prefill`。", ""]
@@ -183,6 +198,9 @@ def main():
                              "whole senses the group's offset at the first command (an assumption)")
     parser.add_argument("--ucie-grade", type=int, choices=(1, 2, 3),
                         help="analysis: bound rounds by the host link (48/94/188 GB/s per channel)")
+    parser.add_argument("--engine", choices=ENGINES, default="auto",
+                        help="mechanism analysis engine: numpy (vectorised) or python (reference); auto picks numpy "
+                             "for static placement. Both give identical results")
     parser.add_argument("--analysis-only", action="store_true",
                         help="write the mechanism analysis without building or running MQSim")
     parser.add_argument("--output", type=Path)
@@ -214,7 +232,7 @@ def main():
     pipeline(cfg, shape, args.layout, directory, binary, mode=args.mode, generation=generation,
              input_csv=args.access_csv, physical=args.physical, tensors=tensors,
              plane_groups=tuple(args.plane_groups or (1,)), prefill_layout=args.prefill,
-             placement=args.placement, protocol=protocol)
+             placement=args.placement, protocol=protocol, engine=args.engine)
     print(directory.resolve())
 
 
