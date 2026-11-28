@@ -158,3 +158,40 @@ def test_effective_bandwidth_leaves_out_the_hbm_tier(tmp_path):
     assert row["hbf_elements"] == 8 * (1920 * 128 * 2)  # body tokens of K and V; the residual is in HBM
     assert row["attended_elements"] == 8 * 2048 * 256
     assert row["effective_gb_s"] == pytest.approx(row["hbf_elements"] * 2 / row["est_ns"])
+
+
+ENDURANCE = {"tool": "endurance",
+             "base": {"analytic": True, "no_calibrate": True, "model": "llama-3.1-8b", "pe_limit": "1e4,1e5"},
+             "vary": {"workload": ["chat", "long32k"], "rd_threshold": [1e5, 1e6]}}
+
+
+def test_endurance_tool_summary(tmp_path):
+    rows = sweep(ENDURANCE, tmp_path / "sweep")
+    assert [row["status"] for row in rows] == ["ok"] * 4
+    table = read_csv(tmp_path / "sweep" / "summary.csv")
+    assert [(row["workload"], float(row["rd_threshold"])) for row in table] == [
+        ("chat", 1e5), ("chat", 1e6), ("long32k", 1e5), ("long32k", 1e6)]
+    for row in table:  # the summary equals the run's own endurance_summary.csv
+        run = read_csv(tmp_path / "sweep" / "runs" / row["run"] / "endurance_summary.csv")
+        assert len(run) == 1
+        for key in ("avg_pec_per_day", "kv_write_gb_s", "days_to_limit_avg@1e4", "days_to_limit_avg@1e5"):
+            assert number(row[key]) == pytest.approx(number(run[0][key]))
+        assert number(row["days_to_limit_avg@1e4"]) * 10 == pytest.approx(number(row["days_to_limit_avg@1e5"]))
+    meta = json.loads((tmp_path / "sweep" / "runs" / table[0]["run"] / "meta.json").read_text())
+    assert meta["tool"] == "endurance" and meta["argv"][0] == "hbf.endurance"
+
+
+def test_endurance_tool_checks(tmp_path):
+    with pytest.raises(ValueError, match="hbf.endurance long options"):
+        load_grid({"tool": "endurance", "base": {"layout": "striped_contiguous"}})
+    with pytest.raises(ValueError, match="set by the sweep"):
+        load_grid({"tool": "endurance", "base": {"output": "x"}})
+    with pytest.raises(ValueError, match="Unknown tool"):
+        load_grid({"tool": "mqsim"})
+    assert load_grid({"base": {"batch": 2}})["tool"] == "analysis"
+    grid = {"tool": "endurance", "base": {"analytic": True, "no_calibrate": True},
+            "vary": {"workload": ["chat,long32k", "chat"]}}
+    rows = sweep(grid, tmp_path / "sweep")
+    assert rows[0]["status"].startswith("infeasible: the point gives 2 rows")
+    assert rows[1]["status"] == "ok"
+    assert not (tmp_path / "sweep" / "runs" / rows[0]["run"]).exists()

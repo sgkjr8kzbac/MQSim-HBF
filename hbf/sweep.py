@@ -1,8 +1,9 @@
-"""Parameter sweeps of the analysis-only pipeline: ``python -m hbf.sweep GRID.json --output DIR``.
+"""Parameter sweeps of the analysis-only pipeline or the endurance model: ``python -m hbf.sweep GRID.json --output DIR``.
 
 GRID.json::
 
-    {"base": {"topology": "ocp", "model": "llama-3.1-8b", "context": 32768},
+    {"tool": "analysis",
+     "base": {"topology": "ocp", "model": "llama-3.1-8b", "context": 32768},
      "vary": {"batch": [1, 4], "format": ["bf16", "kivi2"]},
      "zip": [{"aggregate_gb_s": 384, "ucie_grade": 1}, {"aggregate_gb_s": 1536, "ucie_grade": 2}],
      "seeds": [11, 12, 13]}
@@ -15,6 +16,13 @@ override ``base``. Every run is parsed and validated by ``hbf.cli`` itself and r
 ``--analysis-only --timing`` in DIR/runs/<index>-<slug>; MQSim never runs. DIR/summary.csv has one
 row per run (see ``summarize_run``); a run whose arguments or layout are rejected (ValueError) is
 recorded as ``infeasible: <message>``.
+
+``"tool": "endurance"`` sweeps ``hbf.endurance`` instead (keys are its long options, e.g.
+``analytic``, ``workload``, ``rd_threshold``). Each point must be one combination of model, format,
+workload, pages per block and X (vary them in the grid rather than as comma lists); a comma list of
+``pe_limit`` is fine and adds one ``days_to_limit_*`` column per limit. The runs share the calibration
+cache DIR/calibration unless the grid sets ``calibration_dir``. The summary has ``hbf.endurance.METRICS``
+plus the ``days_to_limit_*`` columns.
 """
 import argparse
 import csv
@@ -28,15 +36,16 @@ import shutil
 import sys
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .analysis import TIMING_KEYS
 from .cli import build_parser, configure, pipeline
 from .system import write_table
 
 MAX_JOBS = 3
-GRID_KEYS = ("base", "vary", "zip", "seeds")
-RESERVED = ("output", "help", "analysis_only", "timing")  # set by the sweep itself
+GRID_KEYS = ("tool", "base", "vary", "zip", "seeds")
 T_KEYS = tuple(key for key in TIMING_KEYS if key.startswith("t_"))
 STEP_KEYS = ("pages", "rounds", "min_rounds", "channel_rounds", "protocol_rounds", "est_ns", "est_batches_ns",
              "bound_ns") + T_KEYS + ("useful_bytes", "burst_bytes", "hbm_bytes", "attended_tokens",
@@ -50,8 +59,77 @@ METRICS = (STEP_KEYS + ("max_block_reads", "bottleneck") + SYSTEM_KEYS + FIT_KEY
            + WRITE_KEYS)
 
 
+def _analysis_check(args):
+    if args.plane_groups and 1 not in args.plane_groups:
+        raise ValueError("the summary reads plane group 1; include 1 in plane_group")
+
+
+def _analysis_execute(directory, run):
+    pipeline(directory=directory, binary=None, **run)
+    return summarize_run(directory, run["shape"].head_dim)
+
+
+def _endurance():
+    from . import endurance
+    return endurance
+
+
+def _endurance_check(args):
+    pass
+
+
+def _endurance_points(run):
+    """Rows one endurance run writes; the sweep needs exactly one per point."""
+    count = 1
+    for key in ("models", "formats", "workloads", "pages_per_block", "x_values"):
+        count *= len(run.get(key) or [None])
+    return count
+
+
+def _endurance_execute(directory, run):
+    endurance = _endurance()
+    count = _endurance_points(run)
+    if count != 1:
+        raise ValueError(f"the point gives {count} rows; vary model, format, workload, pages_per_block and "
+                         "rd_threshold in the grid instead of comma lists")
+    endurance.run(directory, **run)
+    row = endurance.summarize_run(directory)
+    with (Path(directory) / "endurance_summary.csv").open(newline="") as stream:
+        first = next(csv.DictReader(stream), None) or {}
+    row |= {key: _parse(value) for key, value in first.items() if key.startswith("days_to_limit_")}
+    return row
+
+
+@dataclass(frozen=True)
+class Tool:
+    """One program the sweep can drive: its parser, configuration, run and summary columns."""
+    module: str
+    parser: Callable
+    configure: Callable
+    check: Callable  # extra validation of the parsed arguments
+    execute: Callable  # (directory, configuration) -> summary row
+    metrics: Callable  # () -> summary columns
+    flags: tuple  # appended to every run's arguments
+    reserved: tuple  # options set by the sweep itself
+
+
+TOOLS = {
+    "analysis": Tool("hbf.cli", build_parser, configure, _analysis_check, _analysis_execute, lambda: METRICS,
+                     ("--analysis-only", "--timing"), ("output", "help", "analysis_only", "timing")),
+    "endurance": Tool("hbf.endurance", lambda: _endurance().build_parser(), lambda args: _endurance().configure(args),
+                      _endurance_check, _endurance_execute, lambda: _endurance().METRICS, (), ("output", "help")),
+}
+
+
+def tool_of(grid):
+    name = grid.get("tool") or "analysis"
+    if name not in TOOLS:
+        raise ValueError(f"Unknown tool {name!r}: choose {', '.join(TOOLS)}")
+    return TOOLS[name]
+
+
 def load_grid(text):
-    """Grid from a dict, JSON text or a JSON file, with option names checked against hbf.cli."""
+    """Grid from a dict, JSON text or a JSON file, with option names checked against the tool's parser."""
     if isinstance(text, dict):
         grid = text
     else:
@@ -78,13 +156,14 @@ def load_grid(text):
         raise ValueError(f"Keys in both vary and zip: {', '.join(sorted(set(vary) & zip_keys))}")
     if seeds is not None and "seed" in set(vary) | zip_keys:
         raise ValueError("Give the seed in seeds or in vary/zip, not both")
-    options = build_parser()._option_string_actions
+    tool = tool_of(grid)
+    options = tool.parser()._option_string_actions
     for key in set(base) | set(vary) | zip_keys:
-        if key in RESERVED:
+        if key in tool.reserved:
             raise ValueError(f"{key} is set by the sweep")
         if not isinstance(key, str) or flag(key) not in options:
-            raise ValueError(f"Unknown option {key!r}: use hbf.cli long options with _ for -")
-    return {"base": base, "vary": vary, "zip": zipped, "seeds": seeds}
+            raise ValueError(f"Unknown option {key!r}: use {tool.module} long options with _ for -")
+    return {"tool": grid.get("tool") or "analysis", "base": base, "vary": vary, "zip": zipped, "seeds": seeds}
 
 
 def flag(key):
@@ -213,29 +292,30 @@ def summarize_run(directory, head_dim):
     return row
 
 
-def run_one(task):
-    """Parse, validate and run one analysis-only pipeline; returns (summary row, seconds)."""
+def run_one(task, tool_name="analysis"):
+    """Parse, validate and run one point (analysis-only pipeline or endurance model); returns (row, seconds)."""
     started = time.monotonic()
     index, name, params, varied, output, keep, skip_access = task
+    tool = TOOLS[tool_name]
     directory = output / "runs" / name
     row = {"index": index, "run": name} | {key: cell(value) for key, value in varied.items() if key != "seed"}
-    row |= {"seed": params.get("seed"), "status": "ok"} | dict.fromkeys(METRICS)
-    argv = to_argv(params) + ["--analysis-only", "--timing", "--output", str(directory)]
-    parser = build_parser()
+    row |= {"seed": params.get("seed"), "status": "ok"} | dict.fromkeys(tool.metrics())
+    if tool_name == "endurance" and params.get("calibration_dir") is None:
+        params = params | {"calibration_dir": str(output / "calibration")}  # one cache for the whole sweep
+    argv = to_argv(params) + list(tool.flags) + ["--output", str(directory)]
+    parser = tool.parser()
     parser.error = _raise  # argument errors become ValueError instead of exiting
     try:
         args = parser.parse_args(argv)
         row["seed"] = args.seed
-        if args.plane_groups and 1 not in args.plane_groups:
-            raise ValueError("the summary reads plane group 1; include 1 in plane_group")
-        run = configure(args)
+        tool.check(args)
+        run = tool.configure(args)
     except (OSError, TypeError, ValueError) as error:  # as hbf.cli.main
         row["status"] = _status("infeasible", error)
         return row, time.monotonic() - started
-    saved, sys.argv = sys.argv, ["hbf.cli", *argv]  # meta.json records the run's own arguments
+    saved, sys.argv = sys.argv, [tool.module, *argv]  # meta.json records the run's own arguments
     try:
-        pipeline(directory=directory, binary=None, **run)
-        row |= summarize_run(directory, run["shape"].head_dim)
+        row |= tool.execute(directory, run)
     except ValueError as error:
         row["status"] = _status("infeasible", error)
     except Exception as error:  # keep the sweep going; reported at the end
@@ -255,6 +335,7 @@ def sweep(grid, output, jobs=1, keep=True, skip_access=False, progress=None):
     if type(jobs) is not int or not 1 <= jobs <= MAX_JOBS:
         raise ValueError(f"jobs must be 1 to {MAX_JOBS}")
     grid = load_grid(grid)
+    tool = tool_of(grid)
     runs = expand(grid)
     output = Path(output)
     if (output / "runs").exists() or (output / "summary.csv").exists():
@@ -274,12 +355,12 @@ def sweep(grid, output, jobs=1, keep=True, skip_access=False, progress=None):
 
     if jobs == 1:
         for task in tasks:
-            record(run_one(task))
+            record(run_one(task, grid["tool"]))
     else:
         # A killed worker (e.g. out of memory) breaks the pool; the unfinished runs are then recorded
         # as errors instead of waiting forever.
         with ProcessPoolExecutor(jobs, mp_context=multiprocessing.get_context("spawn")) as pool:
-            futures = {pool.submit(run_one, task): task for task in tasks}
+            futures = {pool.submit(run_one, task, grid["tool"]): task for task in tasks}
             for future in as_completed(futures):
                 try:
                     record(future.result())
@@ -289,7 +370,9 @@ def sweep(grid, output, jobs=1, keep=True, skip_access=False, progress=None):
                     record((row | {key: cell(value) for key, value in varied.items() if key != "seed"}, 0.0))
     rows.sort(key=lambda row: row["index"])
     varied_keys = list(dict.fromkeys(key for _, varied in runs for key in varied if key != "seed"))
-    fields = ["index", "run", *varied_keys, "seed", "status", *METRICS]
+    metrics = tuple(tool.metrics())
+    extras = sorted({key for row in rows for key in row if key.startswith("days_to_limit_")} - set(metrics))
+    fields = ["index", "run", *varied_keys, "seed", "status", *metrics, *extras]
     rows = [{key: row.get(key) for key in fields} for row in rows]
     write_table(output / "summary.csv", rows)
     if not keep and not any((output / "runs").iterdir()):
@@ -299,7 +382,8 @@ def sweep(grid, output, jobs=1, keep=True, skip_access=False, progress=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m hbf.sweep",
-                                     description="Run a grid of analysis-only pipelines and summarize them.")
+                                     description="Run a grid of analysis-only pipelines (or endurance-model runs, "
+                                                 "\"tool\": \"endurance\") and summarize them.")
     parser.add_argument("grid", help="GRID.json file or JSON text")
     parser.add_argument("--output", type=Path, required=True, help="new sweep directory")
     parser.add_argument("--jobs", type=int, default=1, help=f"worker processes (1-{MAX_JOBS}, default 1)")

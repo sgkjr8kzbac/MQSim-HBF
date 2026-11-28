@@ -66,4 +66,5 @@ git push origin claude/hbf-kv-study
 
 | 日期 | 原因 | 需要重跑 |
 |---|---|---|
-| 第 2 阶段 B（一）开始 | 新增分配方式、写入干扰、寿命解析模型；M2 审查修复 | `tests`、`placement`、`interference`、`endurance` |
+| 第 2 阶段 B（一）开始 | 新增分配方式、写入干扰、寿命解析模型；M2 审查修复 | `tests`、`placement`、`interference`、`endurance`（已完成，提交 `fb9631d`） |
+| T-B7、T-B2 之后 | `dedicated`、`packed` 默认错开各请求的起点（`--align stagger`），读并行度会变；扫描脚本新增 `"tool": "endurance"` | `placement`、`tests` |
