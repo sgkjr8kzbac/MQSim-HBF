@@ -267,3 +267,190 @@ def test_partitioned_striped_intra_uses_partition_banks():
             # The 16 regions (8 heads x 2 tensors) of layer 0 start on distinct banks inside the partition.
             starts = layout.snapshot.table[0, 0, :, :, 0].ravel()
             assert len({cfg.unit(int(lpa)) for lpa in starts}) == min(16, banks)
+
+
+def test_k7_hybrid_swa_class_frontiers_and_stranded_pages():
+    # K7 acceptance test: hybrid LLLLLG (5 local with window=1024 on HBF + 1 global), 8 heads, BF16,
+    # 1 request, prompt=32,768 + 4,096 generated -> dead local pages = 5 * 8 * 2 * (4096 // 16) = 20,480.
+    from hbf.kvspec import parse_kvspec
+    kv_spec = parse_kvspec("hybrid:pattern=LLLLLG,window=1024,local_tier=hbf", 6, 8, 32768 + 4096)
+    shape = Shape(6, 8, 128, 1)
+
+    # With ppb=8 (segment = 8,192 pages): single frontier mixes local and global pages in every segment
+    # (all 20,480 dead pages stranded); class frontiers isolate short-lived local pages so at most one
+    # open short-lived segment (4,096 < 8,192) is stranded.
+    cfg8 = load("ocp", pages_per_block=8)
+    for allocation in ("packed", "dedicated"):
+        single = PageTableLayout(cfg8, shape, batch(allocation, [(32768, 4096)], intra="layer_contiguous",
+                                                    frontiers="single", kv_spec=kv_spec))
+        classed = PageTableLayout(cfg8, shape, batch(allocation, [(32768, 4096)], intra="layer_contiguous",
+                                                     frontiers="class", kv_spec=kv_spec))
+        s_chk = check_write_order(cfg8, single.snapshot)
+        c_chk = check_write_order(cfg8, classed.snapshot)
+        assert s_chk["legal"] and c_chk["legal"]
+        assert single.snapshot.dead_pages == 20480 and single.snapshot.stranded_pages == 20480
+        assert s_chk["dead_pages"] == 20480 and s_chk["stranded_pages"] == 20480
+        assert classed.snapshot.dead_pages == 20480
+        assert classed.snapshot.stranded_pages == 4096 < 8 * cfg8.units
+        assert classed.snapshot.reclaimable_segments == 2
+        assert c_chk["dead_pages"] == 20480 and c_chk["stranded_pages"] == 4096
+
+    # Small ppb where 20,480 is an exact multiple of segment size -> 0 stranded under class frontiers.
+    for ppb in (2, 4):
+        cfg_small = load("ocp", pages_per_block=ppb)
+        seg_size = ppb * cfg_small.units
+        classed = PageTableLayout(cfg_small, shape, batch("packed", [(32768, 4096)], intra="layer_contiguous",
+                                                          frontiers="class", kv_spec=kv_spec))
+        assert classed.snapshot.dead_pages == 20480 and classed.snapshot.stranded_pages == 0
+        assert classed.snapshot.reclaimable_segments == 20480 // seg_size
+        assert check_write_order(cfg_small, classed.snapshot)["legal"]
+
+    # Channel partition (64 banks) at realistic ppb=256 -> segment = 16,384 pages.
+    cfg_ch = load("ocp", pages_per_block=256)
+    ch_single = PageTableLayout(cfg_ch, shape, batch("packed", [(32768, 4096)], partition="channel",
+                                                     intra="layer_contiguous", frontiers="single", kv_spec=kv_spec))
+    ch_class = PageTableLayout(cfg_ch, shape, batch("packed", [(32768, 4096)], partition="channel",
+                                                    intra="layer_contiguous", frontiers="class", kv_spec=kv_spec))
+    assert ch_single.snapshot.dead_pages == 20480 and ch_single.snapshot.stranded_pages == 20480
+    assert ch_class.snapshot.dead_pages == 20480 and ch_class.snapshot.stranded_pages == 4096 < 64 * 256
+    assert ch_class.snapshot.reclaimable_segments == 1
+
+    # Read path at snapshot (ctx=36,864): 5 local layers read 1,024 pages each, global layer reads 36,864.
+    rows, _ = analyze_accesses(cfg8, classed, list(generate_batch(cfg8, classed, "dense")), timing=True)
+    assert [row["pages"] for row in rows] == [1024, 1024, 1024, 1024, 1024, 36864]
+    assert classed.request_bytes(cfg8)["kv_bytes_per_request"] == (5 * 1024 + 36864) * cfg8.page_bytes
+
+
+def test_k7_shared_prefix_aliasing_and_reads():
+    # K7 acceptance test: 4 requests sharing an 8,192-token prefix (1 layer, 8 heads, BF16):
+    # 8 * 2 * (8192 / 16) = 8,192 prefix pages written once instead of 32,768, and read once per step
+    # when coalesced.
+    cfg = load("ocp")
+    shape = Shape(1, 8, 128, 1)
+    for allocation in ("packed", "dedicated", "layer_major", "vllm_pool"):
+        spec = batch(allocation, [(8192, 0)] * 4, intra="layer_contiguous", align="row",
+                     prefix_tokens=8192, prefix_groups=1, prefix_reads="coalesced")
+        layout = PageTableLayout(cfg, shape, spec)
+        assert layout.snapshot.prefix_pages == 8192
+        assert layout.snapshot.kinds["prefill"] == 8192
+        for r in range(1, 4):
+            assert np.array_equal(layout.snapshot.table[r], layout.snapshot.table[0])
+        (row,), (step_row,) = analyze_accesses(cfg, layout, list(generate_batch(cfg, layout, "dense")), timing=True)
+        assert row["pages"] == 8192 and row["rounds"] == 8
+        assert row["attended_tokens"] == 4 * 8 * 8192
+        assert step_row["max_block_reads"] == 8
+        if allocation in ("packed", "dedicated"):
+            assert check_write_order(cfg, layout.snapshot)["legal"]
+
+    # per_request mode: prefix still written ONCE (8,192), but read 4x per step (32,768 pages, 32 rounds)
+    # on the same banks.
+    per_req = PageTableLayout(cfg, shape, batch("packed", [(8192, 0)] * 4, intra="layer_contiguous", align="row",
+                                                prefix_tokens=8192, prefix_groups=1, prefix_reads="per_request"))
+    assert per_req.snapshot.prefix_pages == 8192 and per_req.snapshot.kinds["prefill"] == 8192
+    assert check_write_order(cfg, per_req.snapshot)["legal"]
+    (row_pr,), (step_pr,) = analyze_accesses(cfg, per_req, list(generate_batch(cfg, per_req, "dense")), timing=True)
+    assert row_pr["pages"] == 32768 and row_pr["rounds"] == 32
+    assert row_pr["attended_tokens"] == 4 * 8 * 8192
+    assert step_pr["max_block_reads"] == 32
+    # Decode works for virtual per-request LPAs as well.
+    lpa_r2 = per_req.lpa(0, 2 * 8 + 3, 0, 5)
+    assert per_req.decode(lpa_r2) == (0, 2 * 8 + 3, 0, 5)
+
+    # 2 prefix groups across 4 requests -> 2 * 8,192 = 16,384 prefix pages written & coalesced-read.
+    two_grp = PageTableLayout(cfg, shape, batch("packed", [(8192, 0)] * 4, intra="layer_contiguous", align="row",
+                                                prefix_tokens=8192, prefix_groups=2))
+    assert two_grp.snapshot.prefix_pages == 16384 and two_grp.snapshot.kinds["prefill"] == 16384
+    assert np.array_equal(two_grp.snapshot.table[0], two_grp.snapshot.table[2])
+    assert np.array_equal(two_grp.snapshot.table[1], two_grp.snapshot.table[3])
+    assert not np.array_equal(two_grp.snapshot.table[0], two_grp.snapshot.table[1])
+    (row_g2,), _ = analyze_accesses(cfg, two_grp, list(generate_batch(cfg, two_grp, "dense")))
+    assert row_g2["pages"] == 16384
+
+    # Prefix + suffix + decode + unequal prompts across allocations.
+    for allocation in ("packed", "dedicated", "vllm_pool", "layer_major"):
+        mixed = PageTableLayout(cfg, shape, batch(allocation, [(4096, 256), (10240, 128)],
+                                                  intra="layer_contiguous", align="row",
+                                                  prefix_tokens=8192, prefix_groups=1))
+        # Group prefix is 8,192 (max shared across members): written once (8,192 pages).
+        # r0 shares 4,096 (0 suffix), r1 shares 8,192 (2,048 suffix -> 2,048 pages).
+        assert mixed.snapshot.prefix_pages == 8192
+        assert mixed.snapshot.kinds["prefill"] == 8192 + 2048
+        assert mixed.snapshot.kinds["decode"] == 8 * 2 * (256 // 16 + 128 // 16)
+        # r0's generated blocks [256..271] must NOT collide with r1's prefix blocks [256..511].
+        r0_gen = set(mixed.snapshot.table[0, 0, :, :, 256:272].ravel().tolist())
+        r1_pref = set(mixed.snapshot.table[1, 0, :, :, 256:512].ravel().tolist())
+        assert r0_gen.isdisjoint(r1_pref)
+        if allocation in ("packed", "dedicated"):
+            assert check_write_order(cfg, mixed.snapshot)["legal"]
+
+
+def test_k7_sliding_age_ladder_and_grouped_presets():
+    from hbf.access import TensorSpec
+    from hbf.kvspec import parse_kvspec
+
+    # Age-based re-quantization ladder without kv_spec: int4 (-4096, -128) is short-lived, int2 (0, -4096) long-lived.
+    cfg = load("ocp", pages_per_block=2)
+    ladder = (
+        TensorSpec("K_int4", 4, 128, window=(-4096, -128)),
+        TensorSpec("V_int4", 4, 128, window=(-4096, -128)),
+        TensorSpec("K_int2", 2, 128, window=(0, -4096)),
+        TensorSpec("V_int2", 2, 128, window=(0, -4096)),
+    )
+    shape = Shape(4, 8, 128, 1)
+    # prompt=8192, generated=4096: int4 (tpp=64) loses 4096/64 = 64 blocks * 4 layers * 8 heads * 2 tensors = 4,096 pages.
+    s_lad = PageTableLayout(cfg, shape, batch("packed", [(8192, 4096)], intra="layer_contiguous", frontiers="single"),
+                            tensors=ladder)
+    c_lad = PageTableLayout(cfg, shape, batch("packed", [(8192, 4096)], intra="layer_contiguous", frontiers="class"),
+                            tensors=ladder)
+    assert s_lad.snapshot.dead_pages == 4096 and c_lad.snapshot.dead_pages == 4096
+    assert c_lad.snapshot.stranded_pages < s_lad.snapshot.stranded_pages
+    assert c_lad.snapshot.stranded_pages <= 2 * cfg.units
+    assert check_write_order(cfg, c_lad.snapshot)["legal"]
+
+    # DuoAttention (head split): 4 retrieval heads (long-lived) + 4 streaming heads (sink + sliding recent on HBF).
+    duo = parse_kvspec("duo:retrieval=0.5,sink=64,recent=256,streaming_tier=hbf", 4, 8, 4096 + 1024)
+    duo_layout = PageTableLayout(cfg, shape, batch("packed", [(4096, 1024)], intra="layer_contiguous",
+                                                   frontiers="class", kv_spec=duo))
+    # Dead recent pages: 4 layers * 4 streaming heads * 2 tensors * (1024 / 16) = 2,048.
+    assert duo_layout.snapshot.dead_pages == 2048
+    assert duo_layout.snapshot.stranded_pages == 0
+    assert check_write_order(cfg, duo_layout.snapshot)["legal"]
+    rows, _ = analyze_accesses(cfg, duo_layout, list(generate_batch(cfg, duo_layout, "dense")))
+    # Per layer: 4 retrieval heads * 2 * (5120/16) + 4 sink * 2 * 4 + 4 recent * 2 * 16 = 2560 + 32 + 128 = 2720 pages.
+    assert [row["pages"] for row in rows] == [2720] * 4
+
+    # CLA (cross-layer aliasing, share=2, reuse=hbf): 4 layers, 2 owners -> writes half, reads all 4.
+    cla = parse_kvspec("cla:share=2,reuse=hbf", 4, 8, 2048)
+    cla_layout = PageTableLayout(cfg, shape, batch("packed", [(2048, 0)], intra="layer_contiguous", kv_spec=cla))
+    assert cla_layout.snapshot.kinds["prefill"] == 2 * 8 * 2 * 128
+    assert np.array_equal(cla_layout.snapshot.table[0, 1], cla_layout.snapshot.table[0, 0])
+    assert np.array_equal(cla_layout.snapshot.table[0, 3], cla_layout.snapshot.table[0, 2])
+    rows, _ = analyze_accesses(cfg, cla_layout, list(generate_batch(cfg, cla_layout, "dense")))
+    assert [row["pages"] for row in rows] == [8 * 2 * 128] * 4
+
+    # SSM hybrid: 3 SSM layers (HBM state only, 0 HBF pages) + 1 attention layer.
+    ssm = parse_kvspec("ssm:pattern=SSSA,state=1048576", 4, 8, 1024)
+    ssm_layout = PageTableLayout(cfg, shape, batch("packed", [(1024, 0)], intra="layer_contiguous", kv_spec=ssm))
+    rows, _ = analyze_accesses(cfg, ssm_layout, list(generate_batch(cfg, ssm_layout, "dense")), timing=True)
+    assert [row["pages"] for row in rows] == [0, 0, 0, 8 * 2 * 64]
+    assert [row["hbm_bytes"] for row in rows] == [1048576, 1048576, 1048576, 0]
+
+
+def test_k7_batch_spec_defaults_and_validation():
+    from hbf.kvspec import parse_kvspec
+    assert batch("layer_major", [(2048, 0)] * 2).default
+    assert not batch("layer_major", [(2048, 0)] * 2, prefix_tokens=512).default
+    assert not batch("packed", [(2048, 0)], frontiers="class").default
+    kv = parse_kvspec("hybrid:pattern=LG,window=256,local_tier=hbf", 2, 8, 2048)
+    assert not batch("layer_major", [(2048, 0)], kv_spec=kv).default
+
+    for kwargs in (
+        {"allocation": "packed", "frontiers": "invalid"},
+        {"allocation": "layer_major", "frontiers": "class"},
+        {"allocation": "vllm_pool", "frontiers": "class"},
+        {"allocation": "packed", "prefix_tokens": -1},
+        {"allocation": "packed", "prefix_groups": 0},
+        {"allocation": "packed", "prefix_reads": "bad"},
+    ):
+        with pytest.raises(ValueError):
+            BatchSpec((BatchRequest(1024, 0),), **kwargs)

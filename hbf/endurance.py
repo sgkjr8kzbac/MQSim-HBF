@@ -109,6 +109,54 @@ class Geometry:
             total += self._tokens(spec, ctx) // tpp
         return self.layers * self.heads * total
 
+    @staticmethod
+    def _raw_bounds(spec, ctx):
+        ctx = np.asarray(ctx, dtype=np.int64)
+        upper = np.maximum(ctx, 0)
+        if spec.window is None:
+            return np.zeros_like(upper), upper
+        lo_s, hi_s = spec.window
+        lo = np.zeros_like(ctx) if lo_s is None else (ctx + lo_s if lo_s < 0 else np.full_like(ctx, lo_s))
+        hi = ctx.copy() if hi_s is None else (ctx + hi_s if hi_s < 0 else np.full_like(ctx, hi_s))
+        lo = np.clip(lo, 0, upper)
+        hi = np.clip(hi, 0, upper)
+        return np.minimum(lo, hi), hi
+
+    def written_pages(self, c0, c1):
+        """Full HBF pages written as context grows from ``c0`` to ``c1`` (``c1 >= c0``).
+
+        For non-sliding windows (``lo is None`` or ``lo >= 0``) this equals
+        ``stored_pages(c1) - stored_pages(c0)``. For sliding windows (``lo < 0``) admission
+        (``c0 <= 0``) writes ``(hi(c1) - lo(c1)) // tpp`` while decode (``c0 > 0``) writes every
+        page entering ``hi`` even though ``stored_pages`` stays constant.
+        """
+        c0 = np.asarray(c0, dtype=np.int64)
+        c1 = np.asarray(c1, dtype=np.int64)
+        total = np.zeros(np.broadcast_shapes(c0.shape, c1.shape), dtype=np.int64)
+        for spec, tpp in zip(self.hbf, self.tpp):
+            if spec.window is not None and spec.window[0] is not None and spec.window[0] < 0:
+                lo0, hi0 = self._raw_bounds(spec, c0)
+                lo1, hi1 = self._raw_bounds(spec, c1)
+                admit = (hi1 - lo1) // tpp
+                grow = np.maximum(0, hi1 // tpp - hi0 // tpp)
+                total += np.where(c0 <= 0, admit, grow)
+            else:
+                total += np.maximum(0, self._tokens(spec, c1) // tpp - self._tokens(spec, c0) // tpp)
+        return self.layers * self.heads * total
+
+    def dead_pages(self, c0, c1):
+        """Full HBF pages that die (slide out of window) as context grows from ``c0`` to ``c1``."""
+        c0 = np.asarray(c0, dtype=np.int64)
+        c1 = np.asarray(c1, dtype=np.int64)
+        total = np.zeros(np.broadcast_shapes(c0.shape, c1.shape), dtype=np.int64)
+        for spec, tpp in zip(self.hbf, self.tpp):
+            if spec.window is not None and spec.window[0] is not None and spec.window[0] < 0:
+                lo0, _ = self._raw_bounds(spec, c0)
+                lo1, _ = self._raw_bounds(spec, c1)
+                died = np.maximum(0, lo1 // tpp - lo0 // tpp)
+                total += np.where(c0 <= 0, 0, died)
+        return self.layers * self.heads * total
+
     def per_request_row_pages(self, ctx, role_share=None):
         """Pages one layer senses per step (ceil) for each request in ``ctx``, scaled per role."""
         ctx = np.asarray(ctx, dtype=np.int64)
@@ -165,10 +213,20 @@ class Geometry:
                 "attended_elements": h * elements, "hbf_elements": h * hbf_elements, "dequant_ops": h * dequant}
 
 
-def geometry_for(model, kv_format=None, page_bytes=4096):
-    from .formats import parse_format
-    fmt = parse_format(kv_format or "bf16", model.head_dim, model.q_heads // model.kv_heads)
-    return Geometry(model.layers, model.kv_heads, fmt.tensors, page_bytes), fmt
+def geometry_for(model, kv_format=None, page_bytes=4096, *, kv_spec=None, context=32768, local_tier="hbm"):
+    if kv_spec is None and not model.layer_pattern and model.attention == "gqa":
+        from .formats import parse_format
+        fmt = parse_format(kv_format or "bf16", model.head_dim, model.q_heads // model.kv_heads)
+        return Geometry(model.layers, model.kv_heads, fmt.tensors, page_bytes), fmt
+    from .kvspec import KVSpec, from_model, parse_kvspec, resolve_format
+    fmt = resolve_format(model, kv_format or "bf16")
+    if kv_spec is None:
+        spec = from_model(model, fmt, local_tier=local_tier)
+    elif isinstance(kv_spec, KVSpec):
+        spec = kv_spec
+    else:
+        spec = parse_kvspec(kv_spec, model.layers, model.kv_heads, context)
+    return spec.geometry(model.layers, model.kv_heads, fmt.tensors, page_bytes), fmt
 
 
 # --------------------------------------------------------------------------------------------
@@ -179,11 +237,12 @@ class StepTime:
     tpot_ns: float
     gpu_ns: float
     hbm_tpot_ns: float
-    h_ns: float  # HBF read time of one layer
+    h_ns: float  # HBF read time of one layer (mean across layers for heterogeneous specs)
     gaps_ns: tuple  # HBF-idle time before each layer's read (sums to tpot - layers x h)
-    read_pages: float  # pages one layer senses
+    read_pages: float  # pages one layer senses (mean across layers for heterogeneous specs)
     rounds: int
     batch: int
+    layer_rounds: tuple = ()
 
 
 class Clock:
@@ -222,6 +281,53 @@ class Clock:
         geo, r = self.geometry, self.ratios
         hbf_ctx = ctx if hbm_tokens is None else ctx - np.asarray(hbm_tokens, dtype=np.int64)
         share = r.get("pages", 1.0)
+        scale = {"burst_bytes": "burst", "hbm_bytes": "hbm", "attended_tokens": "attended",
+                 "attended_elements": "elements", "hbf_elements": "elements", "dequant_ops": "dequant"}
+        if hasattr(geo, "layer_row_pages"):
+            per_req_layers = geo.per_request_layer_row_pages(hbf_ctx) * share
+            layer_pages = per_req_layers.sum(axis=1)
+            if partitions is not None and partition_banks:
+                parts = np.asarray(partitions, dtype=np.int64)
+                layer_rounds = tuple(
+                    math.ceil(self.balance * float(np.bincount(parts, weights=per_req_layers[l]).max())
+                              / partition_banks - 1e-9) if layer_pages[l] > 0 else 0
+                    for l in range(self.model.layers)
+                )
+            else:
+                layer_rounds = tuple(
+                    math.ceil(self.balance * float(layer_pages[l]) / self.banks - 1e-9) if layer_pages[l] > 0 else 0
+                    for l in range(self.model.layers)
+                )
+            layer_demands = [
+                {key: value * r.get(scale[key], 1.0) for key, value in ld.items()}
+                for ld in geo.layer_demand(hbf_ctx, None if hbm_tokens is None else hbm_tokens)
+            ]
+            d_sig = tuple(
+                int(round(math.log1p(val) * 200))
+                for k in sorted(scale)
+                for val in (sum(ld[k] for ld in layer_demands), max(ld[k] for ld in layer_demands))
+            )
+            key = ("L", b, layer_rounds, d_sig)
+            hit = self.cache.get(key)
+            if hit is not None:
+                return hit
+            from .system import evaluate
+            h = [self.layer_ns + self.round_ns * r_l if r_l else 0.0 for r_l in layer_rounds]
+            rows = [{"step": 0, "layer": l, "est_ns": h[l], "bound_ns": layer_rounds[l] * self.read_ns}
+                    | layer_demands[l] for l in range(self.model.layers)]
+            meta = {"batch": b * self.stacks, "stacks": self.stacks, "analysis_batch": b, "selection": self.selection,
+                    "kv_format": self.kv_format}
+            result = evaluate(rows, self.model, self.gpu, self.options, meta)
+            row, layers = result.steps[0], result.layers
+            attn = [x["attn_staged_ns" if self.options.staged else "attn_ns"] for x in layers]
+            gaps = hbf_gaps(h, [x["pre_ns"] for x in layers], attn, [x["post_ns"] for x in layers],
+                            self.options.overlap, self.options.staged)
+            gaps[0] += max(0.0, row["tpot_hbf_est_ns"] - sum(h) - sum(gaps))
+            out = StepTime(row["tpot_hbf_est_ns"], row["gpu_ns"], row["tpot_hbm_ns"],
+                           sum(h) / len(h), tuple(gaps), float(layer_pages.mean()),
+                           max(layer_rounds) if layer_rounds else 0, b, layer_rounds)
+            self.cache[key] = out
+            return out
         per_req = geo.per_request_row_pages(hbf_ctx) * share
         pages = float(per_req.sum())
         if partitions is not None and partition_banks:
@@ -233,8 +339,6 @@ class Clock:
         else:
             rounds = math.ceil(self.balance * pages / self.banks - 1e-9)
         d = geo.demand(hbf_ctx, None if hbm_tokens is None else hbm_tokens)
-        scale = {"burst_bytes": "burst", "hbm_bytes": "hbm", "attended_tokens": "attended",
-                 "attended_elements": "elements", "hbf_elements": "elements", "dequant_ops": "dequant"}
         d = {key: value * r.get(scale[key], 1.0) for key, value in d.items()}
         key = (b, rounds) + tuple(int(round(math.log1p(d[k]) * 200)) for k in sorted(d))
         hit = self.cache.get(key)
@@ -322,12 +426,14 @@ def _csv(path):
 
 
 def phase_a(directory, model, gpu, kv_format, batch, context, *, mode="dense", generation=None, device=(),
-            alloc="layer_major", partition="none"):
+            alloc="layer_major", partition="none", kv_spec=None):
     """Run one analysis-only phase A pipeline (``hbf.cli``) into ``directory``; returns its CSV rows."""
     from .cli import build_parser, configure, pipeline
     argv = HBF_FLAGS + ["--layout", "striped_contiguous", "--model", model, "--gpu", gpu,
                         "--format", kv_format or "bf16", "--mode", mode, "--context", str(context),
                         "--batch", str(batch), "--analysis-only", "--timing", "--output", str(directory)]
+    if kv_spec:
+        argv += ["--kv-spec", kv_spec]
     for key, value in (generation or {}).items():
         argv += [f"--{key.replace('_', '-')}", str(value)]
     argv += list(device)
@@ -345,17 +451,22 @@ def phase_a(directory, model, gpu, kv_format, batch, context, *, mode="dense", g
             "system": _csv(directory / "system_steps.csv")}
 
 
-def calibration_batches(model, kv_format, context, rounds=(32, 128), limit=256):
+def calibration_batches(model, kv_format, context, rounds=(32, 128), limit=256, kv_spec=None):
     """Batches whose dense layer-major runs read about ``rounds`` rounds per layer (the F1 fit range)."""
     from .model import load_model
-    geometry, _ = geometry_for(load_model(model), kv_format)
-    pages = geometry.row_pages(np.array([context]))
+    geometry, _ = geometry_for(load_model(model), kv_format, kv_spec=kv_spec, context=context)
+    if hasattr(geometry, "layer_row_pages"):
+        pages = float(geometry.layer_row_pages(np.array([context])).max())
+    else:
+        pages = geometry.row_pages(np.array([context]))
+    if pages <= 0:
+        return 1, 2
     low = min(limit - 1, max(1, math.ceil(rounds[0] * 1024 / pages)))
     return low, min(limit, max(low + 1, math.ceil(rounds[1] * 1024 / pages)))
 
 
 def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", generation=None, context=32768,
-              batches=None, device=(), policy="packed", partition="none", snapshot_batch=None):
+              batches=None, device=(), policy="packed", partition="none", snapshot_batch=None, kv_spec=None):
     """Fit the Clock to at most three phase A analysis-only runs, cached by a hash of the inputs.
 
     Two dense layer-major points (``batches``; default about 32 and 128 rounds per layer, see
@@ -368,10 +479,12 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
     Returns the fields for ``Clock`` plus diagnostics. Safe for concurrent processes sharing
     ``directory`` (an exclusive lock per digest).
     """
-    batches = tuple(batches or calibration_batches(model, kv_format, context))
+    batches = tuple(batches or calibration_batches(model, kv_format, context, kv_spec=kv_spec))
     inputs = {"model": model, "gpu": gpu, "format": kv_format, "mode": mode, "generation": generation or {},
               "context": context, "batches": list(batches), "device": list(device), "policy": policy,
               "partition": partition, "snapshot_batch": snapshot_batch, "version": 3}
+    if kv_spec:
+        inputs["kv_spec"] = kv_spec
     digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]
     root = Path(directory) / f"calib-{digest}"
     cached = root / "calibration.json"
@@ -384,7 +497,7 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
         if cached.is_file():
             return json.loads(cached.read_text())
         result = _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, context, batches, device,
-                                  policy, partition, snapshot_batch)
+                                  policy, partition, snapshot_batch, kv_spec)
         temporary = root / f".calibration-{os.getpid()}.json"
         temporary.write_text(json.dumps(result, indent=2) + "\n")
         os.replace(temporary, cached)
@@ -408,9 +521,10 @@ def _exclusive(path):
 
 
 def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, context, batches, device, policy,
-                     partition, snapshot_batch):
+                     partition, snapshot_batch, kv_spec=None):
     """The phase A runs and fits of ``calibrate`` (called with the cache lock held)."""
     import shutil
+    from .model import load_model
 
     def fresh(name):
         target = root / name
@@ -420,7 +534,7 @@ def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, cont
 
     points, dense = [], {}
     for b in batches:
-        dense[b] = phase_a(fresh(f"dense-b{b}"), model, gpu, kv_format, b, context, device=device)
+        dense[b] = phase_a(fresh(f"dense-b{b}"), model, gpu, kv_format, b, context, device=device, kv_spec=kv_spec)
         points += [(row["rounds"], row["est_ns"]) for row in dense[b]["layers"] if row["pages"]]
     rounds = np.array([point[0] for point in points], dtype=float)
     est = np.array([point[1] for point in points], dtype=float)
@@ -431,15 +545,16 @@ def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, cont
         layer_ns = F1["layer_ns"]
         round_ns = float(np.sum(rounds * (est - layer_ns)) / np.sum(rounds * rounds))
     b = snapshot_batch or max(batches)
+    grouped = bool(kv_spec or load_model(model).layer_pattern)
     snap_policy = {"hbm_decode": "packed"}.get(policy, policy)
-    snap_policy = snap_policy if snap_policy in ("packed", "dedicated", "vllm_pool") else "layer_major"
+    snap_policy = snap_policy if (not grouped and snap_policy in ("packed", "dedicated", "vllm_pool")) else "layer_major"
     snap_part = partition if snap_policy in ("packed", "dedicated") else "none"
     if mode == "dense" and snap_policy == "layer_major" and b in dense:
         snapshot = dense[b]
     else:
         snapshot = phase_a(fresh(f"snapshot-{mode}-{snap_policy}-{snap_part}-b{b}"), model, gpu, kv_format, b,
                            context, mode=mode, generation=generation, device=device, alloc=snap_policy,
-                           partition=snap_part)
+                           partition=snap_part, kv_spec=kv_spec)
     kappas = []
     for row in snapshot["layers"]:
         if not row["pages"]:
@@ -510,9 +625,20 @@ class Device:
 
 
 def prefill_tok_s(model, gpu, tokens):
-    """Analytic prefill rate: FLOP/token = 2P + 2 L (q_heads d_h) S at the GPU's compute_eff (params.md section 6)."""
-    params = model.layers * model.layer_params + model.embedding_params
-    return gpu.flops / (2 * params + 2 * model.layers * model.q_heads * model.head_dim * max(tokens, 1))
+    """Analytic prefill rate: FLOP/token = 2P + attn_flops(S) at the GPU's compute_eff (params.md section 6)."""
+    s = max(tokens, 1)
+    if not model.experts and not model.layer_pattern and model.attention == "gqa":
+        params = model.layers * model.layer_params + model.embedding_params
+        return gpu.flops / (2 * params + 2 * model.layers * model.q_heads * model.head_dim * s)
+    params = model.active_params if model.experts else model.total_params
+    attn_per_tok = 0
+    for layer in range(model.layers):
+        kind = model.layer_kind(layer)
+        if kind == "S":
+            continue
+        span = min(s, model.window) if kind == "L" else s
+        attn_per_tok += model.q_heads * model.default_attn_dims * span
+    return gpu.flops / (2 * params + attn_per_tok)
 
 
 def threshold_steps(x, ppb, share=1.0, hot=1.0):
@@ -547,6 +673,19 @@ def _pages(geometry, tokens):
     return float(geometry.stored_pages(np.array([int(round(tokens))]))[0])
 
 
+def _written(geometry, c0, c1):
+    c0_i, c1_i = int(round(c0)), int(round(c1))
+    if hasattr(geometry, "written_pages"):
+        return float(geometry.written_pages(np.array([c0_i]), np.array([c1_i]))[0])
+    return max(0.0, _pages(geometry, c1_i) - _pages(geometry, c0_i))
+
+
+def _dead(geometry, c0, c1):
+    if not hasattr(geometry, "dead_pages"):
+        return 0.0
+    return float(geometry.dead_pages(np.array([int(round(c0))]), np.array([int(round(c1))]))[0])
+
+
 def analytic(geometry, clock, workload, device=None, *, policy="packed", x_values=(1e6,), pe_limits=(1e4, 1e5, 1e6),
              share=1.0, hot=1.0, retention_s=86400.0, prefix_reads="per_request", t_prog=100000.0,
              t_bers=1000000.0, m5="gaps", suspend_ns=None, block_unit="die", stacks=1, align="row", region=None):
@@ -571,7 +710,8 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
         raise ValueError(f"m5 must be one of {', '.join(M5_MODES + ('off',))}")
     page, ppb = device.page_bytes, device.pages_per_block
     seg_banks, seg_pages, capacity = device.segment_banks, device.segment_pages, device.capacity_pages
-    rho = ppb * share * hot
+    read_mult = float(getattr(geometry, "read_multiplier", 1.0))
+    rho = ppb * share * hot * read_mult
     w = workload
     n_in, n_out = w.input.mean(), w.output.mean()
     sessions = w.sessions
@@ -615,14 +755,19 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
 
     # Chunks of one request (or session): (pages, cause, block reads over the chunk's life, life in s).
     chunks = []
+    dead_total = 0.0
     if sessions:
         history = 0.0
         for k in range(calls):
             fresh = h0 + n_in if k == 0 else n_in
-            pre = _pages(geometry, history + fresh) - _pages(geometry, history)
-            dec = _pages(geometry, history + fresh + n_out) - _pages(geometry, history + fresh)
+            pre = (min(_written(geometry, history, history + fresh), _pages(geometry, history + fresh))
+                   if history > 0 else _written(geometry, 0, fresh))
+            dec = _written(geometry, history + fresh, history + fresh + n_out)
+            if history > 0:
+                dead_total += _dead(geometry, history, history + fresh)
+            dead_total += _dead(geometry, history + fresh, history + fresh + n_out)
             later = calls - 1 - k
-            reads = (later + 1) * n_out * rho + later * ppb
+            reads = (later + 1) * n_out * rho + later * ppb * read_mult
             life = (later + 1) * (call_s + w.think_s) + w.retain_s
             chunks.append((pre, "prefill", reads, life))
             if not hbm_out:
@@ -630,22 +775,31 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
             history += fresh + n_out
     else:
         hit = w.prefix_share
-        own = hit * (_pages(geometry, prefix + n_in) - _pages(geometry, prefix)) + (1 - hit) * _pages(geometry, n_in)
-        full = (hit * (_pages(geometry, prefix + n_in + n_out) - _pages(geometry, prefix))
-                + (1 - hit) * _pages(geometry, n_in + n_out))
+        pre_hit = (min(_written(geometry, prefix, prefix + n_in), _pages(geometry, prefix + n_in))
+                   if hit else 0.0)
+        own = hit * pre_hit + (1 - hit) * _written(geometry, 0, n_in)
+        dec_hit = _written(geometry, prefix + n_in, prefix + n_in + n_out) if hit else 0.0
+        dec = hit * dec_hit + (1 - hit) * _written(geometry, n_in, n_in + n_out)
+        dead_hit = _dead(geometry, prefix + n_in, prefix + n_in + n_out) if hit else 0.0
+        dead_total = hit * dead_hit + (1 - hit) * _dead(geometry, n_in, n_in + n_out)
         life = call_s + w.retain_s
         if policy == "layer_major":
             life = out_wave * tpot
         chunks.append((own, "prefill", n_out * rho, life))
-        if not hbm_out and full > own:
-            chunks.append((full - own, "decode", n_out * rho, life))
+        if not hbm_out and dec > 0:
+            chunks.append((dec, "decode", n_out * rho, life))
+        if hbm_out:
+            dead_total = min(dead_total, own)
     host_pages = sum(chunk[0] for chunk in chunks)
     if policy == "layer_major":
         if region is None:
-            model = getattr(clock, "model", None)
-            if model is None:
-                raise ValueError("layer_major needs region= or a Clock with a model")
-            region = region_pages(model, geometry.tensors, b, max(1, round(w.input.mean_max(b))), ppb)
+            if hasattr(geometry, "region_span"):
+                region = geometry.region_span(b, max(1, round(w.input.mean_max(b))), ppb)
+            else:
+                model = getattr(clock, "model", None)
+                if model is None:
+                    raise ValueError("layer_major needs region= or a Clock with a model")
+                region = region_pages(model, geometry.tensors, b, max(1, round(w.input.mean_max(b))), ppb)
         per_request = region / b  # each request's share of the wave's region
 
     rows = []
@@ -662,7 +816,7 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
             for p in weights / weights.sum():
                 readers = b * w.prefix_share * p
                 k = readers if prefix_reads == "per_request" else min(1.0, readers)
-                per_s = k * rho / tpot + calls_per_s * w.prefix_share * p * ppb  # decode + prefill reads
+                per_s = k * rho / tpot + calls_per_s * w.prefix_share * p * ppb * read_mult  # decode + prefill reads
                 prefix_rd += p_pages * per_s / x
                 numerator += p_pages * per_s / entry_rate
             prefix_ret = w.prefix_groups * p_pages / retention_s if retention_s else 0.0
@@ -697,9 +851,10 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
                "tpot_m5_ms": (step.tpot_ns + m5_row["extra_step_ns"]) / 1e6,
                "max_step_extra_ms": m5_row["max_step_extra_ns"] / 1e6, "req_per_s": calls_per_s,
                "tokens_per_s": tokens_per_s, "pages_per_request": host_pages / calls,
+               "dead_pages_per_request": dead_total / calls,
                "kv_bytes_per_token": geometry.hbf_token_bytes,
                "hbm_bytes_per_request": float(geometry.hbm_bytes(np.array([int(round(ctx))]))[0]),
-               "threshold_steps": threshold_steps(x, ppb, share, hot),
+               "threshold_steps": threshold_steps(x, ppb, share, hot * read_mult),
                "refreshes_per_request": refreshes, "kv_write_gb_s": kv * page / 1e9}
         row |= {f"{cause}_gb_s": rates[cause] * page / 1e9 for cause in CAUSES}
         refresh = rates["refresh_rd"] + rates["refresh_ret"] + rates["replay"]
@@ -996,7 +1151,8 @@ class Simulator:
         self.S = S = d.capacity_pages // self.P
         if S < 2 * self.parts:
             raise ValueError(f"The device holds {S} segments of {self.P} pages: need at least 2 per partition")
-        self.read_scale = o.share * o.hot / self.row
+        self.read_mult = float(getattr(self.geo, "read_multiplier", 1.0))
+        self.read_scale = o.share * o.hot * self.read_mult / self.row
         # segments
         self.fill, self.live, self.reads = np.zeros(S), np.zeros(S), np.zeros(S)
         self.pec = np.zeros(S, dtype=np.int64)
@@ -1041,6 +1197,7 @@ class Simulator:
         self.sl_gen = np.zeros(cap, dtype=np.int64)
         self.sl_part = np.zeros(cap, dtype=np.int64)
         self.sl_staged = np.zeros(cap)
+        self.sl_dead = np.zeros(cap)
         self.free_slots = list(range(cap - 1, -1, -1))
         self.n_running = 0
         self.queue = []
@@ -1053,6 +1210,8 @@ class Simulator:
         self.vllm_stranded = 0.0
         self.vllm_dirty = False
         if o.policy == "vllm_pool":
+            if hasattr(self.geo, "is_uniform") and not self.geo.is_uniform:
+                raise ValueError("vllm_pool requires uniform layers (not heterogeneous --kv-spec)")
             bt = o.block_tokens or math.lcm(*self.geo.tpp)
             if any(bt % tpp for tpp in self.geo.tpp):
                 raise ValueError("vllm_pool block_tokens must be a multiple of every HBF tensor's tokens per page")
@@ -1078,7 +1237,7 @@ class Simulator:
         self.acc = dict.fromkeys(("steps", "tokens", "batch_s", "ctx_s", "decode_s", "tpot_s", "m5_s",
                                   "stranded_s", "prefill_s"), 0.0)
         self.n = dict.fromkeys(("completed", "admitted", "refresh_rd", "refresh_ret", "compaction", "evicted_pages",
-                                "recompute_tokens", "stalls", "reclaims", "waves", "quanta"), 0.0)
+                                "recompute_tokens", "stalls", "reclaims", "waves", "quanta", "dead_pages"), 0.0)
         self.prefill_dt = 0.0
         self.guard = False
         self.pending_reads = False
@@ -1108,6 +1267,50 @@ class Simulator:
         if hit is None:
             hit = self.page_cache[tokens] = float(self.geo.stored_pages(np.array([tokens]))[0])
         return hit
+
+    def _written(self, c0, c1):
+        c0_i, c1_i = int(c0), int(c1)
+        if hasattr(self.geo, "written_pages"):
+            return float(self.geo.written_pages(np.array([c0_i]), np.array([c1_i]))[0])
+        return max(0.0, self.pages(c1_i) - self.pages(c0_i))
+
+    def _dead(self, c0, c1):
+        if not hasattr(self.geo, "dead_pages"):
+            return 0.0
+        return float(self.geo.dead_pages(np.array([int(c0)]), np.array([int(c1)]))[0])
+
+    def _retire_dead(self, e, n):
+        """Expire ``n`` oldest live pages of entry ``e`` (sliding window deaths). Returns unretired remainder."""
+        if n <= EPS or not self.e_rows.get(e):
+            return max(0.0, float(n))
+        self._entry_reads(e)
+        rows = sorted(self.e_rows[e].values(), key=lambda i: (self.c_t[i], i))
+        rem = float(n)
+        retired = 0.0
+        for i in rows:
+            if rem <= EPS:
+                break
+            avail = float(self.c_n[i])
+            if avail <= rem + EPS:
+                _, dropped = self._drop(i)
+                rem -= dropped
+                retired += dropped
+            else:
+                s = int(self.c_s[i])
+                p = self.part_of[s]
+                self.c_n[i] -= rem
+                self.e_pages[e] -= rem
+                self.live[s] -= rem
+                self.part_live[p] -= rem
+                self.drops += 1
+                self.part_ver[p] += 1
+                if self.live[s] < EPS:
+                    self.live[s] = 0.0
+                    self._release(s)
+                retired += rem
+                rem = 0.0
+        self.n["dead_pages"] += retired
+        return max(0.0, rem)
 
     def _max_request_pages(self):
         w = self.workload
@@ -1312,7 +1515,7 @@ class Simulator:
     def _read_once(self, e):
         """Prefill attention over a cached entry: every page is read once (no share, no skew)."""
         for s, i in self.e_rows[e].items():
-            self.reads[s] += self.c_n[i] / self.row
+            self.reads[s] += self.c_n[i] * self.read_mult / self.row
 
     # ---- block reads -----------------------------------------------------------------------
     def _flush_reads(self):
@@ -1368,8 +1571,11 @@ class Simulator:
         if not len(on):
             return 0.0
         geo = self.geo
-        return float((geo.stored_pages(self.sl_end[on]) - geo.stored_pages(self.sl_ctx[on])).sum()
-                     + self.sl_staged[on].sum())
+        if hasattr(geo, "written_pages"):
+            rem = geo.written_pages(self.sl_ctx[on], self.sl_end[on]).sum()
+        else:
+            rem = (geo.stored_pages(self.sl_end[on]) - geo.stored_pages(self.sl_ctx[on])).sum()
+        return float(rem + self.sl_staged[on].sum())
 
     def _frontier_rem(self, part, prefix=False):
         if self.opt.policy == "dedicated":
@@ -1466,9 +1672,9 @@ class Simulator:
         # A session's history is on HBF up to e_stored (under hbm_decode the last call's output is not:
         # it is written with this call's prompt); an evicted history is recomputed and rewritten.
         have = int(self.e_stored[sess]) if sess >= 0 else pre_tokens
-        own = self.pages(start) - self.pages(have)
+        own = min(self._written(have, start), self.pages(start)) if have > 0 else self._written(0, start)
         pre_need = self.pages(pre_tokens) if new_prefix else 0.0
-        need = own + (self.pages(end) - self.pages(start) if self.writes_decode else 0.0)
+        need = own + (self._written(start, end) if self.writes_decode else 0.0)
         if not self.opt.separate_prefix:
             need += pre_need
             pre_need = 0.0
@@ -1501,6 +1707,10 @@ class Simulator:
         if sess >= 0:
             e = sess
             self._read_once(e)
+            if have > 0:
+                dead_sess = self._dead(have, start)
+                if dead_sess > EPS:
+                    self._retire_dead(e, dead_sess)
         else:
             e = self._new_entry(SESSION if req.session >= 0 else PRIVATE, part, 0)
             if req.session >= 0:
@@ -1519,6 +1729,7 @@ class Simulator:
         self.sl_on[slot], self.sl_req[slot] = True, req
         self.sl_entry[slot], self.sl_prefix[slot], self.sl_part[slot] = e, pre, part
         self.sl_ctx[slot], self.sl_end[slot], self.sl_gen[slot], self.sl_staged[slot] = start, end, 0, 0.0
+        self.sl_dead[slot] = 0.0
         self.n_running += 1
         self.n["admitted"] += 1
         return True
@@ -1528,10 +1739,13 @@ class Simulator:
         self._entry_reads(e)
         if self.sl_staged[slot] > EPS:  # the request's last staged full pages (a partial row)
             self._write(e, float(self.sl_staged[slot]), "decode")
+        if self.sl_dead[slot] > EPS:
+            self._retire_dead(e, float(self.sl_dead[slot]))
+            self.sl_dead[slot] = 0.0
         if self.writes_decode:
             self.e_stored[e] = self.sl_end[slot]
             self.e_tokens[e] = self.sl_end[slot] - (self.workload.prefix_tokens if pre >= 0 else 0)
-        self.sl_on[slot], self.sl_req[slot], self.sl_staged[slot] = False, None, 0.0
+        self.sl_on[slot], self.sl_req[slot], self.sl_staged[slot], self.sl_dead[slot] = False, None, 0.0, 0.0
         self.free_slots.append(slot)
         self.n_running -= 1
         self.n["completed"] += 1
@@ -1607,7 +1821,9 @@ class Simulator:
     def _region_span(self, prompt):
         """Pages a wave writes: phase A's striped layout of H x slots heads at the longest prompt."""
         if prompt not in self.region_cache:
-            if self.model is not None:
+            if hasattr(self.geo, "region_span"):
+                span = self.geo.region_span(self.cap, prompt, self.dev.pages_per_block)
+            elif self.model is not None:
                 span = region_pages(self.model, self.geo.tensors, self.cap, prompt, self.dev.pages_per_block)
             else:  # no model (tests): every per-head stream padded to whole pages
                 per = sum(int(-(-(hi - lo)[0] // tpp)) for spec, tpp in zip(self.geo.hbf, self.geo.tpp)
@@ -1655,7 +1871,7 @@ class Simulator:
             slot = self.free_slots.pop()
             self.sl_on[slot], self.sl_req[slot], self.sl_entry[slot], self.sl_prefix[slot] = True, req, e, -1
             self.sl_ctx[slot], self.sl_end[slot], self.sl_gen[slot] = prompt, prompt + req.output, 0
-            self.sl_part[slot], self.sl_staged[slot] = 0, 0.0
+            self.sl_part[slot], self.sl_staged[slot], self.sl_dead[slot] = 0, 0.0, 0.0
             self.n_running += 1
             self.n["admitted"] += 1
             if self.opt.prefill == "colocated":
@@ -1895,7 +2111,18 @@ class Simulator:
         dt = k * T
         self._update_stranded(dt)
         if self.writes_decode:
-            self.sl_staged[on] += self.geo.stored_pages(ctx1) - self.geo.stored_pages(ctx0)
+            if hasattr(self.geo, "written_pages"):
+                self.sl_staged[on] += self.geo.written_pages(ctx0, ctx1)
+            else:
+                self.sl_staged[on] += self.geo.stored_pages(ctx1) - self.geo.stored_pages(ctx0)
+        if hasattr(self.geo, "dead_pages"):
+            dead = self.geo.dead_pages(ctx0, ctx1)
+            if dead.any():
+                for idx in np.flatnonzero(dead).tolist():
+                    slot = int(on[idx])
+                    rem = self._retire_dead(int(self.sl_entry[slot]), float(dead[idx]))
+                    if rem > EPS:
+                        self.sl_dead[slot] += rem
         if self.vllm is not None:
             for idx, slot in enumerate(on.tolist()):
                 self._vllm_write(int(self.sl_entry[slot]), int(ctx0[idx]), int(ctx1[idx]))
@@ -1963,7 +2190,10 @@ class Simulator:
                 whole = math.floor(self.sl_staged[slot] / row + 1e-9) * row
                 if whole:
                     self.sl_staged[slot] -= whole
-                    self._write(int(self.sl_entry[slot]), whole, "decode")
+                    e = int(self.sl_entry[slot])
+                    self._write(e, whole, "decode")
+                    if self.sl_dead[slot] > EPS:
+                        self.sl_dead[slot] = self._retire_dead(e, float(self.sl_dead[slot]))
             return
         for part in np.unique(self.sl_part[on]).tolist():
             group = on[self.sl_part[on] == part]
@@ -1975,7 +2205,10 @@ class Simulator:
             for slot in group.tolist():
                 pages = float(self.sl_staged[slot]) * share
                 self.sl_staged[slot] -= pages
-                self._write(int(self.sl_entry[slot]), pages, "decode")
+                e = int(self.sl_entry[slot])
+                self._write(e, pages, "decode")
+                if self.sl_dead[slot] > EPS:
+                    self.sl_dead[slot] = self._retire_dead(e, float(self.sl_dead[slot]))
 
     def _housekeeping(self):
         """Idle expiry, read-disturb refresh, retention refresh and background reclaim."""
@@ -2140,9 +2373,10 @@ class Simulator:
                "tpot_m5_ms": (acc["tpot_s"] + acc["m5_s"]) / steps * 1e3 if steps else None,
                "max_step_extra_ms": self.max_step_extra / 1e6, "req_per_s": n["completed"] / span,
                "tokens_per_s": tokens / span, "pages_per_request": host / n["completed"] if n["completed"] else None,
+               "dead_pages_per_request": n["dead_pages"] / n["completed"] if n["completed"] else None,
                "kv_bytes_per_token": self.geo.hbf_token_bytes,
                "hbm_bytes_per_request": float(self.geo.hbm_bytes(np.array([int(round(mean_ctx))]))[0]),
-               "threshold_steps": threshold_steps(o.x, ppb, o.share, o.hot),
+               "threshold_steps": threshold_steps(o.x, ppb, o.share, o.hot * self.read_mult),
                "refreshes_per_request": (prog[CAUSE["refresh_rd"]] + prog[CAUSE["replay"]]) / host if host else None,
                "kv_write_gb_s": host * page / span / 1e9}
         row |= {f"{cause}_gb_s": prog[i] * page / span / 1e9 for i, cause in enumerate(CAUSES)}
@@ -2230,6 +2464,8 @@ def build_parser():
     parser.add_argument("--gpu", default="b200", help="GPU preset (hbf/configs/gpus.json) or JSON")
     parser.add_argument("--format", dest="kv_format", default="bf16",
                         help="KV format(s), comma separated (hbf/formats.py presets, e.g. bf16,fp8,kivi2)")
+    parser.add_argument("--kv-spec",
+                        help="KV group spec (hbf/kvspec.py presets, e.g. hybrid:local_tier=hbf, cla:share=2, ssm)")
     parser.add_argument("--mode", choices=SPARSE_MODES, default="dense",
                         help="read selection of a decode step (non-dense modes take ratios from calibration)")
     parser.add_argument("--fraction", type=float, default=.1, help="selected share (uniform_*, sink_recent)")
@@ -2396,11 +2632,14 @@ def configure(args):
         raise ValueError("--partition applies to packed, dedicated and hbm_decode")
     if args.m5 == "suspend" and args.suspend_ns is None:
         raise ValueError("--m5 suspend needs --suspend-ns (OCP v0.7.0 has no suspend; the value is product specific)")
+    val_ctx = _calib_context(workloads[0], args.calib_context)
     for model in models:
         for fmt in formats:
-            geo, _ = geometry_for(model, fmt)  # validates the format name and parameters for every model
-            if not args.analytic and args.alloc == "vllm_pool" and args.block_tokens is not None:
-                if any(args.block_tokens % tpp for tpp in geo.tpp):
+            geo, _ = geometry_for(model, fmt, kv_spec=args.kv_spec, context=val_ctx)
+            if not args.analytic and args.alloc == "vllm_pool":
+                if hasattr(geo, "is_uniform") and not geo.is_uniform:
+                    raise ValueError(f"--alloc vllm_pool requires uniform layers (not {model.name} with --kv-spec)")
+                if args.block_tokens is not None and any(args.block_tokens % tpp for tpp in geo.tpp):
                     raise ValueError(f"--block-tokens ({args.block_tokens}) must be a multiple of every HBF "
                                      f"tensor's tokens per page ({geo.tpp}) for {model.name}/{fmt}")
     device_flags = []
@@ -2412,6 +2651,7 @@ def configure(args):
         generation = {"fraction": args.fraction, "select_tokens": args.select_tokens, "count": args.count,
                       "seed": args.seed}
     return {"models": models, "gpu": load_gpu(args.gpu), "gpu_name": args.gpu, "formats": formats,
+            "kv_spec": args.kv_spec,
             "mode": args.mode, "generation": generation, "policy": args.alloc, "partition": args.partition,
             "workloads": workloads, "pages_per_block": ppbs, "x_values": xs, "pe_limits": limits,
             "hot": args.rd_hot, "read_share": args.read_share,
@@ -2450,18 +2690,21 @@ def snapshot_batch(workload, stacks):
 
 def make_clock(config, model, kv_format, workload, directory):
     """Clock for one (model, format, workload): calibrated against phase A, or the F1 constants."""
-    geometry, fmt = geometry_for(model, kv_format)
+    kv_spec = config.get("kv_spec")
+    ctx = _calib_context(workload, config.get("calib_context"))
+    geometry, fmt = geometry_for(model, kv_format, kv_spec=kv_spec, context=ctx)
     selection = "static" if config["mode"] in ("dense", "sink_recent") else "dynamic"
     base = {"read_ns": config["read_ns"], "stacks": config["stacks"], "selection": selection,
             "kv_format": fmt.name, "options": config["options"]}
     if not config["calibrate"]:
-        rounds_fn = layout_rounds(model, kv_format) if config["policy"] == "layer_major" else None
+        rounds_fn = (layout_rounds(model, kv_format)
+                     if config["policy"] == "layer_major" and not hasattr(geometry, "spec") else None)
         return Clock(model, config["gpu"], geometry, rounds_fn=rounds_fn, **base), geometry, None
     cache = config["calibration_dir"] or Path(directory) / "calibration"
     calib = calibrate(cache, model.name, config["gpu_name"], kv_format, mode=config["mode"],
-                      generation=config["generation"], context=_calib_context(workload, config["calib_context"]),
+                      generation=config["generation"], context=ctx,
                       device=config["device_flags"], policy=config["policy"], partition=config["partition"],
-                      snapshot_batch=snapshot_batch(workload, config["stacks"]))
+                      snapshot_batch=snapshot_batch(workload, config["stacks"]), kv_spec=kv_spec)
     clock = Clock(model, config["gpu"], geometry, layer_ns=calib["layer_ns"], round_ns=calib["round_ns"],
                   balance=calib["balance"], ratios=calib["ratios"], **base)
     return clock, geometry, calib
@@ -2613,8 +2856,9 @@ def report_lines(rows, config, calibrations=()):
     names = {"packed": "紧凑追加（packed）", "dedicated": "每请求独占段（dedicated）",
              "layer_major": "静态批次波（layer_major）", "hbm_decode": "生成的 KV 留在 HBM（hbm_decode）",
              "vllm_pool": "vLLM 空闲块池（vllm_pool，规范下不合法）"}
+    kv_spec_note = f"；KV 规格 `{config['kv_spec']}`" if config.get("kv_spec") else ""
     lines = ["# 寿命评估（解析稳态）", "",
-             f"分配方式：{names[policy]}，分区 `{partition}`；读取方式 `{config['mode']}`；"
+             f"分配方式：{names[policy]}，分区 `{partition}`；读取方式 `{config['mode']}`{kv_spec_note}；"
              f"每个 stack 容量 {config['capacity_gib']:g} GiB，{config['stacks']} 个 stack 分担请求，"
              f"tPROG {config['t_prog'] / 1e3:g} µs，tBERS {config['t_bers'] / 1e3:g} µs，"
              f"保持刷新间隔 {config['retention_s'] / 3600:g} h（0 表示关闭），持续读偏斜 h = {config['hot']:g}。", ""]
@@ -2684,6 +2928,8 @@ def sim_report_lines(rows, config, calibrations=()):
     """Chinese report section 寿命评估 of an event simulation, with every assumption and its source tag."""
     limits = config["pe_limits"]
     extras = []
+    if config.get("kv_spec"):
+        extras.append(f"KV 规格 `{config['kv_spec']}`")
     if config.get("victim", "greedy") != "greedy":
         extras.append(f"回收选段 `{config['victim']}`")
     if config.get("prefill", "disaggregated") != "disaggregated":

@@ -914,3 +914,163 @@ def test_k1_formats_demand_matches_phase_a_and_kv_bytes():
         assert s["kv_bytes_per_token"] == geo.hbf_token_bytes
         assert a["avg_pec_per_day"] > 0 and s["avg_pec_per_day"] > 0
         assert s["kv_write_gb_s"] == pytest.approx(a["kv_write_gb_s"], rel=.05), fmt_name
+
+
+# ---- Part 3: K4 sliding-window writes/deaths, KVGeometry, CLA, hybrid/SSM/MLA in hbf.endurance ---
+
+def test_k4_sliding_window_write_undercount_fixed_in_analytic_and_simulate():
+    """Design section 3 K4 & section 6 #7: window (-4096, -128), prompt 32,768, +1,000 generated.
+    Previously stored_pages(33768) - stored_pages(32768) gave 0 decode writes; now admission writes
+    3,968 pages, decode writes 1,000, 1,000 die, and stored stays 3,968 in analytic and simulate."""
+    win_geo = Geometry(1, 1, (TensorSpec("kv", 8, 4096, window=(-4096, -128)),))
+    assert int(win_geo.stored_pages([32768])[0]) == 3968
+    assert int(win_geo.stored_pages([33768])[0]) == 3968
+    assert int(win_geo.written_pages([0], [32768])[0]) == 3968
+    assert int(win_geo.written_pages([32768], [33768])[0]) == 1000
+    assert int(win_geo.dead_pages([32768], [33768])[0]) == 1000
+
+    # Analytic: 3,968 prefill + 1,000 decode = 4,968 written pages per request, 1,000 dead pages.
+    w_a = Workload(input="fixed:32768", output="fixed:1000", concurrency=1)
+    a = analytic(win_geo, TEN_MS, w_a, Device(capacity_gib=64), x_values=(1e9,), align="none", **no_m5())[0]
+    assert a["pages_per_request"] == 4968
+    assert a["dead_pages_per_request"] == 1000
+    assert a["prefill_gb_s"] == pytest.approx(a["req_per_s"] * 3968 * 4096 / 1e9)
+    assert a["decode_gb_s"] == pytest.approx(a["req_per_s"] * 1000 * 4096 / 1e9)
+
+    # Event simulation: 1 scripted request -> 3,968 prefill, 1,000 decode, 1,000 dead retired during decode.
+    w_s = scripted([{"arrival": 0.0, "input": 32768, "output": 1000}])
+    sim = simulate(win_geo, TEN_MS, w_s, tiny(1024, banks=4, ppb=4),
+                   sim_opts(policy="packed", x=1e9, hours=20.0 / 3600, align="none"))
+    assert programs(sim, "prefill") == 3968
+    assert programs(sim, "decode") == 1000
+    assert sim.result["pages_per_request"] == 4968
+    assert sim.result["dead_pages_per_request"] == 1000
+    assert sim.live.sum() == 0  # entry completed and released cleanly
+
+
+def test_k4_cla_read_disturb_increases_by_share_factor():
+    """CLA-2 with reuse=hbf halves stored/written pages but doubles block reads per step, halving
+    threshold_steps to X / (ppb * 2) and doubling refreshes per stored page; reuse=hbm keeps 1x."""
+    w = Workload(input="fixed:4096", output="fixed:1000", concurrency=4)
+    base_geo, _ = geometry_for(LLAMA8, "bf16")
+    cla_hbf, _ = geometry_for(LLAMA8, "bf16", kv_spec="cla:share=2,reuse=hbf")
+    cla_hbm, _ = geometry_for(LLAMA8, "bf16", kv_spec="cla:share=2,reuse=hbm")
+    assert cla_hbf.read_multiplier == 2.0 and cla_hbm.read_multiplier == 1.0
+    assert cla_hbf.hbf_token_bytes == base_geo.hbf_token_bytes // 2
+
+    # Choose X so unshared (1000 * 256 = 256k reads) gets 1 refresh while CLA-2 HBF (512k reads) gets 2.
+    x = 200_000.0
+    a_base = analytic(base_geo, TEN_MS, w, Device(capacity_gib=64), x_values=(x,), align="none", **no_m5())[0]
+    a_hbf = analytic(cla_hbf, TEN_MS, w, Device(capacity_gib=64), x_values=(x,), align="none", **no_m5())[0]
+    a_hbm = analytic(cla_hbm, TEN_MS, w, Device(capacity_gib=64), x_values=(x,), align="none", **no_m5())[0]
+    assert a_hbf["threshold_steps"] == pytest.approx(a_base["threshold_steps"] / 2)
+    assert a_hbm["threshold_steps"] == pytest.approx(a_base["threshold_steps"])
+    assert a_hbf["pages_per_request"] == a_base["pages_per_request"] / 2
+    assert a_hbf["refreshes_per_request"] == 2 and a_base["refreshes_per_request"] == 1
+    assert a_hbm["refreshes_per_request"] == 1 and a_hbm["hbm_bytes_per_request"] > 0
+
+    # Event simulation confirms 2x faster read-disturb on a tiny CLA-2 HBF entry vs CLA-2 HBM.
+    from hbf.kvspec import KVGroup, KVSpec
+    t = (TensorSpec("kv", 8, 4096),)
+    spec_hbf = KVSpec("cla", {"share": 2, "reuse": "hbf"}, (KVGroup("kv", (0, 1), alias=((1, 0),), reuse="hbf"),))
+    spec_hbm = KVSpec("cla", {"share": 2, "reuse": "hbm"}, (KVGroup("kv", (0, 1), alias=((1, 0),), reuse="hbm"),))
+    w_sim = scripted([{"arrival": 0, "input": 16, "output": 35}])
+    # 16 pages in 4x4 seg: base/hbm does 4 block reads/step (threshold 10 -> 3 refreshes at steps 10, 20, 30);
+    # cla reuse=hbf does 8 block reads/step (threshold 5 -> 6 refreshes at steps 5..30; step 35 completes & dies).
+    sim_hbm = simulate(spec_hbm.geometry(2, 1, t), TEN_MS, w_sim, tiny(8), sim_opts(policy="hbm_decode", x=40))
+    sim_hbf = simulate(spec_hbf.geometry(2, 1, t), TEN_MS, w_sim, tiny(8), sim_opts(policy="hbm_decode", x=40))
+    assert sim_hbm.result["threshold_steps"] == 10 and sim_hbf.result["threshold_steps"] == 5
+    assert sim_hbm.result["refresh_events_rd"] == 3 and sim_hbf.result["refresh_events_rd"] == 6
+
+
+def test_k4_hybrid_swa_hbf_vs_hbm_and_clock_per_layer_rounds():
+    """Hybrid SWA on HBF vs HBM: Clock computes per-layer rounds; local KV on HBF adds prefill,
+    decode and dead pages while reducing HBM footprint."""
+    gemma = load_model("gemma-3-27b")
+    geo_hbm, _ = geometry_for(gemma, "bf16")  # auto from_model -> local_tier="hbm"
+    geo_hbf, _ = geometry_for(gemma, "bf16", kv_spec="hybrid:pattern=LLLLLG,window=1024,local_tier=hbf")
+    assert geo_hbm.hbf_token_bytes == 10 * 16 * 2 * 128 * 2 == 81_920
+
+    # Per-layer rounds in Clock: 52 local layers (0 rounds on HBM, 2 rounds on HBF at 16 heads x 2 x 64 = 2048p)
+    # and 10 global layers (64 rounds at 32K).
+    c_hbm = Clock(gemma, B200, geo_hbm)
+    c_hbf = Clock(gemma, B200, geo_hbf)
+    s_hbm = c_hbm.step([32768])
+    s_hbf = c_hbf.step([32768])
+    assert len(s_hbm.layer_rounds) == 62 and s_hbm.layer_rounds[:6] == (0, 0, 0, 0, 0, 64)
+    assert len(s_hbf.layer_rounds) == 62 and s_hbf.layer_rounds[:6] == (2, 2, 2, 2, 2, 64)
+    assert s_hbf.tpot_ns > s_hbm.tpot_ns
+    assert sum(s_hbm.gaps_ns) == pytest.approx(s_hbm.tpot_ns - gemma.layers * s_hbm.h_ns)
+    assert sum(s_hbf.gaps_ns) == pytest.approx(s_hbf.tpot_ns - gemma.layers * s_hbf.h_ns)
+
+    # Analytic: SWA on HBF writes 52 local layers' admission + decode pages (all local decode pages die).
+    w = Workload(input="fixed:4096", output="fixed:512", concurrency=4)
+    a_hbm = analytic(geo_hbm, c_hbm, w, Device(capacity_gib=64), x_values=(1e6,), align="none", **no_m5())[0]
+    a_hbf = analytic(geo_hbf, c_hbf, w, Device(capacity_gib=64), x_values=(1e6,), align="none", **no_m5())[0]
+    assert a_hbm["dead_pages_per_request"] == 0 and a_hbm["hbm_bytes_per_request"] > 0
+    assert a_hbf["hbm_bytes_per_request"] == 0
+    # 52 local layers x 16 heads x 2 tensors x (512 / 16) = 53,248 dead local pages.
+    assert a_hbf["dead_pages_per_request"] == 52 * 16 * 2 * (512 // 16)
+    assert a_hbf["pages_per_request"] > a_hbm["pages_per_request"]
+
+
+def test_k4_cli_kv_spec_and_tk3_models_end_to_end(tmp_path):
+    """End-to-end hbf.endurance CLI (--analytic and --hours) for --kv-spec and T-K3 models
+    (gemma-3-27b, deepseek-v2-lite, qwen3-next-80b-a3b), plus prefill_tok_s on MoE/MLA/SSM."""
+    # Analytic CLI: all three T-K3 models (auto from_model without --kv-spec).
+    out_a = tmp_path / "tk3-analytic"
+    main(["--analytic", "--no-calibrate", "--model", "gemma-3-27b,deepseek-v2-lite,qwen3-next-80b-a3b",
+          "--format", "bf16", "--workload", "chat", "--concurrency", "4", "--output", str(out_a)])
+    rows_a = list(csv.DictReader((out_a / "endurance_summary.csv").open()))
+    by_model = {row["model"]: row for row in rows_a}
+    assert float(by_model["gemma-3-27b"]["kv_bytes_per_token"]) == 81_920
+    assert float(by_model["deepseek-v2-lite"]["kv_bytes_per_token"]) == 31_104
+    assert float(by_model["qwen3-next-80b-a3b"]["kv_bytes_per_token"]) == 24_576
+    assert all(float(r["avg_pec_per_day"]) > 0 and float(r["mean_tpot_ms"]) > 0 for r in rows_a)
+
+    # Analytic CLI with explicit --kv-spec (CLA reuse=hbf vs SWA on HBF).
+    out_cla = tmp_path / "cla-analytic"
+    main(["--analytic", "--no-calibrate", "--model", "llama-3.1-8b", "--kv-spec", "cla:share=2,reuse=hbf",
+          "--workload", "long32k", "--rd-threshold", "1e6", "--output", str(out_cla)])
+    cla_row = next(csv.DictReader((out_cla / "endurance_summary.csv").open()))
+    assert float(cla_row["threshold_steps"]) == pytest.approx(1e6 / (256 * 2))
+    assert float(cla_row["kv_bytes_per_token"]) == 32 * 8 * 2 * 128 * 2 / 2
+    assert "cla:share=2,reuse=hbf" in (out_cla / "report.md").read_text()
+
+    # Simulation CLI (--hours) with --kv-spec hybrid (SWA on HBF) and auto from_model SSM (qwen3-next-80b-a3b).
+    out_sim_h = tmp_path / "hybrid-sim"
+    main(["--no-calibrate", "--model", "gemma-3-27b", "--kv-spec", "hybrid:pattern=LLLLLG,window=1024,local_tier=hbf",
+          "--workload", "chat", "--input-len", "fixed:2048", "--output-len", "fixed:128",
+          "--concurrency", "2", "--capacity-gib", "64", "--hours", ".02", "--warmup-h", ".005",
+          "--report-s", "20", "--output", str(out_sim_h)])
+    sim_h = next(csv.DictReader((out_sim_h / "endurance_summary.csv").open()))
+    assert float(sim_h["dead_pages_per_request"]) == pytest.approx(52 * 16 * 2 * (128 // 16), rel=2e-2)
+    assert float(sim_h["avg_pec_per_day"]) > 0
+
+    out_sim_ssm = tmp_path / "ssm-sim"
+    main(["--no-calibrate", "--model", "qwen3-next-80b-a3b",
+          "--workload", "chat", "--input-len", "fixed:2048", "--output-len", "fixed:64",
+          "--concurrency", "2", "--capacity-gib", "64", "--hours", ".02", "--warmup-h", ".005",
+          "--report-s", "20", "--prefill", "colocated", "--output", str(out_sim_ssm)])
+    sim_ssm = next(csv.DictReader((out_sim_ssm / "endurance_summary.csv").open()))
+    assert float(sim_ssm["kv_bytes_per_token"]) == 24_576
+    assert float(sim_ssm["prefill_s"]) > 0 and float(sim_ssm["avg_pec_per_day"]) > 0
+
+    # prefill_tok_s: MoE uses active_params (much faster than total_params), Llama-8B unchanged.
+    ds = load_model("deepseek-v2-lite")
+    qn = load_model("qwen3-next-80b-a3b")
+    assert prefill_tok_s(ds, B200, 4096) > prefill_tok_s(LLAMA8, B200, 4096)
+    assert prefill_tok_s(qn, B200, 4096) > 0
+    expected_llama8 = B200.flops / (2 * (LLAMA8.layers * LLAMA8.layer_params + LLAMA8.embedding_params)
+                                    + 2 * LLAMA8.layers * LLAMA8.q_heads * LLAMA8.head_dim * 4096)
+    assert prefill_tok_s(LLAMA8, B200, 4096) == expected_llama8
+
+    # Calibration with --kv-spec runs cleanly against phase A.
+    calib = calibrate(tmp_path / "cal", "llama-3.1-8b", "b200", "bf16", context=1024, batches=(8, 16),
+                      policy="packed", snapshot_batch=8, kv_spec="cla:share=2,reuse=hbf")
+    assert calib["layer_ns"] > 0 and calib["round_ns"] > 0
+
+    # Validation: vllm_pool rejects heterogeneous --kv-spec.
+    parser = build_parser()
+    with pytest.raises(ValueError, match="vllm_pool"):
+        configure(parser.parse_args(["--hours", "2", "--alloc", "vllm_pool", "--kv-spec", "hybrid:local_tier=hbm"]))

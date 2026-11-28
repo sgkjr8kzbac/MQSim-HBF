@@ -227,7 +227,7 @@ def test_generator_parameter_validation():
             list(generate(cfg, layout, "uniform_tokens", **kwargs))
     for mode in ("dense", "sink_recent"):
         for kwargs in ({"select_static": True}, {"reuse": 0.5}, {"query_groups": 4}):
-            with pytest.raises(ValueError, match="uniform_tokens and uniform_pages"):
+            with pytest.raises(ValueError, match="uniform_tokens, uniform_pages and channel_select"):
                 list(generate(cfg, layout, mode, **kwargs))
 
 
@@ -299,6 +299,166 @@ def test_cli_round_trip_and_default_meta_unchanged(tmp_path):
         ["--mode", "uniform_tokens", "--select-static", "--kv-spec", "cla:share=2"],
     )):
         out = tmp_path / f"bad-{idx}"
+        with pytest.raises(SystemExit):
+            main(HBF_FLAGS + ["--layers", "2", "--context", "1024"] + extra + ["--output", str(out)])
+        assert not out.exists()
+
+
+# ---------------------------------------------------------------------------------------------
+# T-K6 partial-dimension reads: loki, sparq[:dual], full_tensors, channel_select.
+
+def test_loki_channel_select_at_32k():
+    cfg = load("ocp")
+    context = 32768
+    fmt = parse_format("loki:rank=32", 128)
+    layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, context), tensors=fmt.tensors)
+    # Works both with explicit full_tensors and with auto-detected K_lo.
+    acc_auto = list(generate(cfg, layout, "channel_select", fraction=0.1, select_tokens=16, seed=3))
+    acc_explicit = list(generate(cfg, layout, "channel_select", fraction=0.1, select_tokens=16, seed=3,
+                                 full_tensors=fmt.full_tensors))
+    assert acc_auto == acc_explicit
+    (pages,) = iter_layer_pages(cfg, layout, acc_auto)
+    k_lo_pages = int((pages.tensor == layout.index["K_lo"]).sum())
+    k_hi_pages = int((pages.tensor == layout.index["K_hi"]).sum())
+    v_pages = int((pages.tensor == layout.index["V"]).sum())
+    # K_lo is read in full (512 pages vs 2,048 for full K); K_hi and V are read sparsely (~10%).
+    assert k_lo_pages == 512
+    selected_blocks = -(-int(context // 16) * 1 // 10)  # ceil(2048 * 0.1) = 205
+    selected_tokens = 205 * 16
+    assert v_pages == 205 and 205 <= k_hi_pages < 450
+    assert pages.tensor_tokens == {"K_lo": context, "K_hi": selected_tokens, "V": selected_tokens}
+    # No double-counting of K elements across scoring (K_lo) and exact (K_hi + V) phases.
+    expected_elems = context * 32 + selected_tokens * 96 + selected_tokens * 128
+    assert pages.attended_elements == expected_elems and pages.hbf_elements == expected_elems
+
+
+def test_sparq_groups_touched_and_scoring_pages():
+    cfg = load("ocp")
+    # K6: sparq:channels=32,groups=8 -> mean groups touched = 8 * (1 - C(112,32)/C(128,32)) = 7.94 +- 0.1.
+    fmt8 = parse_format("sparq:channels=32,groups=8", 128)
+    layout8 = LAYOUTS["layer_contiguous"](cfg, Shape(4, 8, 128, 256), tensors=fmt8.tensors)
+    acc8 = list(generate(cfg, layout8, "channel_select", steps=20, fraction=0.1, seed=7,
+                         channels=fmt8.channel_select_channels, channel_groups=fmt8.channel_groups))
+    touched_per_draw = {}
+    for a in acc8:
+        if a.kind.startswith("K_g") and a.token_start == 0 and a.token_end == 256:
+            touched_per_draw.setdefault((a.step, a.layer, a.kv_head), set()).add(a.kind)
+    assert len(touched_per_draw) == 20 * 4 * 8
+    mean_touched = sum(len(s) for s in touched_per_draw.values()) / len(touched_per_draw)
+    assert mean_touched == pytest.approx(7.94, abs=0.1)
+
+    # K6: sparq:channels=32,groups=128 at ctx=32,768 -> exactly 32 * 16 = 512 scoring pages per head.
+    context = 32768
+    fmt128_dual = parse_format("sparq:channels=32,groups=128,dual=1", 128)
+    lay_dual = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, context), tensors=fmt128_dual.tensors)
+    (p_dual,) = iter_layer_pages(cfg, lay_dual, generate(cfg, lay_dual, "channel_select", fraction=0.1,
+                                                         select_tokens=16, seed=5, channels=32))
+    k_g_indices = {lay_dual.index[name] for name in fmt128_dual.channel_groups}
+    scoring_pages = int(np.isin(p_dual.tensor, list(k_g_indices)).sum())
+    k_pages = int((p_dual.tensor == lay_dual.index["K"]).sum())
+    v_pages = int((p_dual.tensor == lay_dual.index["V"]).sum())
+    assert scoring_pages == 32 * 16 == 512
+    assert k_pages == 205 and v_pages == 205 and len(p_dual) == 512 + 205 + 205
+    # dual=1 counts exact K and V once (no double-counting with aux K_g*).
+    assert p_dual.attended_elements == 205 * 16 * 256 and p_dual.hbf_elements == 205 * 16 * 256
+
+    # Without dual=1, untouched 96 K_g* tensors (tpp=2048) touch nearly all their 16 pages each in Phase 2.
+    fmt128 = parse_format("sparq:channels=32,groups=128", 128)
+    lay_nodual = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, context), tensors=fmt128.tensors)
+    (p_nodual,) = iter_layer_pages(cfg, lay_nodual, generate(cfg, lay_nodual, "channel_select", fraction=0.1,
+                                                             select_tokens=16, seed=5, channels=32))
+    assert len(p_nodual) > len(p_dual) + 1000
+    expected_nodual = context * 32 + 205 * 16 * 96 + 205 * 16 * 128
+    assert p_nodual.attended_elements == expected_nodual and p_nodual.hbf_elements == expected_nodual
+
+
+@pytest.mark.parametrize("fmt_text", ["loki:rank=32", "sparq:channels=32,groups=8", "sparq:channels=32,groups=8,dual=1"])
+def test_channel_select_realism_options_and_parity(fmt_text):
+    cfg = load("ocp")
+    fmt = parse_format(fmt_text, 128)
+    layout = LAYOUTS["striped_contiguous"](cfg, Shape(2, 2, 128, 2048), tensors=fmt.tensors)
+    extra = {"channels": fmt.channel_select_channels} if fmt.channel_groups else {}
+
+    # select_static keeps identical page sets across steps.
+    static = list(iter_layer_pages(cfg, layout, generate(cfg, layout, "channel_select", steps=2, fraction=0.1,
+                                                         seed=4, select_static=True, **extra)))
+    by_key = {(p.step, p.layer): p for p in static}
+    for layer in range(2):
+        assert np.array_equal(by_key[1, layer].lpa, by_key[0, layer].lpa)
+
+    # reuse > 0 moves repeated Phase 2 blocks to HBM on step 1; engines agree bit-for-bit.
+    acc = list(generate(cfg, layout, "channel_select", steps=2, fraction=0.1, seed=4, reuse=0.5,
+                        query_groups=2, **extra))
+    pages = list(iter_layer_pages(cfg, layout, acc))
+    assert pages[0].hbm_bytes == 0 and pages[2].hbm_bytes > 0
+    assert analyze_accesses(cfg, layout, acc, (1, 16), engine="numpy") == analyze(
+        cfg, schedule(cfg, layout, acc), (1, 16))
+
+
+def test_channel_select_validation():
+    cfg = load("ocp")
+    bf16 = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 256))
+    with pytest.raises(ValueError, match="channel_select requires"):
+        list(generate(cfg, bf16, "channel_select"))
+    with pytest.raises(ValueError, match="channel_select only"):
+        list(generate(cfg, bf16, "uniform_tokens", channels=32))
+    with pytest.raises(ValueError, match="channel_select only"):
+        list(generate(cfg, bf16, "dense", channel_groups=("K",)))
+    sparq = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 256), tensors=parse_format("sparq", 128).tensors)
+    for bad_ch in (None, 0, 129, 32.5):
+        with pytest.raises(ValueError, match="channels"):
+            list(generate(cfg, sparq, "channel_select", channels=bad_ch))
+    with pytest.raises(ValueError, match="both channel_groups and full_tensors"):
+        list(generate(cfg, sparq, "channel_select", channels=32, full_tensors=("K_g0",)))
+
+
+def test_channel_select_cli_end_to_end(tmp_path):
+    # Loki end-to-end at ctx=32,768.
+    loki_out = tmp_path / "loki"
+    main(HBF_FLAGS + ["--timing", "--format", "loki:rank=32", "--mode", "channel_select",
+                      "--layers", "1", "--heads", "1", "--context", "32768", "--fraction", "0.1",
+                      "--output", str(loki_out)])
+    loki_meta = json.loads((loki_out / "meta.json").read_text())
+    assert loki_meta["format"]["name"] == "loki"
+    assert loki_meta["generator"]["full_tensors"] == ["K_lo"]
+    (loki_row,) = csv.DictReader((loki_out / "analysis_layers.csv").open())
+    assert int(loki_row["pages"]) < 1200  # 512 K_lo + sparse K_hi & V (well below 4,096 dense)
+
+    # SparQ end-to-end + access.csv round-trip.
+    sparq_out = tmp_path / "sparq"
+    main(HBF_FLAGS + ["--timing", "--format", "sparq:channels=32,groups=8", "--mode", "channel_select",
+                      "--layers", "1", "--heads", "2", "--context", "4096", "--fraction", "0.1",
+                      "--output", str(sparq_out)])
+    sparq_meta = json.loads((sparq_out / "meta.json").read_text())
+    assert sparq_meta["generator"]["channels"] == 32
+    assert len(sparq_meta["generator"]["channel_groups"]) == 8
+    reimp = tmp_path / "sparq-reimp"
+    main(HBF_FLAGS + ["--timing", "--format", "sparq:channels=32,groups=8",
+                      "--layers", "1", "--heads", "2", "--context", "4096",
+                      "--access-csv", str(sparq_out / "access.csv"), "--output", str(reimp)])
+    assert (reimp / "analysis_steps.csv").read_text() == (sparq_out / "analysis_steps.csv").read_text()
+
+    # SparQ dual=1 with --model, --select-static, --reuse, --query-groups auto: 1.5x stored KV bytes.
+    bf16_sys = tmp_path / "bf16-sys"
+    dual_sys = tmp_path / "dual-sys"
+    main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--context", "1024", "--output", str(bf16_sys)])
+    main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--format", "sparq:channels=32,groups=8,dual=1",
+                      "--mode", "channel_select", "--context", "1024", "--steps", "2", "--fraction", "0.1",
+                      "--select-static", "--reuse", "0.5", "--query-groups", "auto", "--output", str(dual_sys)])
+    bf16_kv = json.loads((bf16_sys / "meta.json").read_text())["system"]["kv_bytes_per_request"]
+    dual_meta = json.loads((dual_sys / "meta.json").read_text())
+    assert dual_meta["system"]["kv_bytes_per_request"] == bf16_kv * 3 // 2
+    assert dual_meta["generator"]["query_groups"] == 4
+    assert dual_meta["system"]["selection"] == "static"
+    assert len(list(csv.DictReader((dual_sys / "system_steps.csv").open()))) == 2
+
+    # Invalid CLI combinations fail cleanly without creating output directory.
+    for idx, extra in enumerate((
+        ["--mode", "channel_select"],
+        ["--format", "loki:rank=32", "--mode", "channel_select", "--kv-spec", "cla:share=2"],
+        ["--format", "loki:rank=32", "--mode", "channel_select", "--alloc", "packed"],
+    )):
+        out = tmp_path / f"k6-bad-{idx}"
         with pytest.raises(SystemExit):
             main(HBF_FLAGS + ["--layers", "2", "--context", "1024"] + extra + ["--output", str(out)])
         assert not out.exists()

@@ -37,7 +37,9 @@ def test_kivi_body_on_hbf_and_residual_in_hbm():
 
 @pytest.mark.parametrize("name,hbf_bytes", [("bf16", 512), ("fp8", 256), ("int4", 136), ("int2:group=64", 80),
                                             ("kivi4", 160), ("kivi2", 96), ("think", 384), ("think:ratio=0.25", 448),
-                                            ("kivi2:think=0.5", 72), ("quest", 544)])
+                                            ("kivi2:think=0.5", 72), ("quest", 544), ("loki", 512),
+                                            ("loki:rank=16", 512), ("sparq", 512), ("sparq:groups=128", 512),
+                                            ("sparq:dual=1", 768), ("sparq:groups=128,dual=1", 768)])
 def test_preset_bytes_per_token(name, hbf_bytes):
     fmt = parse_format(name, 128)
     assert sum(spec.token_bytes for spec in fmt.tensors if spec.tier == "hbf") == hbf_bytes
@@ -313,3 +315,49 @@ def test_engines_agree_on_non_64b_aligned_formats(name, q_heads, mode):
         expected = analyze(cfg, schedule(cfg, layout, accesses), (1, 16), protocol=protocol)
         actual = analyze_accesses(cfg, layout, accesses, (1, 16), protocol=protocol, engine="numpy")
         assert actual == expected
+
+
+# ---------------------------------------------------------------------------------------------
+# T-K6 partial-dimension formats (docs/design/phase3-kv-terms.md section 3, K6).
+
+def test_loki_format_and_pages_at_32k():
+    fmt, layout, pages, _ = dense_pages("loki:rank=32", 32768)
+    assert fmt.attn_dims == 256 and fmt.full_tensors == ("K_lo",)
+    assert [spec.name for spec in fmt.tensors] == ["K_lo", "K_hi", "V"]
+    # K_lo: 32 dims x 2 B = 64 B -> 64 tokens/page -> 512 pages per head (vs 2,048 for full K).
+    assert layout.tokens_per_page == (64, 21, 16)
+    assert layout.block_counts == (512, 1561, 2048)
+    assert pages.attended_elements == 32768 * 256 and pages.hbf_elements == 32768 * 256
+    for bad in ("loki:rank=0", "loki:rank=-4", "loki:rank=128", "loki:rank=200", "loki:rank=16.5", "loki:x=1"):
+        with pytest.raises(ValueError):
+            parse_format(bad, 128)
+
+
+def test_sparq_format_dual_and_validation():
+    fmt, layout, pages, _ = dense_pages("sparq:channels=32,groups=8", 32768)
+    assert fmt.attn_dims == 256 and fmt.channel_select_channels == 32
+    assert fmt.channel_groups == tuple(f"K_g{i}" for i in range(8))
+    assert layout.block_counts == (256,) * 8 + (2048,)
+    assert pages.attended_elements == 32768 * 256 and pages.hbf_elements == 32768 * 256
+
+    fmt128, layout128, _, _ = dense_pages("sparq:channels=32,groups=128", 32768)
+    assert len(fmt128.channel_groups) == 128
+    # 1 channel x 2 B = 2 B/token -> 2,048 tokens/page -> 16 pages per group at ctx 32,768.
+    assert layout128.tokens_per_page[:128] == (2048,) * 128
+    assert layout128.block_counts[:128] == (16,) * 128
+
+    # dual=1 adds token-major K alongside channel-grouped K_g* (aux), raising total HBF bytes/token by 1.5x
+    # without double-counting attended_elements or hbf_elements.
+    bf16_bytes = sum(spec.token_bytes for spec in parse_format("bf16", 128).tensors)
+    dual_fmt, dual_layout, dual_pages, _ = dense_pages("sparq:channels=32,groups=8,dual=1", 4096)
+    dual_bytes = sum(spec.token_bytes for spec in dual_fmt.tensors if spec.tier == "hbf")
+    assert dual_bytes == bf16_bytes * 3 // 2 == 768
+    assert all(spec.role == "aux" for spec in dual_fmt.tensors[:8])
+    assert [spec.name for spec in dual_fmt.tensors[-2:]] == ["K", "V"]
+    assert dual_pages.attended_elements == 4096 * 256 and dual_pages.hbf_elements == 4096 * 256
+
+    for bad in ("sparq:groups=0", "sparq:groups=3", "sparq:groups=256", "sparq:groups=8.5",
+                "sparq:channels=0", "sparq:channels=129", "sparq:channels=32.5",
+                "sparq:dual=2", "sparq:dual=-1", "sparq:dual=0.5", "sparq:x=1"):
+        with pytest.raises(ValueError):
+            parse_format(bad, 128)

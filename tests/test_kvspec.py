@@ -110,7 +110,7 @@ def test_cli_kv_spec_with_the_system_model(tmp_path):
     assert meta["system"]["kv_bytes_per_request"] == 8 * 2 * 4096 * 256 + local
     assert meta["system"]["hbm_tier_bytes_per_request"] == local
     assert "局部层" in (out / "report.md").read_text()
-    for extra in (["--layout", "vllm_interleaved"], ["--mode", "uniform_pages"], ["--alloc", "packed"]):
+    for extra in (["--layout", "vllm_interleaved"], ["--mode", "uniform_pages"]):
         with pytest.raises(SystemExit):
             main(HBF_FLAGS + ["--kv-spec", "cla", "--layers", "2", "--context", "1024", *extra,
                               "--output", str(tmp_path / "x")])
@@ -347,3 +347,148 @@ def test_cli_mla_format_and_hybrid_tensors_integration(tmp_path):
     for bad_kw in ({"reuse": 0.8}, {"select_static": True}, {"query_groups": 4}, {"full_tensors": ("K",)}):
         with pytest.raises(TypeError):
             list(generate_grouped(cfg, layout, "uniform_tokens", **bad_kw))
+
+
+# ---------------------------------------------------------------------------------------------
+# T-K4: Token flow model, eviction policies, age-based ladders, and KVGeometry parity.
+
+def test_k4_sliding_window_token_flow_and_geometry():
+    """Design section 3 K4: window (-4096, -128), prompt 32,768 -> admission writes 3,968 tokens;
+    after +1,000 generated, decode writes 1,000 and 1,000 die; stored stays 3,968."""
+    import numpy as np
+    from hbf.access import TensorSpec
+    from hbf.kvspec import flow
+
+    tensor = TensorSpec("kv", 8, 4096, window=(-4096, -128))  # 1 token per 4 KiB page
+    f = flow(tensor, prompt=32768, generated=1000)
+    assert f.admission_tokens == 3968
+    assert f.decode_tokens == 1000
+    assert f.died_tokens == 1000
+    assert f.rewritten_tokens == 0
+    assert f.stored_tokens == 3968
+    # Same check through KVSpec + KVGeometry (both 1 tok/page and BF16 16 tok/page).
+    spec = KVSpec("win", {}, (KVGroup("g", (0,), heads=(0, 1), tensors=(tensor,)),))
+    geo = spec.geometry(layers=1, heads=1)
+    assert int(geo.stored_pages([32768])[0]) == 3968
+    assert int(geo.stored_pages([33768])[0]) == 3968
+    assert int(geo.written_pages([0], [32768])[0]) == 3968
+    assert int(geo.written_pages([32768], [33768])[0]) == 1000
+    assert int(geo.dead_pages([0], [32768])[0]) == 0
+    assert int(geo.dead_pages([32768], [33768])[0]) == 1000
+    # Additivity over sub-steps matches single-step decode writes and deaths.
+    steps = np.arange(32768, 33768, 100)
+    assert int(geo.written_pages(steps, steps + 100).sum()) == 1000
+    assert int(geo.dead_pages(steps, steps + 100).sum()) == 1000
+
+
+def test_k4_kivi4_to_kivi2_age_based_ladder():
+    """Design section 3 K4: kivi4 (-4096, -128) -> kivi2 (0, -4096) writes 160 + 96 = 256 B per
+    decode token per head against 96 B for direct kivi2 (2.67x), and the kivi4 pages die."""
+    from hbf.formats import parse_format
+    from hbf.kvspec import flow
+
+    k4 = parse_format("kivi4", 128)
+    k2 = parse_format("kivi2", 128)
+    k4_hbf = tuple(s for s in k4.tensors if s.tier == "hbf")
+    k2_hbf = tuple(s for s in k2.tensors if s.tier == "hbf")
+    res_hbm = tuple(s for s in k4.tensors if s.tier == "hbm")
+    assert sum(s.token_bytes for s in k4_hbf) == 160
+    assert sum(s.token_bytes for s in k2_hbf) == 96
+
+    ladder = KVSpec("ladder", {}, (
+        KVGroup("res", (0,), heads=(0, 1), tensors=res_hbm, window=(-128, None), tier="hbm"),
+        KVGroup("k4", (0,), heads=(0, 1), tensors=k4_hbf, window=(-4096, -128)),
+        KVGroup("k2", (0,), heads=(0, 1), tensors=k2_hbf, window=(0, -4096)),
+    ))
+    direct = KVSpec("k2", {}, (
+        KVGroup("res", (0,), heads=(0, 1), tensors=res_hbm, window=(-128, None), tier="hbm"),
+        KVGroup("k2", (0,), heads=(0, 1), tensors=k2_hbf, window=(0, -128)),
+    ))
+    fl = flow(ladder, prompt=32768, generated=1000)
+    fd = flow(direct, prompt=32768, generated=1000)
+    assert fl.decode_bytes_per_token == pytest.approx(256.0)
+    assert fd.decode_bytes_per_token == pytest.approx(96.0)
+    assert fl.decode_bytes_per_token / fd.decode_bytes_per_token == pytest.approx(256 / 96)  # 2.67x
+    assert fl.died_bytes == pytest.approx(1000 * 160)
+    assert fd.died_bytes == 0.0
+    # KVGeometry on the ladder writes the matching decode page bytes (multiple of LCM(tpp)=256 tokens).
+    l_geo = ladder.geometry(layers=1, heads=1)
+    d_geo = direct.geometry(layers=1, heads=1)
+    assert int(l_geo.written_pages([32768], [32768 + 1024])[0]) * 4096 == 1024 * 256
+    assert int(d_geo.written_pages([32768], [32768 + 1024])[0]) * 4096 == 1024 * 96
+    assert int(l_geo.dead_pages([32768], [32768 + 1024])[0]) * 4096 == 1024 * 160
+
+
+def test_k4_eviction_policies_and_h2o_live_page_fraction():
+    """Design section 3 K4: H2O live-page fraction 1 - 0.75^16 = 0.98998; compaction threshold
+    theta drives rewrite traffic; prefill/flush eviction compact before writing."""
+    from hbf.access import TensorSpec
+    from hbf.kvspec import flow, live_page_fraction, parse_evict
+
+    # H2O keep=25%, BF16 tpp=16, cluster=1 -> 1 - 0.75^16 = 0.989977... (~0.98998).
+    lp = live_page_fraction(0.25, 16, cluster=1)
+    assert lp == pytest.approx(1.0 - 0.75 ** 16, rel=1e-12)
+    assert round(lp, 5) == 0.98998
+    assert live_page_fraction(0.25, 16, cluster=16) == pytest.approx(0.25)
+    assert live_page_fraction(0.25, 16, cluster=32) == pytest.approx(0.25)
+
+    bf16_k = TensorSpec("K", 16, 128)  # 256 B/tok -> tpp=16
+    none_f = flow(bf16_k, prompt=4096, generated=1024, evict="none")
+    pre_f = flow(bf16_k, prompt=4096, generated=1024, evict="prefill:keep=0.25")
+    flush_f = flow(bf16_k, prompt=4096, generated=1024, evict="flush:keep=0.25")
+    h2o_0 = flow(bf16_k, prompt=4096, generated=1024, evict="decode:keep=0.25,cluster=1,compact=0")
+    h2o_50 = flow(bf16_k, prompt=4096, generated=1024, evict="decode:keep=0.25,c=1,theta=0.5")
+    h2o_25 = flow(bf16_k, prompt=4096, generated=1024, evict="decode:keep=0.25,c=1,theta=0.25")
+
+    assert pre_f.admission_tokens == pytest.approx(1024) and pre_f.decode_tokens == 1024
+    assert pre_f.live_page_frac == 1.0 and pre_f.rewritten_tokens == 0
+    assert flush_f.admission_tokens == pytest.approx(1024) and flush_f.decode_tokens == pytest.approx(256)
+    assert flush_f.live_page_frac == 1.0 and flush_f.rewritten_tokens == 0
+    # Uncompacted H2O: all 5,120 tokens written, 75% die, 0 rewritten, 98.998% of pages stay live.
+    assert h2o_0.admission_tokens == 4096 and h2o_0.decode_tokens == 1024
+    assert h2o_0.died_tokens == pytest.approx(5120 * 0.75) and h2o_0.stored_tokens == pytest.approx(5120 * 0.25)
+    assert h2o_0.rewritten_tokens == 0.0 and h2o_0.live_page_frac == pytest.approx(1.0 - 0.75 ** 16)
+    # Compacted H2O: lower theta (eager compaction at 25% dead) causes 3x more rewrites than theta=0.5.
+    assert h2o_50.rewritten_tokens == pytest.approx(5120 * 0.75 * 1.0)
+    assert h2o_25.rewritten_tokens == pytest.approx(5120 * 0.75 * 3.0)
+    assert h2o_50.live_page_frac == pytest.approx(0.25) and h2o_25.live_page_frac == pytest.approx(0.25)
+    assert h2o_25.total_written_bytes > h2o_50.total_written_bytes > none_f.total_written_bytes
+    # Validation errors on bad evict specs.
+    for bad in ("bogus", "decode:keep=1.5", "decode:compact=1.0", "none:keep=0.5"):
+        with pytest.raises(ValueError):
+            parse_evict(bad)
+
+
+@pytest.mark.parametrize("spec_text,shape", [
+    ("hybrid:pattern=LLLLLG,window=1024,local_tier=hbf", Shape(6, 8, 128, 4096)),
+    ("hybrid:pattern=LLLLLG,window=1024,local_tier=hbm", Shape(6, 8, 128, 4096)),
+    ("cla:share=2,reuse=hbf", Shape(4, 8, 128, 4096)),
+    ("cla:share=2,reuse=hbm", Shape(4, 8, 128, 4096)),
+    ("duo:retrieval=0.5,sink=64,recent=256", Shape(2, 8, 128, 4096)),
+    ("pyramid:first=4096,last=1024", Shape(4, 8, 128, 4096)),
+    ("ssm:pattern=SSSA,state=1000000", Shape(4, 8, 128, 4096)),
+    ("yoco:window=1024,local_tier=hbm,reuse=hbf", Shape(4, 8, 128, 4096)),
+])
+def test_k4_kvgeometry_matches_grouped_layout_per_layer(spec_text, shape):
+    """KVGeometry layer_row_pages, layer_demand, stored_pages and hbm_bytes match GroupedLayout."""
+    cfg = load("ocp")
+    spec = parse_kvspec(spec_text, shape.layers, shape.kv_heads, shape.context)
+    tensors = default_tensors(shape)
+    layout = GroupedLayout(cfg, shape, spec, tensors)
+    rows, _ = analyze_accesses(cfg, layout, list(generate_grouped(cfg, layout, "dense")), timing=True)
+    geo = spec.geometry(shape.layers, shape.kv_heads, tensors)
+
+    assert int(geo.stored_pages([shape.context])[0]) == layout.pages
+    assert int(geo.hbm_bytes([shape.context])[0]) == layout.request_bytes(cfg)["hbm_tier_bytes_per_request"]
+    assert geo.layer_row_pages([shape.context]).tolist() == [row["pages"] for row in rows]
+    demands = geo.layer_demand([shape.context])
+    for row, d in zip(rows, demands):
+        for key in ("burst_bytes", "hbm_bytes", "attended_tokens", "attended_elements", "hbf_elements", "dequant_ops"):
+            assert d[key] == pytest.approx(row[key]), (spec_text, row["layer"], key)
+    # Cross-layer sharing read multiplier: s for reuse=hbf, 1 for reuse=hbm or unshared.
+    if spec_text == "cla:share=2,reuse=hbf":
+        assert geo.read_multiplier == 2.0
+    elif spec_text == "yoco:window=1024,local_tier=hbm,reuse=hbf":
+        assert geo.read_multiplier == 2.0  # 4 layers: layers 2 and 3 share layer 2
+    else:
+        assert geo.read_multiplier == 1.0

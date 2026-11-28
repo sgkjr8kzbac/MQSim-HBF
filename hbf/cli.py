@@ -188,28 +188,42 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
         "hot_fraction": .5, "hot_units": 1, "select_tokens": 16,
     } | (generation or {})
+    if kv_format is not None and input_csv is None:
+        if (mode in ("uniform_tokens", "uniform_pages", "sink_recent", "channel_select")
+                and kv_format.full_tensors and "full_tensors" not in generation):
+            generation["full_tensors"] = list(kv_format.full_tensors)
+        if mode == "channel_select" and kv_format.channel_groups:
+            if "channel_groups" not in generation:
+                generation["channel_groups"] = list(kv_format.channel_groups)
+            if "channels" not in generation and kv_format.channel_select_channels is not None:
+                generation["channels"] = kv_format.channel_select_channels
     from .batch import BatchSpec, PageTableLayout, check_write_order, generate_batch, place_batch
     placed = isinstance(requests, BatchSpec) and not requests.default
     has_selection_realism = (generation.get("select_static") or generation.get("reuse", 0)
-                             or generation.get("query_groups", 1) != 1 or generation.get("full_tensors"))
+                             or generation.get("query_groups", 1) != 1 or generation.get("full_tensors")
+                             or generation.get("channels") is not None or generation.get("channel_groups")
+                             or mode == "channel_select")
     has_density = tensors is not None and any(spec.density != 1 for spec in tensors)
     if (kv_spec is not None or placed) and has_selection_realism:
-        raise ValueError("select_static, reuse, query_groups and full_tensors are not yet supported with "
-                         "--kv-spec (or a hybrid/SSM model) or request placement")
+        raise ValueError("select_static, reuse, query_groups, full_tensors and channel_select are not yet "
+                         "supported with --kv-spec (or a hybrid/SSM model) or request placement")
     if (kv_spec is not None or placed or check_writes) and has_density:
         raise ValueError("Tensor density < 1 is not yet supported with --kv-spec (or a hybrid/SSM model), "
                          "request placement or --check-writes")
-    if kv_spec is not None:  # layer and head groups (hbf/kvspec.py)
-        from .kvspec import GroupedLayout, generate_grouped, spec_meta
+    if kv_spec is not None:
+        from .kvspec import spec_meta
+    if placed:
+        per_request = Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context)
+        batch_req = replace(requests, kv_spec=kv_spec) if kv_spec is not None and requests.kv_spec is None else requests
+        layout = PageTableLayout(cfg, per_request, batch_req, tensors=tensors)
+        accesses = list(generate_batch(cfg, layout, mode, **{key: generation[key] for key in (
+            "steps", "seed", "fraction", "count", "select_tokens")}))
+    elif kv_spec is not None:  # layer and head groups (hbf/kvspec.py)
+        from .kvspec import GroupedLayout, generate_grouped
         layout = GroupedLayout(cfg, shape, kv_spec, tensors or default_tensors(shape),
                                requests=requests[0] if isinstance(requests, tuple) else 1,
                                intra="striped" if layout_name == "striped_contiguous" else "contiguous")
         accesses = list(generate_grouped(cfg, layout, mode, **{key: generation[key] for key in (
-            "steps", "seed", "fraction", "count", "select_tokens")}))
-    elif placed:
-        per_request = Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context)
-        layout = PageTableLayout(cfg, per_request, requests, tensors=tensors)
-        accesses = list(generate_batch(cfg, layout, mode, **{key: generation[key] for key in (
             "steps", "seed", "fraction", "count", "select_tokens")}))
     else:
         layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
@@ -221,7 +235,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         snapshot = layout.snapshot if placed else place_batch(
             cfg, Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context),
             requests, layout.tensors, layout.tokens_per_page)
-        write_check = check_write_order(cfg, snapshot.written()) | {"kinds": snapshot.kinds}
+        write_check = check_write_order(cfg, snapshot) | {"kinds": snapshot.kinds}
     if input_csv is not None and isinstance(requests, tuple) and requests[0] > 1:
         seen = {access.kv_head // requests[1] for access in accesses}
         if len(seen) < requests[0]:
@@ -350,7 +364,7 @@ def build_parser():
     parser.add_argument("--hot-fraction", type=float, default=.5)
     parser.add_argument("--hot-units", type=int, default=1)
     parser.add_argument("--select-tokens", type=int, default=16,
-                        help="uniform_tokens: tokens per selected block (Quest's page; default 16)")
+                        help="uniform_tokens / channel_select: tokens per selected block (Quest's page; default 16)")
     parser.add_argument("--select-static", action="store_true",
                         help="keep the step-0 sparse selection across all steps (eviction state)")
     parser.add_argument("--reuse", type=float, default=0.0,
@@ -358,6 +372,9 @@ def build_parser():
     parser.add_argument("--query-groups", default="1",
                         help="GQA query heads sharing one KV head for sparse selection union (integer >= 1, "
                              "or 'auto' with --model; default 1)")
+    parser.add_argument("--full-tensors",
+                        help="comma-separated tensor names read over their whole window in sparse selection modes "
+                             "(auto-populated for --format loki)")
     parser.add_argument("--density", default="1",
                         help="share of each HBF tensor's window tokens stored compacted (e.g. 0.25 or 1/4; "
                              "default 1, numpy analysis engine only)")
@@ -368,7 +385,8 @@ def build_parser():
     parser.add_argument("--format", dest="kv_format",
                         help="named KV storage format NAME[:key=value,...]: bf16, fp8, int4, int2, kivi4, kivi2 "
                              "(group, residual, think, fused, pow2), think (ratio), quest (page), "
-                             "mla, mla_fp8 (lora, rope, split, indexer, indexer_hbm, q_heads); see hbf/formats.py")
+                             "mla, mla_fp8 (lora, rope, split, indexer, indexer_hbm, q_heads), "
+                             "loki (rank), sparq (channels, groups, dual); see hbf/formats.py")
     parser.add_argument("--kv-spec", help="layer and head groups PRESET[:key=value,...]: hybrid, ssm, cla, yoco, duo, "
                         "pyramid (see hbf/kvspec.py); generated modes dense, uniform_tokens, sink_recent only")
     parser.add_argument("--tensors", help="JSON list or file of stored tensor formats, "
@@ -467,6 +485,15 @@ def build_parser():
     batch.add_argument("--block-tokens", type=int, help="vllm_pool: tokens per vLLM block (default: largest "
                                                         "tokens per page)")
     batch.add_argument("--free-order", default="fresh", help="vllm_pool: fresh (ascending ids) or shuffled:<seed>")
+    batch.add_argument("--frontiers", choices=("single", "class"), default="single",
+                       help="dedicated/packed: single write frontier, or class (separate frontiers for short-lived "
+                            "sliding-window tensors, long-lived tensors, and shared prefixes)")
+    batch.add_argument("--prefix-tokens", type=int, default=0,
+                       help="shared prefix tokens per prefix group written once and aliased across sharing requests")
+    batch.add_argument("--prefix-groups", type=int, default=1,
+                       help="number of distinct shared-prefix groups (request r joins group r mod prefix_groups)")
+    batch.add_argument("--prefix-reads", choices=("coalesced", "per_request"), default="coalesced",
+                       help="shared prefix read model: coalesced (once per step, default) or per_request")
     batch.add_argument("--check-writes", action="store_true",
                        help="check the batch's write history against the per-block write order of OCP section "
                             "5.4.1 and report skips, overlaps and erases of live blocks")
@@ -492,7 +519,8 @@ def batch_spec(args, per_stack):
     prompts = values(args.contexts, "contexts") if args.contexts is not None else [args.context] * per_stack
     generated = values(args.generated, "generated")
     spec = BatchSpec(tuple(BatchRequest(p, g) for p, g in zip(prompts, generated)), args.alloc, args.partition,
-                     args.layout, args.flush_order, args.block_tokens, args.free_order, args.align)
+                     args.layout, args.flush_order, args.block_tokens, args.free_order, args.align,
+                     args.frontiers, args.prefix_tokens, args.prefix_groups, args.prefix_reads)
     return None if spec.default and not args.check_writes else spec, max(prompts)
 
 
@@ -543,8 +571,8 @@ def configure(args):
         if query_groups < 1:
             raise ValueError("--query-groups must be a positive integer or 'auto'")
     if (args.access_csv is None and (args.select_static or args.reuse or query_groups != 1)
-            and args.mode not in ("uniform_tokens", "uniform_pages")):
-        raise ValueError("--select-static, --reuse and --query-groups apply to uniform_tokens and uniform_pages only")
+            and args.mode not in ("uniform_tokens", "uniform_pages", "channel_select")):
+        raise ValueError("--select-static, --reuse and --query-groups apply to uniform_tokens, uniform_pages and channel_select only")
     if type(args.batch) is not int or args.batch < 1 or type(args.stacks) is not int or args.stacks < 1:
         raise ValueError("--batch and --stacks must be positive")
     per_stack = -(-args.batch // args.stacks)
@@ -565,6 +593,15 @@ def configure(args):
         generation["reuse"] = args.reuse
     if query_groups != 1:
         generation["query_groups"] = query_groups
+    full_tensors = [name.strip() for name in args.full_tensors.split(",") if name.strip()] if args.full_tensors else []
+    if (not full_tensors and kv_format is not None and kv_format.full_tensors
+            and args.mode in ("uniform_tokens", "uniform_pages", "sink_recent", "channel_select")):
+        full_tensors = list(kv_format.full_tensors)
+    if full_tensors:
+        generation["full_tensors"] = full_tensors
+    if args.mode == "channel_select" and kv_format is not None and kv_format.channel_groups:
+        generation["channel_groups"] = list(kv_format.channel_groups)
+        generation["channels"] = kv_format.channel_select_channels
     if args.placement != "static" and (args.timing or model is not None):
         raise ValueError("--timing and --model need static placement (the numpy engine)")
     if model is None and (args.gpu is not None or args.overlap != "serial" or args.kv_consume != "stream"
@@ -604,11 +641,10 @@ def configure(args):
     kv_spec = None
     if args.kv_spec is not None or (model is not None and model.layer_pattern):
         from .kvspec import GROUP_MODES, from_model, parse_kvspec
-        if (spec is not None or args.access_csv is not None or args.mode not in GROUP_MODES
+        if (args.access_csv is not None or args.mode not in GROUP_MODES
                 or args.layout not in ("layer_contiguous", "striped_contiguous")):
             raise ValueError("--kv-spec (or a hybrid/SSM model) works with generated modes dense, uniform_tokens and "
-                             "sink_recent, the layer_contiguous or striped_contiguous layout, and without request "
-                             "placement or --access-csv")
+                             "sink_recent, the layer_contiguous or striped_contiguous layout, and without --access-csv")
         if args.kv_spec is not None:
             kv_spec = parse_kvspec(args.kv_spec, layers, heads, shape.context)
         elif args.tensors is not None:
@@ -617,9 +653,9 @@ def configure(args):
             kv_spec = from_model(model, kv_format or "bf16")
     if spec is not None:
         if not args.analysis_only or args.access_csv is not None or args.prefill:
-            raise ValueError("Request placement (--alloc, --contexts, --generated, --check-writes) is analysis only, "
-                             "with generated accesses and without --prefill")
-        requests = spec
+            raise ValueError("Request placement (--alloc, --contexts, --generated, --frontiers, --prefix-tokens, "
+                             "--check-writes) is analysis only, with generated accesses and without --prefill")
+        requests = replace(spec, kv_spec=kv_spec) if kv_spec is not None else spec
     return {"cfg": cfg, "shape": shape, "layout_name": args.layout, "mode": args.mode, "generation": generation,
             "input_csv": args.access_csv, "physical": args.physical, "tensors": tensors,
             "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": args.prefill,

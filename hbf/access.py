@@ -445,7 +445,7 @@ LAYOUTS = {"layer_contiguous": LayerContiguous, "vllm_interleaved": VllmInterlea
 
 MODES = (
     "dense", "uniform_pages", "uniform_tokens", "sink_recent", "same_unit", "distinct_units", "same_channel_distinct_units",
-    "hot_unit", "write_then_read",
+    "hot_unit", "write_then_read", "channel_select",
 )
 
 
@@ -511,9 +511,24 @@ def _select_blocks(rng, blocks, pick_n, step, key, prev, select_static, reuse):
     return picked, reused
 
 
+def _detect_channel_groups(layout):
+    """Detect contiguous SparQ-style channel-group tensors ``K_g0, K_g1, ...`` in ``layout.tensors``."""
+    found = []
+    for spec in layout.tensors:
+        if spec.name.startswith("K_g") and spec.name[3:].isdigit():
+            found.append((int(spec.name[3:]), spec.name))
+    if not found:
+        return ()
+    found.sort()
+    if [idx for idx, _ in found] != list(range(len(found))):
+        return ()
+    return tuple(name for _, name in found)
+
+
 def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0,
              hot_fraction=.5, hot_units=1, select_tokens=16,
-             select_static=False, reuse=0.0, query_groups=1, full_tensors=()):
+             select_static=False, reuse=0.0, query_groups=1, full_tensors=(),
+             channels=None, channel_groups=()):
     """Seeded accesses of one workload mode.
 
     Every mode reads ``meta`` tensors (selection metadata) in full every (step, layer, head);
@@ -527,6 +542,16 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
     and V pages of one head cover different tokens. ``uniform_tokens`` picks ``fraction`` of the
     blocks of ``select_tokens`` tokens per (step, layer, KV head), as Quest-style methods do, and
     reads every tensor of the head for the same tokens.
+
+    ``channel_select`` models two-phase partial-dimension scoring followed by sparse exact attention:
+    * Static prefix (Loki): reads ``full_tensors`` (auto-detecting ``K_lo`` when unset) over the
+      whole context, then reads the remaining HBF tensors (e.g. ``K_hi``, ``V``) on the selected
+      ``select_tokens``-token blocks.
+    * Dynamic channel groups (SparQ): per (step, layer, head), draws ``channels`` distinct channels
+      uniformly without replacement across ``channel_groups`` (auto-detecting ``K_g0..K_g{g-1}``
+      when unset) and reads the touched group tensors over the whole context; the exact phase reads
+      the remaining data tensors (token-major ``K`` and ``V`` when ``dual=1``, or untouched ``K_g*``
+      and ``V`` when ``dual=0``) on the selected blocks.
 
     Selection realism options (all off by default, preserving exact RNG draw order):
     * ``select_static`` - keep the step-0 selection across all steps (eviction state).
@@ -544,8 +569,10 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
             or isinstance(reuse, bool) or not isinstance(reuse, (int, float)) or not 0 <= reuse <= 1
             or type(query_groups) is not int or query_groups < 1):
         raise ValueError("Invalid generator parameters")
-    if (select_static or reuse or query_groups != 1) and mode not in ("uniform_tokens", "uniform_pages"):
-        raise ValueError("select_static, reuse and query_groups apply to uniform_tokens and uniform_pages only")
+    if (select_static or reuse or query_groups != 1) and mode not in ("uniform_tokens", "uniform_pages", "channel_select"):
+        raise ValueError("select_static, reuse and query_groups apply to uniform_tokens, uniform_pages and channel_select only")
+    if (channels is not None or channel_groups) and mode != "channel_select":
+        raise ValueError("channels and channel_groups apply to channel_select only")
     full = frozenset(full_tensors)
     if any(not isinstance(name, str) or name not in layout.specs for name in full):
         raise ValueError(f"full_tensors must name tensors of the layout, not {sorted(full - set(layout.specs))}")
@@ -560,6 +587,69 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
     def clipped(step, layer, head, spec, lo, hi, op="R"):
         lo, hi = max(lo, windows[spec.name][0]), min(hi, windows[spec.name][1])
         return [Access(step, layer, head, spec.name, op, lo, hi, spec.bits)] if lo < hi else []
+
+    if mode == "channel_select":
+        groups = tuple(channel_groups) if channel_groups else _detect_channel_groups(layout)
+        if any(not isinstance(name, str) or name not in layout.specs for name in groups):
+            raise ValueError(f"channel_groups must name tensors of the layout, not "
+                             f"{sorted(set(groups) - set(layout.specs))}")
+        if len(set(groups)) != len(groups):
+            raise ValueError("channel_groups must not contain duplicate tensor names")
+        groups_set = frozenset(groups)
+        if groups_set & full:
+            raise ValueError(f"Tensors cannot be in both channel_groups and full_tensors: "
+                             f"{sorted(groups_set & full)}")
+        if groups:
+            if any(layout.specs[name].tier != "hbf" for name in groups):
+                raise ValueError("channel_groups tensors must be on the hbf tier")
+            total_dims = sum(layout.specs[name].dims for name in groups)
+            if type(channels) is not int or not 1 <= channels <= total_dims:
+                raise ValueError(f"channel_select with channel_groups needs integer channels in [1, {total_dims}]")
+            channel_to_group = [i for i, name in enumerate(groups) for _ in range(layout.specs[name].dims)]
+        elif channels is not None:
+            raise ValueError("channels requires channel_groups (e.g. sparq format)")
+        if not groups and not full and "K_lo" in layout.specs:
+            full = frozenset(("K_lo",))
+            always = [spec for spec in layout.all_tensors
+                      if spec.role == "meta" or spec.tier == "hbm" or spec.name in full]
+        if not groups and not full:
+            raise ValueError("channel_select requires full_tensors (e.g. loki K_lo) or "
+                             "channel_groups (e.g. sparq K_g*)")
+        blocks = -(-shape.context // select_tokens)
+        pick_n = share(blocks, eff_fraction)
+        base_selective = [spec for spec in layout.tensors
+                          if spec.role != "meta" and spec.name not in full and spec.name not in groups_set]
+        prev = {}
+        prev_groups = {}
+        for step in range(steps):
+            for layer in range(shape.layers):
+                for head in range(shape.kv_heads):
+                    if groups:
+                        if select_static and step > 0:
+                            touched_idx = prev_groups[layer, head]
+                        else:
+                            picked_ch = rng.sample(range(total_dims), channels)
+                            touched_idx = sorted({channel_to_group[c] for c in picked_ch})
+                            if select_static:
+                                prev_groups[layer, head] = touched_idx
+                        touched_set = set(touched_idx)
+                        for idx in touched_idx:
+                            yield whole(step, layer, head, layout.specs[groups[idx]])
+                        untouched_data = [layout.specs[groups[i]] for i in range(len(groups))
+                                          if i not in touched_set and layout.specs[groups[i]].role == "data"]
+                        exact_tensors = untouched_data + base_selective
+                    else:
+                        exact_tensors = base_selective
+                    picked, reused = _select_blocks(rng, blocks, pick_n, step, (layer, head), prev,
+                                                    select_static, reuse)
+                    for block in picked:
+                        lo, hi = block * select_tokens, min((block + 1) * select_tokens, shape.context)
+                        op = "H" if block in reused else "R"
+                        for spec in exact_tensors:
+                            yield from clipped(step, layer, head, spec, lo, hi, op)
+                    for spec in always:
+                        yield whole(step, layer, head, spec)
+        return
 
     if mode == "uniform_tokens":
         blocks = -(-shape.context // select_tokens)
