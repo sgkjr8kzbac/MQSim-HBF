@@ -68,3 +68,21 @@ git push origin claude/hbf-kv-study
 |---|---|---|
 | 第 2 阶段 B（一）开始 | 新增分配方式、写入干扰、寿命解析模型；M2 审查修复 | `tests`、`placement`、`interference`、`endurance`（已完成，提交 `fb9631d`） |
 | T-B7、T-B2 之后 | `dedicated`、`packed` 默认错开各请求的起点（`--align stagger`），读并行度会变；扫描脚本新增 `"tool": "endurance"` | `placement`、`tests` |
+| 事件模拟（T-B1d）合并后 | 新增 `hbf.endurance` 的事件模拟（不加 `--analytic`，需要 `--hours`） | `tests`；另跑下面两条验证命令 |
+
+## 事件模拟的验证（T-B1d）
+
+```bash
+python3 -m hbf.endurance --workload long32k --concurrency 8 --alloc packed --hours 24 --warmup-h 1 --rd-threshold 1e5,1e6 --output runs/sim-long32k
+```
+
+```bash
+python3 -m hbf.endurance --workload agentic --concurrency 8 --alloc packed --hours 48 --warmup-h 2 --rd-threshold 1e5,1e6 --output runs/sim-agentic
+```
+
+每条约 1–2 分钟。在 `endurance_summary.csv` 里检查：
+- `avg_pec_per_day`、`refresh_to_kv` 与同一行的 `analytic_avg_pec_per_day`、`analytic_refresh_to_kv` 对比：long32k 在 X = 1e6 时应相差几个百分点以内；agentic 的刷新比例应接近，调用速率会偏低，因为 TPOT 随批增大。
+- `stalls` 为 0，`free_segments_min` 高于低水位。
+- `endurance_timeseries.csv` 中 `avg_pec` 在预热后线性增长。
+
+把两个运行目录里的 `endurance_summary.csv` 复制到 `evidence/phase2b/sim-long32k.csv`、`sim-agentic.csv` 后提交。
