@@ -130,12 +130,29 @@ def schedule_run(cfg, layout, accesses, prefill=False):
     return [replace(batch, arrival_ns=index * cfg.interval_ns) for index, batch in enumerate(batches)]
 
 
-def unwritten_reads(batches):
-    """Reads of LPAs that no earlier batch wrote; the OCP spec answers them with error 0x7."""
-    written, count = set(), 0
+def unwritten_reads(cfg, batches):
+    """Reads of LPAs that are not currently written; the OCP spec answers them with error 0x7
+    (Table 12). Tracks written pages per (unit, block) and resets a block to {0} whenever its
+    page 0 is written (section 5.4.1 auto-erase). Reads in a batch are checked before writes in
+    the same batch update block state.
+    """
+    written = defaultdict(set)
+    count = 0
     for batch in batches:
-        count += sum(req.op == "R" and req.lpa not in written for req in batch.requests)
-        written.update(req.lpa for req in batch.requests if req.op == "W")
+        for req in batch.requests:
+            if req.op == "R":
+                unit = cfg.unit(req.lpa)
+                block, page = divmod(req.lpa // cfg.units, cfg.pages_per_block)
+                if page not in written.get((unit, block), ()):
+                    count += 1
+        for req in batch.requests:
+            if req.op == "W":
+                unit = cfg.unit(req.lpa)
+                block, page = divmod(req.lpa // cfg.units, cfg.pages_per_block)
+                if page == 0:
+                    written[unit, block] = {0}
+                else:
+                    written[unit, block].add(page)
     return count
 
 

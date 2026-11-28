@@ -595,3 +595,18 @@ def test_topology_preset_may_override_device_fields(tmp_path, monkeypatch):
     cfg = cfg_mod.load("half")
     assert cfg.aggregate_gb_s == 512 and cfg.width == 32 and cfg.host_channels == 8
     assert cfg_mod.load("half", aggregate_gb_s=256).aggregate_gb_s == 256
+
+
+def test_unwritten_reads_resets_block_on_page_zero_write():
+    from hbf.controller import unwritten_reads
+    cfg = load("ocp", pages_per_block=4)
+    block0 = [cfg.unit_lpa(0, p) for p in range(4)]
+    other = [cfg.unit_lpa(1, p) for p in range(4)]
+    batches = [
+        Batch(-1, -1, 0, 0, tuple(Request(lpa, "W") for lpa in block0 + other)),
+        Batch(0, 0, 0, cfg.interval_ns, (Request(block0[1], "R"), Request(block0[0], "W"))),
+        Batch(1, 0, 0, 2 * cfg.interval_ns, (Request(block0[0], "R"), Request(block0[1], "R"), Request(other[1], "R"))),
+    ]
+    # Batch 1 reads page 1 before batch 1's page-0 write erases block 0; batch 2's read of page 1 is unwritten,
+    # while page 0 of block 0 (rewritten) and page 1 of unit 1 (untouched) remain written.
+    assert unwritten_reads(cfg, batches) == 1

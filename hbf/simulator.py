@@ -222,7 +222,7 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     if not batches or not all(batch.requests for batch in batches):
         raise ValueError("At least one nonempty batch is required")
     check_gc_budget(cfg, batches)
-    unwritten = unwritten_reads(batches)
+    unwritten = unwritten_reads(cfg, batches)
     if unwritten and cfg.planes > 1 and not allow_unwritten:
         # One plane per chip makes the offset irrelevant; with multi-plane commands MQSim's first-read
         # allocation would put the pages at offsets the OCP spec does not allow (Table 12, error 0x7).

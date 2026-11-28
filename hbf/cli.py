@@ -293,7 +293,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     if layer_rows:
         write_table(directory / "analysis_layers.csv", layer_rows)
         write_table(directory / "analysis_steps.csv", step_rows)
-    unwritten = unwritten_reads(batches) if needs_schedule else 0
+    unwritten = unwritten_reads(cfg, batches) if needs_schedule else 0
     hierarchy = (f"{cfg.channels} 通道 × {cfg.chips} chip × {cfg.dies} die × {cfg.planes} plane"
                  f"（地址映射 {cfg.address_map}）")
     switches = [f"核心通道合计 {cfg.aggregate_gb_s} GB/s", f"plane 规则 {cfg.plane_rule or '上游'}"]
