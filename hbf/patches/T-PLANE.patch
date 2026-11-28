@@ -97,13 +97,18 @@ index 5d19956..7616554 100644
  #include <string>
  #include "TSU_Base.h"
  
-@@ -5,6 +9,31 @@
+@@ -5,6 +9,37 @@
  
  namespace SSD_Components
  {
 +	//HBF T-PLANE: rule for the transactions that may join one multi-plane command.
 +	//Unset keeps upstream (same page index, any block); "independent" accepts any address on each
-+	//plane, as the OCP HBF spec allows per-bank reads; "lockstep" requires the same block and page.
++	//plane for reads only (OCP section 11.2.2 requires the same page number across banks of a die
++	//for multi-plane writes/erases, so non-read transactions require matching block and page);
++	//"lockstep" requires the same block and page.
++	//Note: pageID/blockID are taken from sourceQueue1->front() rather than the first ready
++	//transaction; that could only diverge when the queue head is a write waiting on a RelatedRead,
++	//which does not occur with whole-page writes.
 +	static int hbf_plane_rule()
 +	{
 +		static const int rule = [] {
@@ -120,7 +125,8 @@ index 5d19956..7616554 100644
 +	static bool hbf_joins_command(const NVM_Transaction_Flash* tr, flash_block_ID_type blockID, flash_page_ID_type pageID)
 +	{
 +		switch (hbf_plane_rule()) {
-+			case 1: return true;
++			case 1: return tr->Type == Transaction_Type::READ
++				|| (tr->Address.PageID == pageID && tr->Address.BlockID == blockID);
 +			case 2: return tr->Address.PageID == pageID && tr->Address.BlockID == blockID;
 +			default: return tr->Address.PageID == pageID;
 +		}
@@ -129,7 +135,7 @@ index 5d19956..7616554 100644
  	TSU_Base* TSU_Base::_my_instance = NULL;
  
  	TSU_Base::TSU_Base(const sim_object_id_type& id, FTL* ftl, NVM_PHY_ONFI_NVDDR2* NVMController, Flash_Scheduling_Type Type,
-@@ -73,7 +102,8 @@ namespace SSD_Components
+@@ -73,7 +108,8 @@ namespace SSD_Components
  	{
  		flash_die_ID_type dieID = sourceQueue1->front()->Address.DieID;
  		flash_page_ID_type pageID = sourceQueue1->front()->Address.PageID;
@@ -139,7 +145,7 @@ index 5d19956..7616554 100644
  		static int issueCntr = 0;
  		
  		for (unsigned int i = 0; i < die_no_per_chip; i++)
-@@ -83,13 +113,13 @@ namespace SSD_Components
+@@ -83,13 +119,13 @@ namespace SSD_Components
  
  			for (Flash_Transaction_Queue::iterator it = sourceQueue1->begin(); it != sourceQueue1->end();)
  			{
@@ -156,7 +162,7 @@ index 5d19956..7616554 100644
  						transaction_dispatch_slots.push_back(*it);
  						DEBUG(issueCntr++ << ": " << Simulator->Time() <<" Issueing Transaction - Type:" << TRTOSTR((*it)) << ", PPA:" << (*it)->PPA << ", LPA:" << (*it)->LPA << ", Channel: " << (*it)->Address.ChannelID << ", Chip: " << (*it)->Address.ChipID);
  						sourceQueue1->remove(it++);
-@@ -103,13 +133,13 @@ namespace SSD_Components
+@@ -103,13 +139,13 @@ namespace SSD_Components
  			{
  				for (Flash_Transaction_Queue::iterator it = sourceQueue2->begin(); it != sourceQueue2->end();)
  				{

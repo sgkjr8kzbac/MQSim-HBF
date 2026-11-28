@@ -322,3 +322,27 @@ def test_multiplane_runs_reject_unwritten_reads(binary, tmp_path):
     _, _, _, stats = pipeline(one_plane, Shape(1, 2, 128, 256), "layer_contiguous", tmp_path / "chips", binary,
                               mode="uniform_pages")
     assert stats["unwritten_reads"] > 0  # allowed with one plane per chip, where the offset has no effect
+
+
+def test_independent_rule_does_not_combine_mismatched_page_writes(binary, evidence):
+    """OCP section 11.2.2: multi-plane writes on a die require the same page number.
+
+    Batch 0 writes only plane 0 (advancing its write frontier to page 1 while plane 1 stays at
+    page 0). Batch 1 writes both plane 0 and plane 1 together with a coalescing window: because
+    their page indices differ (1 vs 0), T-PLANE independent must not merge them into a multi-plane
+    program command.
+    """
+    cfg = load("16x64", channels=1, chips=1, planes=2, aggregate_gb_s=64,
+               plane_rule="independent", coalesce_ns=500)
+    mismatched = [
+        Batch(-1, 0, 0, 0, (Request(0, "W"),)),
+        Batch(-1, 0, 1, cfg.interval_ns, (Request(2, "W"), Request(1, "W"))),
+    ]
+    _, _, _, stats = simulate(cfg, mismatched, evidence / "t-plane-write-mismatch", binary)
+    assert stats["Issued_Flash_Multiplane_Program_CMD"] == 0
+    assert stats["Issued_Flash_Program_CMD"] == 3
+    # Positive control: both planes at page 0 do combine into one multi-plane program command.
+    matched = [Batch(-1, 0, 0, 0, (Request(0, "W"), Request(1, "W")))]
+    _, _, _, stats_ok = simulate(cfg, matched, evidence / "t-plane-write-match", binary)
+    assert stats_ok["Issued_Flash_Multiplane_Program_CMD"] == 1
+    assert stats_ok["Issued_Flash_Program_CMD"] == 0
