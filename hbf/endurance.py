@@ -25,11 +25,15 @@ and ``METRICS`` mirror ``hbf.cli`` for the sweep driver.
 import argparse
 import csv
 import hashlib
+import heapq
 import itertools
 import json
 import math
+import os
 import sys
-from dataclasses import dataclass
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -37,7 +41,7 @@ from uuid import uuid4
 import numpy as np
 
 from .interference import MODES as M5_MODES, hbf_gaps, interference
-from .workload import load_workload, presets as workload_presets
+from .workload import Stream, load_workload, per_stack, presets as workload_presets
 
 GIB = 2 ** 30
 DAY = 86400.0
@@ -106,6 +110,15 @@ class Geometry:
             share = 1.0 if role_share is None else role_share.get(spec.role, 1.0)
             total += float(np.sum(-(-(hi - lo) // tpp))) * share
         return self.heads * total
+
+    def hbm_bytes(self, ctx):
+        """HBM-tier KV bytes of one request with ``ctx`` tokens (e.g. KIVI's full-precision residual)."""
+        ctx = np.asarray(ctx, dtype=np.int64)
+        total = np.zeros_like(ctx)
+        for spec in self.hbm:
+            lo, hi = self.window(spec, ctx)
+            total += (hi - lo) * spec.token_bytes
+        return self.layers * self.heads * total
 
     def partial_pages(self):
         """Pages of HBM staging per running request: one partial page per (layer, head, HBF tensor)."""
@@ -335,9 +348,9 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
     rounds at kappa 1 (ceil(pages / 1,024), or the busiest partition's), the demand ratios of
     the mode against dense at the same batch, and the per-step hot factor (max block reads over
     ppb x read share). Pages per block do not change rounds or est, so they are fixed at 256.
-    Returns the fields for ``Clock`` plus diagnostics.
+    Returns the fields for ``Clock`` plus diagnostics. Safe for concurrent processes sharing
+    ``directory`` (an exclusive lock per digest).
     """
-    import shutil
     batches = tuple(batches or calibration_batches(model, kv_format, context))
     inputs = {"model": model, "gpu": gpu, "format": kv_format, "mode": mode, "generation": generation or {},
               "context": context, "batches": list(batches), "device": list(device), "policy": policy,
@@ -348,6 +361,39 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
     if cached.is_file():
         return json.loads(cached.read_text())
     root.mkdir(parents=True, exist_ok=True)
+    # Sweep workers share the cache: one process fits a digest while the others wait on the lock and
+    # then read its result; calibration.json appears atomically (os.replace).
+    with _exclusive(root / ".lock"):
+        if cached.is_file():
+            return json.loads(cached.read_text())
+        result = _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, context, batches, device,
+                                  policy, partition, snapshot_batch)
+        temporary = root / f".calibration-{os.getpid()}.json"
+        temporary.write_text(json.dumps(result, indent=2) + "\n")
+        os.replace(temporary, cached)
+    return result
+
+
+@contextmanager
+def _exclusive(path):
+    """An exclusive advisory lock on ``path`` (fcntl.flock; a no-op where fcntl is missing)."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - not POSIX
+        yield
+        return
+    with open(path, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, context, batches, device, policy,
+                     partition, snapshot_batch):
+    """The phase A runs and fits of ``calibrate`` (called with the cache lock held)."""
+    import shutil
 
     def fresh(name):
         target = root / name
@@ -406,7 +452,6 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
               "snapshot": {"policy": snap_policy, "partition": snap_part, "batch": b,
                            "tpot_ns": snapshot["system"][0]["tpot_hbf_est_ns"] if snapshot["system"] else None},
               "inputs": inputs, "points": len(points)}
-    cached.write_text(json.dumps(result, indent=2) + "\n")
     return result
 
 
@@ -635,7 +680,9 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
                "tpot_m5_ms": (step.tpot_ns + m5_row["extra_step_ns"]) / 1e6,
                "max_step_extra_ms": m5_row["max_step_extra_ns"] / 1e6, "req_per_s": calls_per_s,
                "tokens_per_s": tokens_per_s, "pages_per_request": host_pages / calls,
-               "kv_bytes_per_token": geometry.token_bytes, "threshold_steps": threshold_steps(x, ppb, share, hot),
+               "kv_bytes_per_token": geometry.hbf_token_bytes,
+               "hbm_bytes_per_request": float(geometry.hbm_bytes(np.array([int(round(ctx))]))[0]),
+               "threshold_steps": threshold_steps(x, ppb, share, hot),
                "refreshes_per_request": refreshes, "kv_write_gb_s": kv * page / 1e9}
         row |= {f"{cause}_gb_s": rates[cause] * page / 1e9 for cause in CAUSES}
         refresh = rates["refresh_rd"] + rates["refresh_ret"] + rates["replay"]
@@ -661,6 +708,1066 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
         row["legal"] = policy != "vllm_pool"
         rows.append(row)
     return rows
+
+
+# --------------------------------------------------------------------------------------------
+# Event simulation (M4b)
+
+SIM_POLICIES = ("packed", "dedicated", "hbm_decode", "layer_major")
+WEAR = ("none", "dynamic", "ideal")
+REFRESH = ("auto", "relocate", "replay")
+CAUSE = {cause: index for index, cause in enumerate(CAUSES)}
+EPS = 1e-6
+OPEN, FULL = 1, 2  # segment states (0: never written)
+ACTIVE, IDLE = 1, 2  # entry states (0: unused)
+PRIVATE, PREFIX, SESSION = 0, 1, 2  # entry kinds
+
+
+class CapacityError(RuntimeError):
+    """No free segment for a write or an admission (raise --capacity-gib or lower the load)."""
+
+
+@dataclass(frozen=True)
+class SimOptions:
+    """Settings of one event simulation (CLI names in ``build_parser``)."""
+    policy: str = "packed"
+    x: float = 1e6  # read-disturb threshold in block reads
+    hot: float = 1.0  # persistent read skew (max over mean block reads)
+    share: float = 1.0  # pages sensed per stored page per decode step
+    retention_s: float = 86400.0  # 0: retention refresh off
+    prefix_reads: str = "per_request"
+    hours: float = 24.0
+    warmup_h: float = 1.0
+    quantum_s: float = 1.0
+    report_s: float = 60.0
+    rd_slack: float = 0.01  # shortest quantum as a share of the fastest segment's threshold in steps
+    wear: str = "dynamic"
+    refresh: str = "auto"  # auto: replay for layer_major, relocate otherwise
+    refresh_idle: str = "relocate"  # or evict: idle entries in a refreshed segment are dropped
+    reclaim: str = "evict"  # or compact: idle entries in a reclaim victim are copied too
+    low_watermark: int | None = None  # free segments per partition kept by reclaim (default 2 + one request)
+    align: str = "row"  # packed: a new entry starts on a row
+    slots: int | None = None  # running requests at most (layer_major: slots per wave)
+    stagger: bool = True
+    stacks: int = 1  # for the summary only (the workload is already one stack's share)
+    m5: str = "gaps"
+    t_prog: float = 100000.0
+    t_bers: float = 1000000.0
+    suspend_ns: float | None = None
+    block_unit: str = "die"
+    pe_limits: tuple = (1e4, 1e5, 1e6)
+
+    def __post_init__(self):
+        if self.policy not in SIM_POLICIES:
+            raise ValueError(f"The simulation supports the policies {', '.join(SIM_POLICIES)}; "
+                             "vllm_pool is analytic only (--analytic)")
+        if self.wear not in WEAR or self.refresh not in REFRESH:
+            raise ValueError(f"wear must be one of {', '.join(WEAR)} and refresh one of {', '.join(REFRESH)}")
+        if self.refresh_idle not in ("relocate", "evict") or self.reclaim not in ("evict", "compact"):
+            raise ValueError("refresh_idle is relocate or evict; reclaim is evict or compact")
+        if self.prefix_reads not in ("per_request", "once") or self.align not in ("row", "none"):
+            raise ValueError("prefix_reads is per_request or once; align is row or none")
+        if self.m5 not in M5_MODES + ("off",):
+            raise ValueError(f"m5 must be one of {', '.join(M5_MODES + ('off',))}")
+        if self.m5 == "suspend" and self.suspend_ns is None:
+            raise ValueError("m5 suspend needs suspend_ns")
+        if min(self.x, self.hot, self.hours, self.quantum_s, self.report_s) <= 0 or not 0 < self.share <= 1:
+            raise ValueError("x, hot, hours, quantum and report interval must be positive and share in (0, 1]")
+        if self.warmup_h < 0 or self.warmup_h >= self.hours:
+            raise ValueError("The warm-up must be non-negative and shorter than the simulated time")
+        if self.retention_s < 0 or not 0 <= self.rd_slack < 1:
+            raise ValueError("retention_s must be >= 0 and rd_slack in [0, 1)")
+        if self.low_watermark is not None and self.low_watermark < 1:
+            raise ValueError("low_watermark must be at least 1 segment")
+        if self.slots is not None and self.slots < 1:
+            raise ValueError("slots must be positive")
+        if self.policy == "layer_major" and self.refresh == "relocate":
+            raise ValueError("layer_major regions are refreshed in place (replay, spec section 5.7)")
+
+
+class Simulator:
+    """Segment-level event simulation of one HBF stack (design-B section 4); ``simulate`` runs it.
+
+    A segment is one block index across the banks of a partition (a superblock of 1,024 banks, a
+    channel block of 64 or a die block of 16). Placement is row-aligned, so an entry with n pages
+    in a segment puts n / banks pages in each of its blocks and segment-level counts are exact.
+
+    State (struct of arrays): segments (fill, live, pec, block reads since erase x hot, state,
+    owner: a dedicated entry or -2 for a wave region, erases per cause); entries (a request's own
+    KV, a shared prefix or a session history: pages, readers, active or idle, idle deadline);
+    occupancy rows (entry, segment, pages, oldest write time) in COO arrays; running requests in
+    slot arrays (context, end context, staged decode pages, entry, prefix entry, partition).
+
+    One quantum: step time T from the Clock plus the previous quantum's M5 extra; n = quantum / T
+    steps, cut at the earliest predicted read-threshold or retention crossing (not below rd_slack
+    of the fastest segment's threshold in steps); requests complete and arrive at their exact step
+    inside it. Then block reads are applied, staged decode pages are written in whole rows, and
+    idle expiry, read-disturb refresh, retention refresh and reclaim run (design-B section 4.2).
+    """
+
+    def __init__(self, geometry, clock, workload, device=None, options=None, model=None):
+        self.geo, self.clock, self.workload = geometry, clock, workload
+        self.dev = d = device or Device()
+        self.opt = o = options or SimOptions()
+        self.model = model if model is not None else getattr(clock, "model", None)
+        if o.policy == "layer_major" and d.partition != "none":
+            raise ValueError("layer_major uses the whole device (no partition)")
+        if o.refresh == "auto":
+            self.refresh = "replay" if o.policy == "layer_major" else "relocate"
+        else:
+            self.refresh = o.refresh
+        self.writes_decode = o.policy in ("packed", "dedicated")
+        self.hbm_out = o.policy in ("hbm_decode", "layer_major")
+        self.parts, self.row, self.P = d.parts, d.segment_banks, d.segment_pages
+        self.S = S = d.capacity_pages // self.P
+        if S < 2 * self.parts:
+            raise ValueError(f"The device holds {S} segments of {self.P} pages: need at least 2 per partition")
+        self.read_scale = o.share * o.hot / self.row
+        # segments
+        self.fill, self.live, self.reads = np.zeros(S), np.zeros(S), np.zeros(S)
+        self.pec = np.zeros(S, dtype=np.int64)
+        self.state = np.zeros(S, dtype=np.int8)
+        self.owner = np.full(S, -1, dtype=np.int64)
+        self.busy = np.zeros(S, dtype=bool)
+        self.part_of = np.arange(S) % self.parts
+        self.erases = np.zeros((S, len(CAUSES)), dtype=np.int64)
+        self.is_free = np.ones(S, dtype=bool)
+        self.heaps = [[self._key(s) for s in range(p, S, self.parts)] for p in range(self.parts)]
+        self.free_count = np.array([len(heap) for heap in self.heaps], dtype=np.int64)
+        self.part_live = np.zeros(self.parts)
+        self.part_pec = np.zeros(self.parts)  # sum of segment PECs per partition (tie-break for new entries)
+        self.frontier = [-1] * self.parts
+        # entries
+        self.e_cap = 0
+        self.free_entries = []
+        self._grow_entries(256)
+        self.e_rows, self.e_owned, self.e_key = {}, {}, {}
+        self.prefix_entry, self.session_entry = {}, {}
+        self.protected = set()
+        # occupancy rows
+        self.c_e = np.zeros(4096, dtype=np.int64)
+        self.c_s = np.zeros(4096, dtype=np.int64)
+        self.c_n = np.zeros(4096)
+        self.c_t = np.zeros(4096)
+        self.c_v = np.zeros(4096, dtype=bool)
+        self.c_count = self.dead_rows = 0
+        # running requests
+        w = workload
+        self.cap = cap = o.slots or (w.concurrency if w.arrival == "closed" else w.max_batch)
+        self.sl_on = np.zeros(cap, dtype=bool)
+        self.sl_req = [None] * cap
+        self.sl_entry = np.full(cap, -1, dtype=np.int64)
+        self.sl_prefix = np.full(cap, -1, dtype=np.int64)
+        self.sl_ctx = np.zeros(cap, dtype=np.int64)
+        self.sl_end = np.zeros(cap, dtype=np.int64)
+        self.sl_gen = np.zeros(cap, dtype=np.int64)
+        self.sl_part = np.zeros(cap, dtype=np.int64)
+        self.sl_staged = np.zeros(cap)
+        self.free_slots = list(range(cap - 1, -1, -1))
+        self.n_running = 0
+        self.queue = []
+        self.stream = Stream(workload, stagger=o.stagger)
+        self.region, self.region_cache = [], {}
+        # clocks and counters
+        self.t = 0.0
+        self.page_cache = {}
+        self.programs = np.zeros(len(CAUSES))
+        self.seg_erases = np.zeros(len(CAUSES), dtype=np.int64)
+        self.block_erases = 0
+        self.acc = dict.fromkeys(("steps", "tokens", "batch_s", "ctx_s", "decode_s", "tpot_s", "m5_s"), 0.0)
+        self.n = dict.fromkeys(("completed", "admitted", "refresh_rd", "refresh_ret", "compaction", "evicted_pages",
+                                "recompute_tokens", "stalls", "reclaims", "waves", "quanta"), 0.0)
+        self.guard = False
+        self.pending_reads = False
+        self.drops = 0  # bumps whenever live data dies or moves (retry point of a stalled admission)
+        self.blocked = None
+        self.m5_extra = self.max_step_extra = self.staging_peak = 0.0
+        self.m5_mark = (0.0, 0)
+        self.free_min = int(self.free_count.sum())
+        self.warm = None
+        self.timeseries = []
+        self.low_wm = o.low_watermark or min(2 + math.ceil(self._max_request_pages() / self.P - 1e-9),
+                                             max(1, S // self.parts // 2))
+        self.wall_s = 0.0
+
+    # ---- helpers ---------------------------------------------------------------------------
+    def _key(self, s):
+        return (0 if self.opt.wear == "none" else int(self.pec[s]), s)
+
+    def pages(self, tokens):
+        """Full HBF pages of ``tokens`` tokens of one request (cached)."""
+        tokens = int(tokens)
+        hit = self.page_cache.get(tokens)
+        if hit is None:
+            hit = self.page_cache[tokens] = float(self.geo.stored_pages(np.array([tokens]))[0])
+        return hit
+
+    def _max_request_pages(self):
+        w = self.workload
+
+        def top(length):
+            if length is None:
+                return 0.0
+            return float(length.get("n")) if length.kind == "fixed" else float(length._grid()[-1])
+        if w.arrival == "script":
+            tokens = max(int(item["input"]) + int(item["output"]) for item in w.script)
+        elif w.sessions:
+            tokens = top(w.history) + w.calls * (top(w.input) + top(w.output))
+        else:
+            tokens = top(w.input) + top(w.output)
+        return self.pages(int(tokens + w.prefix_tokens))
+
+    def _grow_entries(self, new):
+        fields = (("e_pages", float, 0), ("e_readers", float, 0), ("e_state", np.int8, 0),
+                  ("e_ttl", float, math.inf), ("e_kind", np.int8, 0), ("e_part", np.int64, 0),
+                  ("e_dseg", np.int64, -1), ("e_tokens", float, 0), ("e_steps", float, 0),
+                  ("e_stored", np.int64, 0))  # e_stored: context position up to which the entry is on HBF
+        old = self.e_cap
+        for name, kind, fill in fields:
+            grown = np.full(new, fill, dtype=kind)
+            if old:
+                grown[:old] = getattr(self, name)
+            setattr(self, name, grown)
+        self.free_entries.extend(range(new - 1, old - 1, -1))
+        self.e_cap = new
+
+    def _new_entry(self, kind, part, tokens):
+        if not self.free_entries:
+            self._grow_entries(2 * self.e_cap)
+        e = self.free_entries.pop()
+        self.e_pages[e] = self.e_readers[e] = self.e_steps[e] = 0.0
+        self.e_state[e], self.e_ttl[e], self.e_kind[e] = ACTIVE, math.inf, kind
+        self.e_part[e], self.e_dseg[e], self.e_tokens[e], self.e_stored[e] = part, -1, tokens, 0
+        self.e_rows[e], self.e_owned[e] = {}, []
+        return e
+
+    def _program(self, cause, n):
+        self.programs[CAUSE[cause]] += n
+
+    # ---- occupancy rows --------------------------------------------------------------------
+    def _row(self, e, s, n):
+        rows = self.e_rows[e]
+        i = rows.get(s)
+        if i is not None:  # keeps the older write time (conservative for retention)
+            self.c_n[i] += n
+            return
+        if self.c_count == len(self.c_e):
+            if self.dead_rows > self.c_count // 2:
+                self._compact_rows()
+            else:
+                for name in ("c_e", "c_s", "c_n", "c_t", "c_v"):
+                    array = getattr(self, name)
+                    grown = np.zeros(2 * len(array), dtype=array.dtype)
+                    grown[:len(array)] = array
+                    setattr(self, name, grown)
+        i = self.c_count
+        self.c_e[i], self.c_s[i], self.c_n[i], self.c_t[i], self.c_v[i] = e, s, n, self.t, True
+        self.c_count += 1
+        rows[s] = i
+
+    def _compact_rows(self):
+        self._flush_reads()
+        keep = np.flatnonzero(self.c_v[:self.c_count])
+        for name in ("c_e", "c_s", "c_n", "c_t", "c_v"):
+            array = getattr(self, name)
+            array[:len(keep)] = array[keep]
+        self.c_v[len(keep):] = False
+        self.c_count, self.dead_rows = len(keep), 0
+        for rows in self.e_rows.values():
+            rows.clear()
+        for i, (e, s) in enumerate(zip(self.c_e[:len(keep)].tolist(), self.c_s[:len(keep)].tolist())):
+            self.e_rows[e][s] = i
+
+    def _drop(self, i):
+        """Invalidate occupancy row i; returns (entry, pages)."""
+        e, s, n = int(self.c_e[i]), int(self.c_s[i]), float(self.c_n[i])
+        self.c_v[i] = False
+        self.dead_rows += 1
+        self.drops += 1
+        del self.e_rows[e][s]
+        self.e_pages[e] -= n
+        self.live[s] -= n
+        self.part_live[self.part_of[s]] -= n
+        if self.live[s] < EPS:
+            self.live[s] = 0.0
+            self._release(s)
+        return e, n
+
+    # ---- segments --------------------------------------------------------------------------
+    def _release(self, s):
+        """Mark segment s free when it is closed, unowned and holds no live data."""
+        if (self.is_free[s] or self.busy[s] or self.state[s] == OPEN or self.owner[s] != -1
+                or self.live[s] > EPS):
+            return
+        self.is_free[s] = True
+        p = self.part_of[s]
+        heapq.heappush(self.heaps[p], self._key(s))
+        self.free_count[p] += 1
+        self.drops += 1
+
+    def _take(self, part):
+        heap = self.heaps[part]
+        while heap:
+            s = heapq.heappop(heap)[1]
+            if self.is_free[s]:
+                self.is_free[s] = False
+                self.free_count[part] -= 1
+                self.free_min = min(self.free_min, int(self.free_count.sum()))
+                return s
+        return -1
+
+    def _erase(self, s, cause):
+        """Row-0 write of segment s: every block of it is auto-erased (spec section 5.4.1 item 5)."""
+        c = CAUSE[cause]
+        self.pec[s] += 1
+        self.part_pec[self.part_of[s]] += 1
+        self.erases[s, c] += 1
+        self.seg_erases[c] += 1
+        self.block_erases += self.row
+        self.reads[s] = 0.0
+
+    def _open(self, part, cause, owner=-1):
+        """Take a free segment of ``part`` and write its row 0 (an erase), reclaiming first when none is free."""
+        s = self._take(part)
+        if s < 0 and not self.guard:
+            self._reclaim(part, force=True, target=self.P)
+            if owner < 0 and self.frontier[part] >= 0:  # compaction opened a frontier: continue there
+                return self.frontier[part]
+            s = self._take(part)
+        if s < 0:
+            raise CapacityError(f"No free segment in partition {part} at t = {self.t:.1f} s "
+                                f"({self.S} segments of {self.P} pages); raise --capacity-gib or --low-watermark")
+        self._erase(s, cause)
+        self.state[s], self.owner[s], self.fill[s] = OPEN, owner, 0.0
+        if owner >= 0:
+            self.e_owned[owner].append(s)
+        else:
+            self.frontier[part] = s
+        return s
+
+    def _close(self, s):
+        self.state[s] = FULL
+        p = self.part_of[s]
+        if self.frontier[p] == s:
+            self.frontier[p] = -1
+        o = self.owner[s]
+        if o >= 0 and self.e_dseg[o] == s:
+            self.e_dseg[o] = -1
+        self._release(s)
+
+    # ---- writes ----------------------------------------------------------------------------
+    def _write(self, e, n, cause, align=False):
+        """Append n pages of entry e: the partition's frontier, or the entry's own segment (dedicated)."""
+        part = int(self.e_part[e])
+        dedicated = self.opt.policy == "dedicated"
+        while n > EPS:
+            if dedicated:
+                s = int(self.e_dseg[e])
+                if s < 0:
+                    s = self._open(part, cause, owner=e)
+                    self.e_dseg[e] = s
+            else:
+                s = self.frontier[part]
+                if s >= 0 and align and self.opt.align == "row":
+                    pad = math.ceil(self.fill[s] / self.row - 1e-9) * self.row - self.fill[s]
+                    if pad > EPS:
+                        self.fill[s] += pad
+                        self._program("padding", pad)
+                        if self.fill[s] >= self.P - EPS:
+                            self._close(s)
+                            s = -1
+                if s < 0:
+                    s = self._open(part, cause)
+                align = False
+            k = min(n, self.P - self.fill[s])
+            self.fill[s] += k
+            self.live[s] += k
+            self.part_live[self.part_of[s]] += k
+            self.e_pages[e] += k
+            self._row(e, s, k)
+            self._program(cause, k)
+            n -= k
+            if self.fill[s] >= self.P - EPS:
+                self._close(s)
+
+    def _read_once(self, e):
+        """Prefill attention over a cached entry: every page is read once (no share, no skew)."""
+        for s, i in self.e_rows[e].items():
+            self.reads[s] += self.c_n[i] / self.row
+
+    # ---- block reads -----------------------------------------------------------------------
+    def _flush_reads(self):
+        """Apply the read steps accrued since the last flush to the segments holding each entry."""
+        if not self.pending_reads:
+            return
+        n = self.c_count
+        weight = self.c_n[:n] * self.e_steps[self.c_e[:n]]
+        weight[~self.c_v[:n]] = 0.0
+        self.reads += np.bincount(self.c_s[:n], weight, self.S) * self.read_scale
+        self.e_steps[:] = 0.0
+        self.pending_reads = False
+
+    def _entry_reads(self, e):
+        k = self.e_steps[e]
+        if k:
+            for s, i in self.e_rows[e].items():
+                self.reads[s] += self.c_n[i] * k * self.read_scale
+            self.e_steps[e] = 0.0
+
+    def _rates(self):
+        """Block reads per decode step per segment for the current running set."""
+        on = np.flatnonzero(self.sl_on)
+        rate = np.zeros(self.e_cap)
+        np.add.at(rate, self.sl_entry[on], 1.0)
+        pre = self.sl_prefix[on]
+        pre = pre[pre >= 0]
+        if len(pre):
+            if self.opt.prefix_reads == "per_request":
+                np.add.at(rate, pre, 1.0)
+            else:
+                rate[np.unique(pre)] = 1.0
+        n = self.c_count
+        weight = self.c_n[:n] * rate[self.c_e[:n]]
+        weight[~self.c_v[:n]] = 0.0
+        return np.bincount(self.c_s[:n], weight, self.S) * self.read_scale
+
+    # ---- admission and completion ------------------------------------------------------------
+    def _partition(self):
+        """Partition of a new entry: least live pages; ties to the least worn (wear levelling) or lowest index."""
+        if self.parts == 1:
+            return 0
+        low = np.flatnonzero(self.part_live <= self.part_live.min() + EPS)
+        if self.opt.wear == "none":
+            return int(low[0])
+        return int(low[np.argmin(self.part_pec[low])])
+
+    def _outstanding(self, part):
+        """Pages that running requests of ``part`` will still write (remaining decode plus staged)."""
+        if not self.writes_decode:
+            return 0.0
+        on = np.flatnonzero(self.sl_on & (self.sl_part == part))
+        if not len(on):
+            return 0.0
+        geo = self.geo
+        return float((geo.stored_pages(self.sl_end[on]) - geo.stored_pages(self.sl_ctx[on])).sum()
+                     + self.sl_staged[on].sum())
+
+    def _room(self, part):
+        room = float(self.free_count[part] * self.P)
+        s = self.frontier[part]
+        if s >= 0 and self.opt.policy != "dedicated":
+            room += self.P - self.fill[s]
+        return room
+
+    def _space(self, part, need):
+        """Room for ``need`` pages plus outstanding writes and the reserve, reclaiming when short."""
+        if self.opt.policy == "dedicated":
+            need = math.ceil(need / self.P - 1e-9) * self.P
+        want = need + self._outstanding(part)
+        reserve = (self.low_wm - 1) * self.P
+        if self._room(part) - want >= reserve:
+            return True
+        self._reclaim(part, force=True, target=want + reserve)
+        return self._room(part) - want >= -EPS
+
+    def _admit(self, req):
+        """Start a request: prefix and session entries, prefill writes. False when space is short."""
+        w = self.workload
+        pre_tokens = w.prefix_tokens if req.prefix >= 0 else 0
+        start = pre_tokens + req.history + req.input
+        end = start + req.output
+        sess = self.session_entry.get(req.session, -1) if req.session >= 0 else -1
+        pre = self.prefix_entry.get(req.prefix, -1) if req.prefix >= 0 else -1
+        # A session's history is on HBF up to e_stored (under hbm_decode the last call's output is not:
+        # it is written with this call's prompt); an evicted history is recomputed and rewritten.
+        have = int(self.e_stored[sess]) if sess >= 0 else pre_tokens
+        own = self.pages(start) - self.pages(have)
+        need = own + (self.pages(pre_tokens) if req.prefix >= 0 and pre < 0 else 0.0)
+        if self.writes_decode:
+            need += self.pages(end) - self.pages(start)
+        part = int(self.e_part[sess]) if sess >= 0 else self._partition()
+        keep = [e for e in (sess, pre) if e >= 0]
+        self.protected.update(keep)  # a forced reclaim must not evict what this request reuses
+        try:
+            if not self._space(part, need):
+                return False
+        finally:
+            self.protected.difference_update(keep)
+        if req.prefix >= 0:
+            if pre >= 0:
+                self._read_once(pre)
+            else:
+                pre = self._new_entry(PREFIX, part, pre_tokens)
+                self.prefix_entry[req.prefix], self.e_key[pre] = pre, ("prefix", req.prefix)
+                self._write(pre, self.pages(pre_tokens), "prefill", align=True)
+            self.e_state[pre], self.e_ttl[pre] = ACTIVE, math.inf
+            self.e_readers[pre] += 1
+        if sess >= 0:
+            e = sess
+            self._read_once(e)
+        else:
+            e = self._new_entry(SESSION if req.session >= 0 else PRIVATE, part, 0)
+            if req.session >= 0:
+                self.session_entry[req.session], self.e_key[e] = e, ("session", req.session)
+                self.n["recompute_tokens"] += req.history  # an evicted history is recomputed
+        self.e_state[e], self.e_readers[e], self.e_ttl[e] = ACTIVE, 1.0, math.inf
+        self.e_tokens[e], self.e_stored[e] = start - pre_tokens, start
+        self._write(e, own, "prefill", align=sess < 0)
+        slot = self.free_slots.pop()
+        self.sl_on[slot], self.sl_req[slot] = True, req
+        self.sl_entry[slot], self.sl_prefix[slot], self.sl_part[slot] = e, pre, part
+        self.sl_ctx[slot], self.sl_end[slot], self.sl_gen[slot], self.sl_staged[slot] = start, end, 0, 0.0
+        self.n_running += 1
+        self.n["admitted"] += 1
+        return True
+
+    def _complete(self, slot):
+        req, e, pre = self.sl_req[slot], int(self.sl_entry[slot]), int(self.sl_prefix[slot])
+        if self.sl_staged[slot] > EPS:  # the request's last staged full pages (a partial row)
+            self._entry_reads(e)
+            self._write(e, float(self.sl_staged[slot]), "decode")
+        if self.writes_decode:
+            self.e_stored[e] = self.sl_end[slot]
+            self.e_tokens[e] = self.sl_end[slot] - (self.workload.prefix_tokens if pre >= 0 else 0)
+        self.sl_on[slot], self.sl_req[slot], self.sl_staged[slot] = False, None, 0.0
+        self.free_slots.append(slot)
+        self.n_running -= 1
+        self.n["completed"] += 1
+        w = self.workload
+        if pre >= 0:
+            self.e_readers[pre] -= 1
+            if self.e_readers[pre] <= 0:
+                if w.retain_s > 0:
+                    self._idle(pre, self.t + w.retain_s)
+                else:
+                    self._kill(pre)
+        if req.session >= 0 and not req.last:
+            self._idle(e, math.inf)
+        elif req.retain_s > 0:
+            self._idle(e, self.t + req.retain_s)
+        else:
+            self._kill(e)
+        self.stream.call_done(req, self.t)
+
+    def _idle(self, e, ttl):
+        self.e_state[e], self.e_readers[e], self.e_ttl[e] = IDLE, 0.0, ttl
+
+    def _kill(self, e, evicted=False):
+        self._entry_reads(e)
+        if evicted:
+            self.n["evicted_pages"] += self.e_pages[e]
+            self.n["recompute_tokens"] += self.e_tokens[e]
+        for i in list(self.e_rows[e].values()):
+            self._drop(i)
+        for s in self.e_owned.pop(e, ()):
+            if self.owner[s] == e:
+                self.owner[s] = -1
+                if self.state[s] == OPEN:
+                    self.state[s] = FULL
+                self._release(s)
+        key = self.e_key.pop(e, None)
+        if key is not None:
+            table = self.prefix_entry if key[0] == "prefix" else self.session_entry
+            if table.get(key[1]) == e:
+                del table[key[1]]
+        del self.e_rows[e]
+        self.e_state[e], self.e_readers[e], self.e_pages[e], self.e_dseg[e] = 0, 0.0, 0.0, -1
+        self.e_ttl[e], self.e_steps[e] = math.inf, 0.0
+        self.free_entries.append(e)
+
+    def _admit_pending(self):
+        self.queue.extend(self.stream.arrived(self.t))
+        w = self.workload
+        if self.opt.policy == "layer_major":
+            if not self.n_running:
+                if self.region:
+                    self._end_wave()
+                self._start_wave()
+            return
+        if w.arrival == "closed" and not w.sessions:
+            while self.n_running + len(self.queue) < self.cap:
+                self.queue.append(self.stream.closed_new(self.t))
+        if self.blocked == self.drops:  # nothing died or moved since the last failed admission
+            return
+        while self.queue and self.free_slots:
+            if not self._admit(self.queue[0]):
+                self.n["stalls"] += 1
+                self.blocked = self.drops
+                return
+            self.queue.pop(0)
+        self.blocked = None
+
+    # ---- layer-major waves -------------------------------------------------------------------
+    def _region_span(self, prompt):
+        """Pages a wave writes: phase A's striped layout of H x slots heads at the longest prompt."""
+        if prompt not in self.region_cache:
+            if self.model is not None:
+                span = region_pages(self.model, self.geo.tensors, self.cap, prompt, self.dev.pages_per_block)
+            else:  # no model (tests): every per-head stream padded to whole pages
+                per = sum(int(-(-(hi - lo)[0] // tpp)) for spec, tpp in zip(self.geo.hbf, self.geo.tpp)
+                          for lo, hi in [self.geo.window(spec, np.array([prompt]))])
+                span = float(self.cap * self.geo.layers * self.geo.heads * per)
+            self.region_cache[prompt] = span
+        return self.region_cache[prompt]
+
+    def _start_wave(self):
+        w = self.workload
+        reqs = self.queue[:self.cap]
+        del self.queue[:len(reqs)]
+        while len(reqs) < self.cap and w.arrival == "closed" and not w.sessions:
+            reqs.append(self.stream.closed_new(self.t))
+        if not reqs:
+            return
+        prompts = [(w.prefix_tokens if r.prefix >= 0 else 0) + r.history + r.input for r in reqs]
+        span = self._region_span(max(prompts))
+        need = math.ceil(span / self.P - 1e-9)
+        if self.free_count[0] < need:
+            self._reclaim(0, force=True, target=need * self.P)
+        if self.free_count[0] < need:
+            raise CapacityError(f"A wave region of {span:.0f} pages needs {need} segments, "
+                                f"{self.free_count[0]} are free")
+        self.region = [self._take(0) for _ in range(need)]
+        fills, left = [], span
+        for s in self.region:
+            self._erase(s, "wave")
+            self.state[s], self.owner[s] = FULL, -2
+            self.fill[s] = min(float(self.P), left)
+            fills.append(self.fill[s])
+            left -= self.fill[s]
+        real = 0.0
+        for req, prompt in zip(reqs, prompts):
+            pages = self.pages(prompt)
+            real += pages
+            e = self._new_entry(PRIVATE, 0, prompt)
+            for s, f in zip(self.region, fills):
+                k = pages * f / span
+                self.live[s] += k
+                self.part_live[0] += k
+                self.e_pages[e] += k
+                self._row(e, s, k)
+            self.e_readers[e] = 1.0
+            slot = self.free_slots.pop()
+            self.sl_on[slot], self.sl_req[slot], self.sl_entry[slot], self.sl_prefix[slot] = True, req, e, -1
+            self.sl_ctx[slot], self.sl_end[slot], self.sl_gen[slot] = prompt, prompt + req.output, 0
+            self.sl_part[slot], self.sl_staged[slot] = 0, 0.0
+            self.n_running += 1
+            self.n["admitted"] += 1
+        self._program("prefill", real)
+        self._program("padding", span - real)
+        self.n["waves"] += 1
+
+    def _end_wave(self):
+        for s in self.region:
+            self.owner[s] = -1
+            self._release(s)
+        self.region = []
+
+    # ---- refresh and reclaim -----------------------------------------------------------------
+    def _refresh(self, s, cause):
+        self.n[cause] += 1
+        if self.refresh == "replay":
+            self._replay(s)
+        else:
+            self._relocate(s, cause)
+
+    def _replay(self, s):
+        """Rewrite rows 0 .. fill - 1 of segment s in place, dead pages included (spec section 5.7)."""
+        self._flush_reads()
+        self._erase(s, "replay")
+        self._program("replay", self.fill[s])
+        n = self.c_count
+        self.c_t[:n][self.c_v[:n] & (self.c_s[:n] == s)] = self.t
+
+    def _relocate(self, s, cause):
+        """Move the live pages of segment s (refresh or compaction); idle entries may be evicted instead.
+
+        The pages go to the partition's frontier, or to the owner's own segment (dedicated). Segment s
+        is free afterwards; its erase is counted at its next row-0 write.
+        """
+        self._flush_reads()
+        self.busy[s] = True
+        o = int(self.owner[s])
+        if o >= 0:
+            self.e_owned[o].remove(s)
+            self.owner[s] = -1
+            if self.e_dseg[o] == s:
+                self.e_dseg[o] = -1
+        if self.state[s] == OPEN:
+            self._close(s)
+        evict = self.opt.reclaim == "evict" if cause == "compaction" else self.opt.refresh_idle == "evict"
+        n = self.c_count
+        moves = []
+        for i in np.flatnonzero(self.c_v[:n] & (self.c_s[:n] == s)).tolist():
+            if not self.c_v[i]:
+                continue
+            e = int(self.c_e[i])
+            if evict and self.e_state[e] == IDLE and e not in self.protected:
+                self._kill(e, evicted=True)
+                continue
+            moves.append(self._drop(i))
+        moved = {e for e, _ in moves}
+        self.protected.update(moved)
+        try:
+            for e, pages in moves:
+                self._write(e, pages, cause)
+        finally:
+            self.protected.difference_update(moved)
+        self.busy[s] = False
+        self.reads[s] = 0.0
+        self._release(s)
+
+    def _victim(self, part):
+        """Reclaim victim of ``part``: the closed segment with the fewest pages to copy (greedy)."""
+        n = self.c_count
+        e = self.c_e[:n]
+        keep = self.e_state[e] == ACTIVE
+        if self.protected:
+            keep |= np.isin(e, list(self.protected))
+        if self.opt.reclaim == "compact":
+            keep = self.e_state[e] > 0
+        keep &= self.c_v[:n]
+        copy = np.bincount(self.c_s[:n][keep], self.c_n[:n][keep], self.S)
+        owner_idle = np.zeros(self.S, dtype=bool)
+        owned = self.owner >= 0
+        if owned.any():
+            owner_idle[owned] = (self.e_state[self.owner[owned]] == IDLE) & ~np.isin(self.owner[owned],
+                                                                                      list(self.protected))
+            copy[owner_idle] = 0.0
+        cand = ((self.part_of == part) & (self.state == FULL) & ~self.busy & ~self.is_free
+                & (self.live > EPS) & ((self.owner == -1) | owner_idle))
+        index = np.flatnonzero(cand)
+        if not len(index):
+            return -1
+        least = index[copy[index] <= copy[index].min() + EPS]
+        if len(least) > 1:  # ties: the segment with the oldest data (least recently written first)
+            oldest = np.full(self.S, math.inf)
+            valid = self.c_v[:n]
+            np.minimum.at(oldest, self.c_s[:n][valid], self.c_t[:n][valid])
+            least = least[np.argsort(oldest[least], kind="stable")]
+        best = int(least[0])
+        if copy[best] >= self.P - EPS or copy[best] > self._room(part) + EPS:
+            return -1
+        return best
+
+    def _reclaim(self, part, force=False, target=None):
+        """Free segments of ``part``: while fewer than the low watermark, or (forced) until ``target`` pages fit."""
+        if self.guard:
+            return
+        self.guard = True
+        try:
+            for _ in range(self.S):
+                if force:
+                    if target is not None and self._room(part) >= target:
+                        break
+                elif self.free_count[part] >= self.low_wm:
+                    break
+                victim = self._victim(part)
+                if victim < 0:
+                    break
+                self.n["reclaims"] += 1
+                owner = int(self.owner[victim])
+                if owner >= 0:  # dedicated: an idle owner is evicted with all its segments
+                    self._kill(owner, evicted=True)
+                else:
+                    self.n["compaction"] += 1
+                    self._relocate(victim, "compaction")
+        finally:
+            self.guard = False
+
+    # ---- one quantum ---------------------------------------------------------------------------
+    def _next_retention(self):
+        if not self.opt.retention_s:
+            return math.inf
+        n = self.c_count
+        valid = self.c_v[:n]
+        return float(self.c_t[:n][valid].min()) + self.opt.retention_s if valid.any() else math.inf
+
+    def _next_ttl(self):
+        idle = self.e_state == IDLE
+        return float(self.e_ttl[idle].min()) if idle.any() else math.inf
+
+    def _clock_step(self):
+        on = np.flatnonzero(self.sl_on)
+        parts = self.sl_part[on] if self.parts > 1 else None
+        hbm = self.sl_gen[on] if self.hbm_out else None
+        return self.clock.step(self.sl_ctx[on], parts, self.row if parts is not None else None, hbm)
+
+    def _limit(self, n, T, horizon, warm):
+        """Cut the quantum at the earliest predicted threshold crossing, retention deadline, warm-up end or horizon."""
+        o, t = self.opt, self.t
+        rates = self._rates()
+        read = rates > 0
+        if read.any():
+            rate = rates[read]
+            floor = max(1, int(o.rd_slack * o.x / rate.max()))
+            first = float(((o.x - self.reads[read]) / rate).min())
+            n = min(n, max(floor, math.ceil(first - 1e-9)))
+        for deadline in (self._next_retention(), warm if self.warm is None else math.inf, horizon):
+            if deadline < math.inf:
+                n = min(n, max(1, math.ceil((deadline - t) / T - 1e-9)))
+        return n
+
+    def _advance(self, on, k, T):
+        ctx0 = self.sl_ctx[on]
+        ctx1 = ctx0 + k
+        if self.writes_decode:
+            self.sl_staged[on] += self.geo.stored_pages(ctx1) - self.geo.stored_pages(ctx0)
+        np.add.at(self.e_steps, self.sl_entry[on], k)
+        pre = self.sl_prefix[on]
+        pre = pre[pre >= 0]
+        if len(pre):
+            if self.opt.prefix_reads == "per_request":
+                np.add.at(self.e_steps, pre, k)
+            else:
+                self.e_steps[np.unique(pre)] += k
+        self.pending_reads = True
+        self.sl_ctx[on] = ctx1
+        self.sl_gen[on] += k
+        dt = k * T
+        self.acc["batch_s"] += len(on) * dt
+        self.acc["ctx_s"] += float(ctx0.sum() + ctx1.sum()) / 2 * dt
+        self.acc["tokens"] += len(on) * k
+
+    def _quantum(self, n, T):
+        """Run n decode steps of length T; requests complete and arrive at their exact step. Returns steps run."""
+        t0, done = self.t, 0
+        splits = self.opt.policy != "layer_major"
+        while done < n:
+            on = np.flatnonzero(self.sl_on)
+            if not len(on):
+                break
+            k = max(1, min(n - done, int((self.sl_end[on] - self.sl_ctx[on]).min())))
+            if splits and self.free_slots and self.blocked != self.drops:
+                arrival = self.stream.next_time()
+                if arrival < t0 + n * T:
+                    k = min(k, max(1, math.ceil((arrival - t0) / T - 1e-9) - done))
+            self._advance(on, k, T)
+            done += k
+            self.t = t0 + done * T
+            finished = on[self.sl_ctx[on] >= self.sl_end[on]]
+            for slot in finished.tolist():
+                self._complete(slot)
+            if len(finished) or (self.free_slots and self.stream.next_time() <= self.t + 1e-12):
+                self._admit_pending()
+        return done
+
+    def _flush_decode(self):
+        """Write staged decode pages in whole rows (per partition for packed, per request for dedicated)."""
+        if not self.writes_decode:
+            return
+        on = np.flatnonzero(self.sl_on & (self.sl_staged > EPS))
+        if not len(on):
+            return
+        row = self.row
+        if self.opt.policy == "dedicated":
+            for slot in on.tolist():
+                whole = math.floor(self.sl_staged[slot] / row + 1e-9) * row
+                if whole:
+                    self.sl_staged[slot] -= whole
+                    self._write(int(self.sl_entry[slot]), whole, "decode")
+            return
+        for part in np.unique(self.sl_part[on]).tolist():
+            group = on[self.sl_part[on] == part]
+            total = float(self.sl_staged[group].sum())
+            whole = math.floor(total / row + 1e-9) * row
+            if whole <= 0:
+                continue
+            share = whole / total
+            for slot in group.tolist():
+                pages = float(self.sl_staged[slot]) * share
+                self.sl_staged[slot] -= pages
+                self._write(int(self.sl_entry[slot]), pages, "decode")
+
+    def _housekeeping(self):
+        """Idle expiry, read-disturb refresh, retention refresh and background reclaim."""
+        o = self.opt
+        for e in np.flatnonzero((self.e_state == IDLE) & (self.e_ttl <= self.t + 1e-9)).tolist():
+            if self.e_state[e] == IDLE:
+                self._kill(e)
+        self._flush_reads()
+        for s in np.flatnonzero(self.reads >= o.x * (1 - 1e-9)).tolist():
+            if self.reads[s] < o.x * (1 - 1e-9):
+                continue
+            if self.live[s] > EPS:
+                self._refresh(s, "refresh_rd")
+            elif self.state[s] == OPEN and self.owner[s] == -1:
+                self._close(s)  # blocks past X take no new data
+        if o.retention_s:
+            n = self.c_count
+            due = self.c_v[:n] & (self.c_t[:n] <= self.t - o.retention_s + 1e-6)
+            for s in np.unique(self.c_s[:n][due]).tolist():
+                if self.live[s] > EPS:
+                    self._refresh(s, "refresh_ret")
+        if o.policy != "layer_major":
+            for part in range(self.parts):
+                if self.free_count[part] < self.low_wm:
+                    self._reclaim(part)
+
+    def _m5(self, step, steps):
+        programs, erases = float(self.programs.sum()), self.block_erases
+        if self.opt.m5 != "off":
+            o = self.opt
+            load = {"programs": (programs - self.m5_mark[0]) / steps, "erases": (erases - self.m5_mark[1]) / steps,
+                    "wave_banks": self.row, "gaps_ns": step.gaps_ns, "step_ns": step.tpot_ns}
+            result = interference(load, o.m5, o.t_prog, o.t_bers, o.suspend_ns, block_unit=o.block_unit)
+            self.m5_extra = result["extra_step_ns"]
+            if self.warm is not None:
+                self.max_step_extra = max(self.max_step_extra, result["max_step_extra_ns"])
+        self.m5_mark = (programs, erases)
+
+    def _staging(self):
+        on = np.flatnonzero(self.sl_on)
+        pages = float(self.sl_staged[on].sum()) + len(on) * self.geo.partial_pages()
+        held = float(self.sl_gen[on].sum()) * self.geo.hbf_token_bytes if self.hbm_out else 0.0
+        self.staging_peak = max(self.staging_peak, pages * self.dev.page_bytes + held)
+
+    def run(self):
+        """Simulate ``hours``; returns the summary row (rates over the time after the warm-up)."""
+        o = self.opt
+        wall = time.perf_counter()
+        horizon, warm = o.hours * 3600, o.warmup_h * 3600
+        next_report, step, stuck = 0.0, None, 0
+        if warm <= 0:
+            self.warm = self._snapshot()
+        self._admit_pending()
+        while self.t < horizon - 1e-9:
+            if self.warm is None and self.t >= warm - 1e-9:
+                self.warm = self._snapshot()
+            if self.t >= next_report - 1e-9:
+                self._record(step)
+                next_report = (math.floor(self.t / o.report_s + 1e-9) + 1) * o.report_s
+            if not self.n_running:
+                if self.queue and self.blocked == self.drops and self._next_ttl() == math.inf:
+                    raise CapacityError(f"The next request does not fit even after reclaim (t = {self.t:.1f} s, "
+                                        f"{self.S} segments of {self.P} pages); raise --capacity-gib")
+                events = [self.stream.next_time(), horizon, next_report, self._next_retention(), self._next_ttl()]
+                if self.warm is None:
+                    events.append(warm)
+                before = self.t
+                self.t = max(min(events), self.t)
+                self._housekeeping()
+                self.m5_mark = (float(self.programs.sum()), self.block_erases)
+                self._admit_pending()
+                stuck = stuck + 1 if self.t <= before and not self.n_running else 0
+                if stuck > 1000:
+                    raise RuntimeError(f"The simulation makes no progress at t = {self.t:.3f} s")
+                continue
+            step = self._clock_step()
+            T = (step.tpot_ns + self.m5_extra) / 1e9
+            n = self._limit(max(1, int(o.quantum_s / T + 1e-9)), T, horizon, warm)
+            steps = self._quantum(n, T)
+            self.n["quanta"] += 1
+            self._staging()
+            self._flush_reads()  # before the flush: staged pages were read from HBM, not HBF
+            self._flush_decode()
+            self._housekeeping()
+            if steps:
+                self.acc["steps"] += steps
+                self.acc["decode_s"] += steps * T
+                self.acc["tpot_s"] += steps * step.tpot_ns / 1e9
+                self.acc["m5_s"] += steps * self.m5_extra / 1e9
+                self._m5(step, steps)
+            self._admit_pending()
+        if self.warm is None:
+            self.warm = self._snapshot()
+        self._record(step)
+        self.wall_s = time.perf_counter() - wall
+        return self.summary()
+
+    # ---- outputs -------------------------------------------------------------------------------
+    def _snapshot(self):
+        return {"t": self.t, "programs": self.programs.copy(), "seg_erases": self.seg_erases.copy(),
+                "block_erases": self.block_erases, "pec": self.pec.copy(), "acc": dict(self.acc), "n": dict(self.n)}
+
+    def _record(self, step):
+        page, on = self.dev.page_bytes, np.flatnonzero(self.sl_on)
+        idle = float(self.e_pages[self.e_state == IDLE].sum())
+        row = {"t_s": self.t, "running": self.n_running, "queued": len(self.queue),
+               "sum_context": int(self.sl_ctx[on].sum()),
+               "tpot_ms": step.tpot_ns / 1e6 if step else None,
+               "tpot_m5_ms": (step.tpot_ns + self.m5_extra) / 1e6 if step else None}
+        row |= {f"{cause}_gb": self.programs[i] * page / 1e9 for i, cause in enumerate(CAUSES)}
+        row |= {f"erases_{cause}": int(self.seg_erases[i]) for i, cause in enumerate(CAUSES)}
+        row |= {"block_erases": self.block_erases, "free_segments": int(self.free_count.sum()),
+                "live_pages": float(self.live.sum()), "idle_pages": idle, "stranded_pages": 0.0,
+                "avg_pec": float(self.pec.mean()), "max_pec": int(self.pec.max()),
+                "max_reads_over_x": float(self.reads.max() / self.opt.x)}
+        self.timeseries.append(row)
+
+    def summary(self):
+        o, d, w0 = self.opt, self.dev, self.warm
+        span = max(self.t - w0["t"], 1e-9)
+        page, ppb = d.page_bytes, d.pages_per_block
+        prog = self.programs - w0["programs"]
+        host = prog[CAUSE["prefill"]] + prog[CAUSE["decode"]]
+        total = float(prog.sum())
+        erased = (self.block_erases - w0["block_erases"]) * ppb
+        days = span / DAY
+        dpec = self.pec - w0["pec"]
+        avg_day = float(dpec.mean()) / days
+        max_day = avg_day if o.wear == "ideal" else float(dpec.max()) / days
+        acc = {key: self.acc[key] - w0["acc"][key] for key in self.acc}
+        n = {key: self.n[key] - w0["n"][key] for key in self.n}
+        steps, tokens = acc["steps"], acc["tokens"]
+        mean_ctx = acc["ctx_s"] / acc["batch_s"] if acc["batch_s"] else 0.0
+        tpot = acc["tpot_s"] / steps if steps else None
+        refresh = prog[CAUSE["refresh_rd"]] + prog[CAUSE["refresh_ret"]] + prog[CAUSE["replay"]]
+        row = {"workload": self.workload.name, "policy": o.policy, "partition": d.partition, "pages_per_block": ppb,
+               "x": o.x, "stacks": o.stacks, "mean_batch": acc["batch_s"] / span, "mean_context": mean_ctx,
+               "mean_tpot_ms": tpot * 1e3 if steps else None,
+               "tpot_m5_ms": (acc["tpot_s"] + acc["m5_s"]) / steps * 1e3 if steps else None,
+               "max_step_extra_ms": self.max_step_extra / 1e6, "req_per_s": n["completed"] / span,
+               "tokens_per_s": tokens / span, "pages_per_request": host / n["completed"] if n["completed"] else None,
+               "kv_bytes_per_token": self.geo.hbf_token_bytes,
+               "hbm_bytes_per_request": float(self.geo.hbm_bytes(np.array([int(round(mean_ctx))]))[0]),
+               "threshold_steps": threshold_steps(o.x, ppb, o.share, o.hot),
+               "refreshes_per_request": prog[CAUSE["refresh_rd"]] / host if host else None,
+               "kv_write_gb_s": host * page / span / 1e9}
+        row |= {f"{cause}_gb_s": prog[i] * page / span / 1e9 for i, cause in enumerate(CAUSES)}
+        row |= {"program_gb_s": total * page / span / 1e9,
+                "program_bw_share": total * page / span / (d.banks * page / (o.t_prog / 1e9)),
+                "wa": total / host if host else None, "erase_amp": erased / total if total else None,
+                "erase_wa": erased / host if host else None, "refresh_to_kv": refresh / host if host else None,
+                "erases_per_s": erased / ppb / span, "avg_pec_per_day": avg_day, "max_pec_per_day": max_day}
+        for limit in o.pe_limits:
+            row[f"days_to_limit_avg@{sci(limit)}"] = limit / avg_day if avg_day else math.inf
+        for limit in o.pe_limits:
+            row[f"days_to_limit_max@{sci(limit)}"] = limit / max_day if max_day else math.inf
+        row["pe_per_mtok"] = avg_day / (tokens / span * DAY / 1e6) if tokens else None
+        row["break_even_x"] = None
+        row["staging_peak_mib"] = self.staging_peak / 2 ** 20
+        row["pending_units_per_channel"] = row["mean_batch"] * self.geo.partial_pages() / 16
+        row["unit_open_s"] = max(self.geo.tpp) * tpot if steps else None
+        row["replay_buffer_mib"] = self.P * page / 2 ** 20 if self.refresh == "replay" else 0.0
+        row["legal"] = True
+        row |= {"hours": o.hours, "warmup_h": o.warmup_h, "measured_h": span / 3600, "segments": self.S,
+                "segment_pages": self.P, "low_watermark": self.low_wm, "decode_steps": int(steps),
+                "completed": int(n["completed"]),
+                "refresh_events_rd": int(n["refresh_rd"]), "refresh_events_ret": int(n["refresh_ret"]),
+                "compaction_events": int(n["compaction"]), "waves": int(n["waves"]),
+                "segment_erases": int((self.seg_erases - w0["seg_erases"]).sum()),
+                "free_segments_min": self.free_min, "evicted_gb": n["evicted_pages"] * page / 1e9,
+                "recompute_tokens": n["recompute_tokens"], "stalls": int(n["stalls"]), "stranded_frac": 0.0,
+                "quanta": int(self.n["quanta"]), "wall_s": self.wall_s}
+        return row
+
+    def segment_rows(self):
+        rows = []
+        for s in range(self.S):
+            row = {"segment": s, "partition": int(self.part_of[s]), "state": int(self.state[s]),
+                   "pec": int(self.pec[s]), "live_pages": float(self.live[s]), "fill_pages": float(self.fill[s]),
+                   "reads": float(self.reads[s])}
+            row |= {f"erases_{cause}": int(self.erases[s, i]) for i, cause in enumerate(CAUSES)}
+            rows.append(row)
+        return rows
+
+
+def simulate(geometry, clock, workload, device=None, options=None, model=None):
+    """Run the event simulation of one stack; returns the Simulator with ``result`` (the summary row),
+    ``timeseries`` and ``segment_rows()``. ``workload`` is one stack's share (``workload.per_stack``)."""
+    sim = Simulator(geometry, clock, workload, device, options, model)
+    sim.result = sim.run()
+    return sim
 
 
 # --------------------------------------------------------------------------------------------
