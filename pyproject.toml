@@ -1,7 +1,7 @@
 [project]
 name = "hbf-stage0"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = ["numpy>=1.24"]
 
 [tool.pytest.ini_options]
@@ -14,10 +14,24 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project.scripts]
+hbf = "hbf.cli:main"
 hbf-stage0 = "hbf.cli:main"
 
-[tool.setuptools]
-packages = ["hbf"]
+[tool.setuptools.packages.find]
+include = ["hbf*"]
+exclude = ["hbf.mqsim*"]
 
 [tool.setuptools.package-data]
-hbf = ["mqsim.commit", "mqsim.sha256", "mqsim/.gitignore", "mqsim/**/*", "configs/*.xml", "configs/*.json", "patches/*.patch", "patches/series"]
+hbf = [
+    "mqsim.commit",
+    "mqsim.sha256",
+    "mqsim/.gitignore",
+    "mqsim/*",
+    "mqsim/*/*",
+    "mqsim/*/*/*",
+    "mqsim/*/*/*/*",
+    "configs/*.xml",
+    "configs/*.json",
+    "patches/*.patch",
+    "patches/series",
+]
