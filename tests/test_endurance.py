@@ -870,7 +870,7 @@ def test_k1_formats_demand_matches_phase_a_and_kv_bytes():
     from hbf.device.config import load
     from hbf.frontend.kv.formats import parse_format
     from hbf.models import ModelSpec
-    from hbf.backends.rounds.pages import iter_layer_pages
+    from hbf.frontend.pages import iter_layer_pages
 
     cfg = load("ocp")
     mla_model = ModelSpec(name="mla-tiny", layers=4, hidden=2048, q_heads=16, kv_heads=1, head_dim=128,

@@ -95,8 +95,8 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | [`hbf/device/`](hbf/device) | `config.py`（参数、拓扑、XML 校验、统一资源路径）、`address.py`（CWDP 与 OCP 静态地址映射唯一实现） |
 | [`hbf/frontend/trace/`](hbf/frontend/trace) | `tokens.py`（token 级 `access.csv` 格式与校验）、`synthetic.py`（合成访问生成器）、`requests.py`（请求流与负载预设） |
 | [`hbf/frontend/kv/`](hbf/frontend/kv) | `tensors.py`（`TensorSpec` 与模型形状）、`formats.py`（KV 压缩存储格式）、`layouts.py`（4 种静态布局）、`placement.py`（多请求放置与写序检查） |
-| [`hbf/frontend/addrtrace.py`](hbf/frontend/addrtrace.py) | 前后端唯一接口：`addr.npz`、`layers.npz`、`addr.json` 的流式读写与规范合法性校验（§5.4.1 / §5.4.3） |
-| [`hbf/backends/rounds/`](hbf/backends/rounds) | 轮数与解析后端：`pages.py`（numpy 页集合）、`analysis.py`（机制分析与协议约束）、`timing.py`（读时间估计与时间分解） |
+| [`hbf/frontend/pages.py`](hbf/frontend/pages.py)、[`addrtrace.py`](hbf/frontend/addrtrace.py) | 前端降阶（token 访问 → 去重页数组/子批）与前后端唯一接口：`addr.npz`、`layers.npz`、`addr.json` 的流式读写与规范合法性校验（§5.4.1 / §5.4.3） |
+| [`hbf/backends/rounds/`](hbf/backends/rounds) | 轮数与解析后端：`analysis.py`（机制分析与协议约束）、`timing.py`（读时间估计与时间分解） |
 | [`hbf/backends/mqsim/`](hbf/backends/mqsim) | MQSim 后端：`build.py`（源码散列校验、打补丁与编译）、`schedule.py`（地址轨迹转子批与未写页检查）、`run.py`（运行、对回完成日志、聚合指标） |
 | [`hbf/lifetime/`](hbf/lifetime) | 寿命模型：`geometry.py`、`clock.py`（核心 `StepClock`/`ReadTimeClock` 与轮数校准）、`analytic.py`、`sim/`（事件模拟）、`interference.py`、`report.py`、`cli.py` |
 | [`hbf/run.py`](hbf/run.py)、[`hbf/cli.py`](hbf/cli.py)、[`hbf/sweep.py`](hbf/sweep.py) | TOML/JSON 配置与 `--set` 覆盖、统一子命令入口 `python3 -m hbf`（`run`/`sweep`/`lifetime`/`check`/`system`/`interference`）、笛卡儿积参数扫描 |
@@ -353,8 +353,8 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 │   ├── run.py           TOML/JSON 配置加载、--set 覆盖、config.json 生成与 check 核对
 │   ├── sweep.py         配置键笛卡儿积参数扫描
 │   ├── device/          参数、拓扑、XML 校验（config.py）与静态地址映射唯一实现（address.py）
-│   ├── frontend/        trace/（tokens/synthetic/requests）、kv/（tensors/formats/layouts/placement）、addrtrace.py
-│   ├── backends/        rounds/（pages/analysis/timing）与 mqsim/（build/schedule/run）
+│   ├── frontend/        trace/（tokens/synthetic/requests）、kv/（tensors/formats/layouts/placement）、pages.py、addrtrace.py
+│   ├── backends/        rounds/（analysis/timing）与 mqsim/（build/schedule/run）
 │   ├── lifetime/        寿命模型（geometry/clock/analytic/report/cli/interference/sim/）
 │   ├── configs/         参数 JSON（含假设标注）、XML 模板、模型/GPU/负载预设
 │   ├── patches/         I1–I4、T-SUSP、T-ONFI、T-PLANE、T-CMD、T-CACHE、T-PERF；series 规定应用顺序

@@ -1,19 +1,38 @@
-"""Vectorised page sets: numpy counterparts of ``controller.schedule`` and ``analysis.locate``.
+"""Frontend token-to-page lowering: deduplicated per-layer page arrays and scalar sub-batches.
 
-``iter_layer_pages`` turns logical accesses into the deduplicated read pages of every (step,
-layer), as ``schedule`` does, but as numpy arrays instead of ``Request`` objects: a 32-layer 128K
-dense step has four million pages. ``place`` gives each page's die, plane, offset, core-die
-channel and host channel, as ``analysis.locate``, ``Config.device_lpa`` and
-``Config.host_channel`` do one LPA at a time. Tests check both against the scalar code.
+Turns logical token ``Access`` records and a ``Layout`` into deduplicated 4 KiB page accesses
+before they are packaged into an ``AddressTrace`` (``hbf/frontend/addrtrace.py``):
+
+* ``iter_layer_pages`` / ``layer_pages``: vectorised numpy path yielding ``LayerPages`` per
+  ``(step, layer)`` with useful bytes, 64 B burst bytes/runs, and HBM/attention/dequant demand.
+* ``schedule`` / ``prefill_batches`` / ``schedule_run``: scalar sub-batch lowering used for
+  prefill writes (OCP §5.4.1 block page-0 alignment) and explicit write accesses.
 """
 from array import array
-from collections import defaultdict
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from ...device.address import Placed, check_host_channels, device_lpas, place
-from ..mqsim.schedule import BURST_BYTES, schedule
+BURST_BYTES = 64
+
+
+@dataclass(frozen=True)
+class Request:
+    lpa: int
+    op: str = "R"
+    useful_bytes: int = 4096
+    burst_bytes: int = 4096
+    burst_runs: int = 1  # contiguous runs of wanted 64 B units: one burst read command each
+
+
+@dataclass(frozen=True)
+class Batch:
+    step: int
+    layer: int
+    subbatch: int
+    arrival_ns: int
+    requests: tuple[Request, ...]
 
 
 @dataclass
@@ -45,6 +64,113 @@ class LayerPages:
         return len(self.lpa)
 
 
+def union_size(intervals):
+    end = total = 0
+    for lo, hi in sorted(intervals):
+        total += max(0, hi - max(lo, end))
+        end = max(hi, end)
+    return total
+
+
+def burst_chunks(intervals, start, token_bytes, burst=BURST_BYTES):
+    return [((lo - start) * token_bytes // burst, -(-(hi - start) * token_bytes // burst))
+            for lo, hi in intervals]
+
+
+def burst_bytes(intervals, start, token_bytes, burst=BURST_BYTES):
+    """Bytes moved when a page read returns only the 64 B bursts covering the wanted tokens.
+
+    The OCP HBF base-die spec v0.7.0 (section 4.1) allows host read bursts of 64 B to 4 KiB in
+    multiples of 64 B within one NAND page, so the host link can carry less than a page. Between the
+    base die and the core dies the minimum is still 4 KiB (section 4.6, device logical unit), so
+    this counts host-side bytes only; sensing and the NAND-side transfer stay whole pages.
+    """
+    return union_size(burst_chunks(intervals, start, token_bytes, burst)) * burst
+
+
+def burst_runs(intervals, start, token_bytes, burst=BURST_BYTES):
+    """Contiguous runs of wanted 64 B units in a page; adjacent or overlapping units merge."""
+    runs, end = 0, None
+    for lo, hi in sorted(burst_chunks(intervals, start, token_bytes, burst)):
+        if end is None or lo > end:
+            runs += 1
+        end = hi if end is None else max(end, hi)
+    return runs
+
+
+def schedule(cfg, layout, accesses):
+    """Deduplicate logical token accesses into sub-batches of ``Request``s (writes before reads)."""
+    if any(spec.density != 1 for spec in layout.all_tensors):
+        raise ValueError("Tensor density < 1 is supported by the numpy analysis engine only")
+    logical = defaultdict(dict)
+    for access in accesses:
+        access.validate(layout)
+        if access.op == "W" and access.step != -1:
+            raise ValueError("Phase 0 only accepts prefill writes")
+        if access.op == "H" or layout.specs[access.kind].tier != "hbf":
+            continue  # HBM-tier tensors and HBM-cached hits have no HBF pages
+        group = logical[access.step, access.layer, access.op]
+        t = layout.tensor_index(access.kind)
+        tokens = layout.tokens(t)
+        blocks, first = layout.token_blocks(t, access.token_start, access.token_end)
+        for block in blocks:
+            start = first + block * tokens
+            lpa = layout.lpa(access.layer, access.kv_head, t, block)
+            group.setdefault(lpa, (t, start, []))[2].append((
+                max(access.token_start, start), min(access.token_end, start + tokens)
+            ))
+    batches = []
+    serials = Counter()
+    limit = cfg.batch_pages
+    for (step, layer, op), pages in sorted(logical.items(), key=lambda item: (*item[0][:2], item[0][2] == "R")):
+        requests = []
+        for lpa, (t, start, intervals) in sorted(pages.items()):
+            useful = union_size(intervals) * layout.token_bytes(t)
+            filled = min(start + layout.tokens(t), layout.windows[layout.tensors[t].name][1]) - start
+            if op == "W" and useful != filled * layout.token_bytes(t):
+                raise ValueError("Partial-page prefill write would cause an update read")
+            token = layout.token_bytes(t)
+            requests.append(Request(lpa, op, useful, burst_bytes(intervals, start, token),
+                                    burst_runs(intervals, start, token)))
+        for start in range(0, len(requests), limit):
+            serial = serials[step, layer]
+            serials[step, layer] += 1
+            batches.append(Batch(step, layer, serial, len(batches) * cfg.interval_ns,
+                                 tuple(requests[start:start + limit])))
+    return batches
+
+
+def prefill_batches(cfg, layout):
+    """Write every LPA of the layout's span once, in address order, as step -1 (layer -1).
+
+    The OCP HBF spec maps an address to a fixed bank, die, block and page and requires the host to
+    write a block's 4 KiB addresses consecutively from page 0 without skipping (section 5.4.1), so
+    the span is written whole, padding pages of striped layouts included. MQSim's data write
+    frontier uses blocks 0, 3, 4, ... (blocks 1 and 2 are reserved for translation and GC write
+    frontiers, Flash_Block_Manager_Base.cpp:53-57), so prior to static-write FTL support MQSim's
+    physical block ID does not equal the static block ID; aligning ``base`` to block page 0
+    (``units * pages_per_block``) keeps each plane's in-block page offset equal to its static page
+    offset.
+    """
+    if layout.base % (cfg.units * cfg.pages_per_block):
+        raise ValueError("A prefill needs a layout base aligned to block page 0 "
+                         "(a multiple of units * pages_per_block); otherwise MQSim's in-block page "
+                         "offsets differ from the static offsets")
+    lpas = range(layout.base, layout.base + layout.span)
+    limit = cfg.batch_pages
+    return [Batch(-1, -1, index, 0, tuple(Request(lpa, "W") for lpa in lpas[start:start + limit]))
+            for index, start in enumerate(range(0, len(lpas), limit))]
+
+
+def schedule_run(cfg, layout, accesses, prefill=False):
+    """Batches of one run: an optional whole-layout prefill, then the scheduled accesses."""
+    accesses = list(accesses)
+    if prefill and any(access.op == "W" for access in accesses):
+        raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
+    batches = (prefill_batches(cfg, layout) if prefill else []) + schedule(cfg, layout, accesses)
+    return [replace(batch, arrival_ns=index * cfg.interval_ns) for index, batch in enumerate(batches)]
+
+
 def _union(group, lo, hi, scale):
     """Per-group union length and run count of [lo, hi) intervals sorted by (group, lo).
 
@@ -61,6 +187,33 @@ def _union(group, lo, hi, scale):
     length = np.bincount(group, np.maximum(0, key_hi - np.maximum(key_lo, before)), count)
     runs = np.bincount(group, key_lo > before, count)
     return length.astype(np.int64), runs.astype(np.int64)
+
+
+def per_tensor_tokens(head, g, lo, hi, context, count):
+    """Tokens read per tensor, summed over heads (unions within each (head, tensor))."""
+    if not len(head):
+        return np.zeros(count, dtype=np.int64)
+    key = head * count + g
+    order = np.lexsort((lo, key))
+    key, lo, hi = key[order], lo[order], hi[order]
+    new = np.empty(len(key), dtype=bool)
+    new[:1] = True
+    np.not_equal(key[1:], key[:-1], out=new[1:])
+    tokens, _ = _union(np.cumsum(new) - 1, lo, hi, context + 1)
+    return np.bincount(key[new] % count, tokens, count).astype(np.int64)
+
+
+def attended_tokens(head, lo, hi, context):
+    """Sum over KV heads of the tokens read by any tensor of the head (the tokens attention covers)."""
+    if not len(head):
+        return 0
+    order = np.lexsort((lo, head))
+    head, lo, hi = head[order], lo[order], hi[order]
+    new = np.empty(len(head), dtype=bool)
+    new[:1] = True
+    np.not_equal(head[1:], head[:-1], out=new[1:])
+    tokens, _ = _union(np.cumsum(new) - 1, lo, hi, context + 1)
+    return int(tokens.sum())
 
 
 def layer_pages(cfg, layout, step, layer, rows, cached=None):
@@ -148,33 +301,6 @@ def layer_pages(cfg, layout, step, layer, rows, cached=None):
                       hbm_bytes=int(hbm_bytes), attended_tokens=attended,
                       tensor_tokens={specs[i].name: int(tensor_tokens[i]) for i in range(len(specs))},
                       dequant_ops=float(dequant), attended_elements=elements, hbf_elements=hbf_elements)
-
-
-def per_tensor_tokens(head, g, lo, hi, context, count):
-    """Tokens read per tensor, summed over heads (unions within each (head, tensor))."""
-    if not len(head):
-        return np.zeros(count, dtype=np.int64)
-    key = head * count + g
-    order = np.lexsort((lo, key))
-    key, lo, hi = key[order], lo[order], hi[order]
-    new = np.empty(len(key), dtype=bool)
-    new[:1] = True
-    np.not_equal(key[1:], key[:-1], out=new[1:])
-    tokens, _ = _union(np.cumsum(new) - 1, lo, hi, context + 1)
-    return np.bincount(key[new] % count, tokens, count).astype(np.int64)
-
-
-def attended_tokens(head, lo, hi, context):
-    """Sum over KV heads of the tokens read by any tensor of the head (the tokens attention covers)."""
-    if not len(head):
-        return 0
-    order = np.lexsort((lo, head))
-    head, lo, hi = head[order], lo[order], hi[order]
-    new = np.empty(len(head), dtype=bool)
-    new[:1] = True
-    np.not_equal(head[1:], head[:-1], out=new[1:])
-    tokens, _ = _union(np.cumsum(new) - 1, lo, hi, context + 1)
-    return int(tokens.sum())
 
 
 def iter_layer_pages(cfg, layout, accesses):

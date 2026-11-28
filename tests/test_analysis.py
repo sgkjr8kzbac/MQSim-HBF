@@ -12,7 +12,8 @@ from hbf.backends.rounds.analysis import locate, placement, plane_geometry
 from tests.reference import analyze, analyze_group
 from hbf.cli import main, pipeline
 from hbf.device.config import load, parse_topology
-from hbf.backends.mqsim.schedule import Batch, Request, burst_bytes, metrics, schedule
+from hbf.backends.mqsim.schedule import metrics
+from hbf.frontend.pages import Batch, Request, burst_bytes, schedule
 
 
 def tiny():
@@ -452,7 +453,8 @@ def test_link_bound_follows_ucie_grade():
     """A dense round of 64 pages per host channel moves 256 KiB: 5.46 us at grade 1 (48 GB/s)."""
     from hbf.backends.rounds.analysis import Protocol, analyze_accesses, _protocol_part, protocol_rounds
     from hbf.cli import build_run_parser, configure, topology_name
-    from hbf.backends.rounds.pages import iter_layer_pages, place
+    from hbf.device.address import place
+    from hbf.frontend.pages import iter_layer_pages
     cfg8 = load("ocp-8ch")
     assert (cfg8.channels, cfg8.chips, cfg8.planes, cfg8.units, cfg8.host_channels, cfg8.aggregate_gb_s,
             cfg8.width) == (16, 2, 16, 512, 8, 512, 32)
@@ -538,7 +540,7 @@ def test_per_page_estimate_is_withheld_for_multi_plane_dies(tmp_path):
 
 def test_generator_and_cli_edge_cases(tmp_path, monkeypatch):
     from hbf.frontend.trace.synthetic import share
-    from hbf.backends.mqsim.schedule import prefill_batches
+    from hbf.frontend.pages import prefill_batches
     assert share(100, .07) == 7 and share(100, .071) == 8 and share(3, 1) == 3
     cfg = load("ocp")
     shape = Shape(1, 1, 128, 1600)

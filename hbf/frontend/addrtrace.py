@@ -17,10 +17,9 @@ from pathlib import Path
 
 import numpy as np
 
-from ..backends.mqsim.schedule import prefill_batches, schedule
-from ..backends.rounds.pages import LayerPages, iter_layer_pages
 from ..device.address import block_and_page, block_page, place
 from ..util import dump
+from .pages import LayerPages, iter_layer_pages, prefill_batches, schedule
 
 VALID_OPS = frozenset(("R", "W", "D"))
 VALID_CLASSES = frozenset(("kv", "prefill", "flush", "refresh", "relocate"))

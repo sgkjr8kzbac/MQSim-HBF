@@ -291,7 +291,7 @@ def _protocol_part(cfg, pages, placed, group, protocol, part):
     otherwise the reference scheduler on rebuilt requests."""
     check_protocol(cfg, protocol)
     np = _numpy()
-    from ..mqsim.schedule import Request
+    from ...frontend.pages import Request
     useful, burst, runs = pages.useful[part], pages.burst[part], pages.runs[part]
     if not len(useful):
         return 0, 0, 0, 0
@@ -464,7 +464,7 @@ def analyze_trace(cfg, chunks, groups=(1,), protocol=None, timing=True):
 
 def analyze_accesses(cfg, layout, accesses, groups=(1,), protocol=None, timing=True):
     """Mechanism analysis straight from logical accesses (numpy engine, OCP static placement)."""
-    from .pages import iter_layer_pages
+    from ...frontend.pages import iter_layer_pages
     return analyze_pages(cfg, iter_layer_pages(cfg, layout, accesses), groups, protocol, timing)
 
 

@@ -10,7 +10,7 @@ from hbf.frontend.trace.tokens import read_access
 from hbf.backends.rounds.analysis import locate, placement
 from hbf.cli import pipeline
 from hbf.device.config import load
-from hbf.backends.mqsim.schedule import Batch, Request, schedule_run
+from hbf.frontend.pages import Batch, Request, schedule_run
 from hbf.backends.mqsim.parse import completions
 from hbf.backends.mqsim.run import simulate
 

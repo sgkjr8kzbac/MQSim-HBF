@@ -8,7 +8,7 @@ from hbf.frontend.kv.tensors import Shape
 from hbf.frontend.trace.synthetic import generate
 from hbf.cli import pipeline
 from hbf.device.config import load
-from hbf.backends.mqsim.schedule import Batch, Request, schedule
+from hbf.frontend.pages import Batch, Request, schedule
 from hbf.backends.mqsim.run import simulate
 from hbf.util import dump
 

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from hbf.backends.mqsim.run import simulate
-from hbf.backends.mqsim.schedule import Batch, Request
+from hbf.frontend.pages import Batch, Request
 from hbf.backends.rounds.analysis import locate
 from hbf.device.address import (block_and_page, block_ids, block_page, device_lpa, device_lpas,
                                 host_lpa, host_lpas, place)

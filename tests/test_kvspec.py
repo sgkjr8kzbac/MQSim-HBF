@@ -12,7 +12,7 @@ from hbf.backends.rounds.analysis import analyze_accesses
 from hbf.cli import main
 from hbf.device.config import load
 from hbf.kvspec import GroupedLayout, KVGroup, KVSpec, from_model, generate_grouped, parse_kvspec
-from hbf.backends.rounds.pages import iter_layer_pages
+from hbf.frontend.pages import iter_layer_pages
 
 HBF_FLAGS = ["run", "--analysis-only", "--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read"]
 
@@ -207,7 +207,7 @@ def test_cli_pads_missing_sparse_layers_under_timing(tmp_path):
 def test_grouped_layout_engine_parity(spec_text, intra):
     # L6: numpy and pure-Python reference engines must agree row-by-row on GroupedLayout.
     from hbf.backends.rounds.analysis import Protocol
-    from hbf.backends.mqsim.schedule import schedule
+    from hbf.frontend.pages import schedule
     from tests.reference import analyze
     cfg = load("ocp")
     shape = Shape(6, 4, 128, 4096)

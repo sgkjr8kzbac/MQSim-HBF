@@ -19,7 +19,8 @@ from hbf.frontend.trace.synthetic import generate
 from hbf.frontend.trace.tokens import Access, read_access, write_access
 from hbf.cli import main, pipeline
 from hbf.device.config import CONFIG, PARAMETERS, ROOT, check_xml, load, workload_fields, xml_settings
-from hbf.backends.mqsim.schedule import Batch, Request, metrics, schedule
+from hbf.backends.mqsim.schedule import metrics
+from hbf.frontend.pages import Batch, Request, schedule
 from hbf.backends.mqsim.parse import completions
 from hbf.backends.mqsim.run import check_gc_budget, simulate
 from hbf.util import dump

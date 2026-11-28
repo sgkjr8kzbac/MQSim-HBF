@@ -8,8 +8,8 @@ from hbf.frontend.kv.tensors import Shape, TensorSpec
 from hbf.frontend.trace.synthetic import generate
 from hbf.backends.rounds.analysis import Protocol, analyze_accesses, locate
 from hbf.device.config import load
-from hbf.backends.mqsim.schedule import schedule
-from hbf.backends.rounds.pages import iter_layer_pages, place
+from hbf.device.address import place
+from hbf.frontend.pages import iter_layer_pages, schedule
 from tests.reference import analyze
 
 TWO_BIT = (TensorSpec("K", 2, 128), TensorSpec("V", 2, 128))

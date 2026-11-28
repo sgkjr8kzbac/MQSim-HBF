@@ -54,3 +54,34 @@ def test_lifetime_does_not_import_hbf_cli():
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     assert alias.name != "hbf.cli", f"{path} imports hbf.cli"
+
+
+def _imported_targets(path):
+    """Yield every (module, level) imported inside ``path``."""
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            yield (node.module or ""), node.level
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                yield alias.name, 0
+
+
+def test_frontend_does_not_import_backends():
+    """Frontend produces traces/pages only and must never import from hbf.backends."""
+    for path in sorted((HBF_DIR / "frontend").rglob("*.py")):
+        for module, level in _imported_targets(path):
+            parts = module.split(".") if module else []
+            if "backends" in parts:
+                raise AssertionError(f"{path} imports backend module {'.' * level}{module}")
+
+
+def test_backends_do_not_cross_import():
+    """Sibling backends (rounds and mqsim) must remain independent of each other."""
+    for backend, forbidden in (("rounds", "mqsim"), ("mqsim", "rounds")):
+        for path in sorted((HBF_DIR / "backends" / backend).rglob("*.py")):
+            for module, level in _imported_targets(path):
+                parts = module.split(".") if module else []
+                if forbidden in parts:
+                    raise AssertionError(f"{path} cross-imports {'.' * level}{module}")
+

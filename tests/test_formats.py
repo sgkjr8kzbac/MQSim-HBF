@@ -11,9 +11,8 @@ from hbf.frontend.trace.tokens import Access
 from hbf.backends.rounds.analysis import analyze_accesses
 from hbf.cli import main
 from hbf.device.config import load
-from hbf.backends.mqsim.schedule import schedule
 from hbf.frontend.kv.formats import parse_format
-from hbf.backends.rounds.pages import iter_layer_pages
+from hbf.frontend.pages import iter_layer_pages, schedule
 from tests.reference import analyze
 
 
