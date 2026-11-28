@@ -99,8 +99,9 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | [`hbf/backends/rounds/`](hbf/backends/rounds) | 轮数与解析后端：`analysis.py`（机制分析与协议约束）、`timing.py`（读时间估计与时间分解） |
 | [`hbf/backends/mqsim/`](hbf/backends/mqsim) | MQSim 后端：`build.py`（源码散列校验、打补丁与编译）、`schedule.py`（地址轨迹转子批与未写页检查）、`run.py`（运行、对回完成日志、聚合指标） |
 | [`hbf/lifetime/`](hbf/lifetime) | 寿命模型：`geometry.py`、`clock.py`（核心 `StepClock`/`ReadTimeClock` 与轮数校准）、`analytic.py`、`sim/`（事件模拟）、`interference.py`、`report.py`、`cli.py` |
-| [`hbf/run.py`](hbf/run.py)、[`hbf/cli.py`](hbf/cli.py)、[`hbf/sweep.py`](hbf/sweep.py) | TOML/JSON 配置与 `--set` 覆盖、统一子命令入口 `python3 -m hbf`（`run`/`sweep`/`lifetime`/`check`/`system`/`interference`）、笛卡儿积参数扫描 |
-| [`hbf/models.py`](hbf/models.py)、[`hbf/system.py`](hbf/system.py)、[`hbf/kvspec.py`](hbf/kvspec.py) | 模型与 GPU 预设、系统级 TPOT 评估、层/头 KV 分组（R4 规划迁入扩展） |
+| [`hbf/registry.py`](hbf/registry.py)、[`hbf/run.py`](hbf/run.py)、[`hbf/cli.py`](hbf/cli.py)、[`hbf/sweep.py`](hbf/sweep.py) | 统一插件注册表（内置方法与可选扩展共用同一套接口）、TOML/JSON 配置与 `--set` 覆盖、统一子命令入口 `python3 -m hbf`、笛卡儿积参数扫描 |
+| [`hbf/models.py`](hbf/models.py) | 核心模型形状预设（`layers`、`kv_heads`、`head_dim`、`q_heads`） |
+| [`hbf/ext/`](hbf/ext) | 可选扩展（可整目录删除，不影响核心运行）：`ext/system/`（GPU roofline、TPOT 时钟与 `gpus.json`）、`ext/kv_terms/`（MLA/Loki/SparQ、kvspec 分组、K4–K7 挂接点） |
 | [`hbf/mqsim/`](hbf/mqsim)、[`hbf/patches/`](hbf/patches) | MQSim 上游原版源码（SHA-256 校验）与 I1–I4、T-SUSP、T-ONFI、T-PLANE、T-CMD、T-CACHE、T-PERF 补丁 |
 | [`hbf/configs/`](hbf/configs) | 参数 JSON（含产品假设与出处注释）、XML 模板、模型/GPU/负载预设 |
 | [`tests/`](tests)、[`evidence/`](evidence) | 验证测试、模块导入与快速开始测试、实测摘要和配置网格 |
@@ -340,6 +341,21 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 
 ---
 
+## 扩展（Extensions）
+
+本项目采用微内核 + 统一插件注册表（[hbf/registry.py](hbf/registry.py)）：核心内置方法（`bf16`/`fp8`/`int4`/`int2`/`kivi4`/`kivi2`/`think`/`quest`、4 种布局、通用合成模式与核心 `ReadTimeClock`）与 `hbf/ext/` 下的可选扩展通过**同一套注册接口**接入，核心代码从不静态导入 `hbf.ext`。
+
+**删除整个 `hbf/ext/` 目录（或设置环境变量 `HBF_NO_EXT=1`）不影响核心模拟器运行**：MQSim 模拟、轮数后端估算和寿命外推均可正常工作（由 [tests/test_core_without_ext.py](tests/test_core_without_ext.py) 强制验证）。若配置引用了未装载扩展的名称，注册表会直接报错并指明所属扩展包。
+
+| 扩展 | 作用 | 主要配置节 / 选项 |
+|---|---|---|
+| [`hbf/ext/system/`](hbf/ext/system) | GPU roofline、decode TPOT 评估、MoE 线性层时间、TPOT 寿命时钟（`Clock`）、GPU `prefill_tok_s` 与 `gpus.json` | `[ext.system]`：`gpu`、`overlap`、`kv_consume`、`selection`；子命令 `python3 -m hbf system` |
+| [`hbf/ext/kv_terms/`](hbf/ext/kv_terms) | MLA / `mla_fp8` / DSA 索引器、Loki / SparQ 格式、`kvspec` 层与头分组（`hybrid`/`ssm`/`cla`/`yoco`/`duo`/`pyramid`）、K4 `KVGeometry`、K5 选择真实性（`density`/`select_static`/`reuse`/`query_groups`/`full_tensors`）、K6 `channel_select`、K7 分组放置 / 按类别分写前沿 / 前缀别名 | `[ext.kv_terms]`：`kv_spec`、`select_static`、`reuse`、`query_groups`、`full_tensors`、`frontiers`、`prefix_tokens`、`prefix_groups`、`prefix_reads`；`kv.format` 中的 `mla`/`mla_fp8`/`loki`/`sparq`；`trace.mode = "channel_select"` |
+
+新增自定义 KV 格式、合成模式、放置策略或时钟时，只需参照 `hbf/ext/` 中的模块，在自定义模块里调用 `REGISTRY.register_format` / `register_mode` / `register_clock` / `register_hook` 即可，与内置方法地位完全相同。
+
+---
+
 ## 目录结构
 
 ```
@@ -349,19 +365,22 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 ├── docs/                设计文档、参数来源、本地运行清单与 CLI 迁移表（cli-migration.md）
 ├── hbf/                 中间件 Python 包（python3 -m hbf）
 │   ├── __main__.py      统一入口 python3 -m hbf
+│   ├── registry.py      统一插件注册表（内置方法 + 按需装载 hbf.ext.*）
 │   ├── cli.py           子命令分发（run / check / sweep / lifetime / system / interference）
 │   ├── run.py           TOML/JSON 配置加载、--set 覆盖、config.json 生成与 check 核对
 │   ├── sweep.py         配置键笛卡儿积参数扫描
+│   ├── models.py        核心模型形状预设
 │   ├── device/          参数、拓扑、XML 校验（config.py）与静态地址映射唯一实现（address.py）
 │   ├── frontend/        trace/（tokens/synthetic/requests）、kv/（tensors/formats/layouts/placement）、pages.py、addrtrace.py
 │   ├── backends/        rounds/（analysis/timing）与 mqsim/（build/schedule/run）
 │   ├── lifetime/        寿命模型（geometry/clock/analytic/report/cli/interference/sim/）
-│   ├── configs/         参数 JSON（含假设标注）、XML 模板、模型/GPU/负载预设
+│   ├── ext/             可选扩展（可整体删除）：system/、kv_terms/
+│   ├── configs/         参数 JSON（含假设标注）、XML 模板、模型与负载预设
 │   ├── patches/         I1–I4、T-SUSP、T-ONFI、T-PLANE、T-CMD、T-CACHE、T-PERF；series 规定应用顺序
 │   ├── mqsim/           MQSim 上游源码（固定 commit，SHA-256 校验）
 │   ├── mqsim.commit     固定的上游 commit
 │   └── mqsim.sha256     逐文件校验清单
-├── tests/               pytest：验证项、模块导入、快速开始端到端、上游行为探针、规模测试
+├── tests/               pytest：验证项、无扩展核心冒烟、模块导入、快速开始端到端、规模测试
 └── evidence/            随仓库保存的实测摘要、配置键网格和日志
 ```
 

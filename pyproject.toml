@@ -32,6 +32,7 @@ hbf = [
     "mqsim/*/*/*/*",
     "configs/*.xml",
     "configs/*.json",
+    "ext/system/*.json",
     "patches/*.patch",
     "patches/series",
 ]
