@@ -1,0 +1,165 @@
+diff --git a/src/ssd/Address_Mapping_Unit_Page_Level.cpp b/src/ssd/Address_Mapping_Unit_Page_Level.cpp
+index 1db2d45..e14bdb9 100644
+--- a/src/ssd/Address_Mapping_Unit_Page_Level.cpp
++++ b/src/ssd/Address_Mapping_Unit_Page_Level.cpp
+@@ -1,4 +1,5 @@
+ #include <cmath>
++#include <cstdlib>
+ #include <assert.h>
+ #include <stdexcept>
+ 
+@@ -8,6 +9,29 @@
+ 
+ namespace SSD_Components
+ {
++	//HBF T-HBFW1: static CWDP formula mapping LPA directly to (channel, chip, die, plane, block, page).
++	static bool hbf_static_map()
++	{
++		static const bool enabled = (std::getenv("HBF_T_HBFW1") != nullptr);
++		return enabled;
++	}
++
++	static void hbf_lpa_to_static_address(const AddressMappingDomain* domain, LPA_type lpa,
++		unsigned int pages_no_per_block, NVM::FlashMemory::Physical_Page_Address& addr)
++	{
++		uint64_t ch_no = domain->Channel_no;
++		uint64_t w_no = domain->Chip_no;
++		uint64_t d_no = domain->Die_no;
++		uint64_t p_no = domain->Plane_no;
++		uint64_t units = ch_no * w_no * d_no * p_no;
++		addr.ChannelID = domain->Channel_ids[(unsigned int)(lpa % ch_no)];
++		addr.ChipID = domain->Chip_ids[(unsigned int)((lpa / ch_no) % w_no)];
++		addr.DieID = domain->Die_ids[(unsigned int)((lpa / (ch_no * w_no)) % d_no)];
++		addr.PlaneID = domain->Plane_ids[(unsigned int)((lpa / (ch_no * w_no * d_no)) % p_no)];
++		uint64_t offset = (uint64_t)lpa / units;
++		addr.BlockID = (flash_block_ID_type)(offset / pages_no_per_block);
++		addr.PageID = (flash_page_ID_type)(offset % pages_no_per_block);
++	}
+ 	Cached_Mapping_Table::Cached_Mapping_Table(unsigned int capacity) : capacity(capacity)
+ 	{
+ 	}
+@@ -422,7 +446,8 @@ namespace SSD_Components
+ 
+ 	void Address_Mapping_Unit_Page_Level::Store_mapping_table_on_flash_at_start()
+ 	{
+-		if (mapping_table_stored_on_flash) {
++		if (mapping_table_stored_on_flash || hbf_static_map()) {
++			mapping_table_stored_on_flash = true;
+ 			return;
+ 		}
+ 		//Since address translation functions work on flash transactions
+@@ -583,6 +608,21 @@ namespace SSD_Components
+ 	*/
+ 	bool Address_Mapping_Unit_Page_Level::translate_lpa_to_ppa(stream_id_type streamID, NVM_Transaction_Flash* transaction)
+ 	{
++		if (hbf_static_map()) {
++			if (transaction->Type == Transaction_Type::READ) {
++				hbf_lpa_to_static_address(domains[streamID], transaction->LPA, pages_no_per_block, transaction->Address);
++				transaction->PPA = Convert_address_to_ppa(transaction->Address);
++				block_manager->Read_transaction_issued(transaction->Address);
++				transaction->Physical_address_determined = true;
++				return true;
++			} else {
++				hbf_lpa_to_static_address(domains[streamID], transaction->LPA, pages_no_per_block, transaction->Address);
++				allocate_page_in_plane_for_user_write((NVM_Transaction_Flash_WR*)transaction, false);
++				transaction->Physical_address_determined = true;
++				return true;
++			}
++		}
++
+ 		PPA_type ppa = domains[streamID]->Get_ppa(ideal_mapping_table, streamID, transaction->LPA);
+ 
+ 		if (transaction->Type == Transaction_Type::READ) {
+@@ -1146,6 +1186,13 @@ namespace SSD_Components
+ 	void Address_Mapping_Unit_Page_Level::allocate_page_in_plane_for_user_write(NVM_Transaction_Flash_WR* transaction, bool is_for_gc)
+ 	{
+ 		AddressMappingDomain* domain = domains[transaction->Stream_id];
++		if (hbf_static_map() && !is_for_gc) {
++			block_manager->Allocate_block_and_page_in_plane_for_user_write(transaction->Stream_id, transaction->Address);
++			transaction->PPA = Convert_address_to_ppa(transaction->Address);
++			domain->Update_mapping_info(ideal_mapping_table, transaction->Stream_id, transaction->LPA, transaction->PPA,
++				transaction->write_sectors_bitmap);
++			return;
++		}
+ 		PPA_type old_ppa = domain->Get_ppa(ideal_mapping_table, transaction->Stream_id, transaction->LPA);
+ 
+ 		if (old_ppa == NO_PPA)  /*this is the first access to the logical page*/
+@@ -1225,6 +1272,12 @@ namespace SSD_Components
+ 	PPA_type Address_Mapping_Unit_Page_Level::online_create_entry_for_reads(LPA_type lpa, const stream_id_type stream_id, NVM::FlashMemory::Physical_Page_Address& read_address, uint64_t read_sectors_bitmap)
+ 	{
+ 		AddressMappingDomain* domain = domains[stream_id];
++		if (hbf_static_map()) {
++			hbf_lpa_to_static_address(domain, lpa, pages_no_per_block, read_address);
++			PPA_type ppa = Convert_address_to_ppa(read_address);
++			domain->Update_mapping_info(ideal_mapping_table, stream_id, lpa, ppa, read_sectors_bitmap);
++			return ppa;
++		}
+ 		switch (domain->PlaneAllocationScheme) {
+ 			//Static: Channel first
+ 			case Flash_Plane_Allocation_Scheme_Type::CWDP:
+diff --git a/src/ssd/Flash_Block_Manager.cpp b/src/ssd/Flash_Block_Manager.cpp
+index d401dcb..11ab5d2 100644
+--- a/src/ssd/Flash_Block_Manager.cpp
++++ b/src/ssd/Flash_Block_Manager.cpp
+@@ -1,10 +1,16 @@
+ 
++#include <cstdlib>
+ #include "../nvm_chip/flash_memory/Physical_Page_Address.h"
+ #include "Flash_Block_Manager.h"
+ #include "Stats.h"
+ 
+ namespace SSD_Components
+ {
++	static bool hbf_static_map()
++	{
++		static const bool enabled = (std::getenv("HBF_T_HBFW1") != nullptr);
++		return enabled;
++	}
+ 	Flash_Block_Manager::Flash_Block_Manager(GC_and_WL_Unit_Base* gc_and_wl_unit, unsigned int max_allowed_block_erase_count, unsigned int total_concurrent_streams_no,
+ 		unsigned int channel_count, unsigned int chip_no_per_channel, unsigned int die_no_per_chip, unsigned int plane_no_per_die,
+ 		unsigned int block_no_per_plane, unsigned int page_no_per_block)
+@@ -20,6 +26,15 @@ namespace SSD_Components
+ 	void Flash_Block_Manager::Allocate_block_and_page_in_plane_for_user_write(const stream_id_type stream_id, NVM::FlashMemory::Physical_Page_Address& page_address)
+ 	{
+ 		PlaneBookKeepingType *plane_record = &plane_manager[page_address.ChannelID][page_address.ChipID][page_address.DieID][page_address.PlaneID];
++		if (hbf_static_map()) {
++			Block_Pool_Slot_Type* block = &plane_record->Blocks[page_address.BlockID];
++			block->Stream_id = stream_id;
++			if (page_address.PageID + 1 > block->Current_page_write_index) {
++				block->Current_page_write_index = page_address.PageID + 1;
++			}
++			program_transaction_issued(page_address);
++			return;
++		}
+ 		plane_record->Valid_pages_count++;
+ 		plane_record->Free_pages_count--;		
+ 		page_address.BlockID = plane_record->Data_wf[stream_id]->BlockID;
+@@ -110,6 +125,9 @@ namespace SSD_Components
+ 
+ 	inline void Flash_Block_Manager::Invalidate_page_in_block(const stream_id_type stream_id, const NVM::FlashMemory::Physical_Page_Address& page_address)
+ 	{
++		if (hbf_static_map()) {
++			return;
++		}
+ 		PlaneBookKeepingType* plane_record = &plane_manager[page_address.ChannelID][page_address.ChipID][page_address.DieID][page_address.PlaneID];
+ 		plane_record->Invalid_pages_count++;
+ 		plane_record->Valid_pages_count--;
+diff --git a/src/ssd/Flash_Block_Manager_Base.cpp b/src/ssd/Flash_Block_Manager_Base.cpp
+index 3abe320..adbd853 100644
+--- a/src/ssd/Flash_Block_Manager_Base.cpp
++++ b/src/ssd/Flash_Block_Manager_Base.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "Flash_Block_Manager.h"
+ 
+ 
+@@ -119,6 +120,9 @@ namespace SSD_Components
+ 	
+ 	void PlaneBookKeepingType::Check_bookkeeping_correctness(const NVM::FlashMemory::Physical_Page_Address& plane_address)
+ 	{
++		if (std::getenv("HBF_T_HBFW1") != nullptr) {
++			return;
++		}
+ 		if (Total_pages_count != Free_pages_count + Valid_pages_count + Invalid_pages_count) {
+ 			PRINT_ERROR("Inconsistent status in the plane bookkeeping record!")
+ 		}

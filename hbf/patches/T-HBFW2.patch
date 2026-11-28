@@ -1,0 +1,465 @@
+diff --git a/src/ssd/Address_Mapping_Unit_Page_Level.cpp b/src/ssd/Address_Mapping_Unit_Page_Level.cpp
+index e14bdb9..cbb7811 100644
+--- a/src/ssd/Address_Mapping_Unit_Page_Level.cpp
++++ b/src/ssd/Address_Mapping_Unit_Page_Level.cpp
+@@ -16,6 +16,34 @@ namespace SSD_Components
+ 		return enabled;
+ 	}
+ 
++	//HBF T-HBFW2: writing page 0 of a previously written block submits a USERIO erase first.
++	static bool hbf_auto_erase()
++	{
++		static const bool enabled = (std::getenv("HBF_T_HBFW2") != nullptr);
++		return enabled;
++	}
++
++	static void hbf_attach_auto_erase(Flash_Block_Manager_Base* block_manager, NVM_Transaction_Flash_WR* transaction)
++	{
++		if (!hbf_auto_erase()) return;
++		PlaneBookKeepingType* plane_record = block_manager->Get_plane_bookkeeping_entry(transaction->Address);
++		Block_Pool_Slot_Type* block = &plane_record->Blocks[transaction->Address.BlockID];
++		if (transaction->Address.PageID == 0 && block->Hbf_written && block->Hbf_ongoing_erase == NULL) {
++			NVM::FlashMemory::Physical_Page_Address erase_addr(transaction->Address);
++			erase_addr.PageID = 0;
++			NVM_Transaction_Flash_ER* erase_tr = new NVM_Transaction_Flash_ER(
++				Transaction_Source_Type::USERIO, transaction->Stream_id, erase_addr);
++			erase_tr->Issue_time = transaction->Issue_time;
++			erase_tr->Hbf_waiting_writes.push_back(transaction);
++			transaction->RelatedErase = erase_tr;
++			block->Hbf_ongoing_erase = erase_tr;
++		} else if (block->Hbf_ongoing_erase != NULL) {
++			block->Hbf_ongoing_erase->Hbf_waiting_writes.push_back(transaction);
++			transaction->RelatedErase = block->Hbf_ongoing_erase;
++		}
++		block->Hbf_written = true;
++	}
++
+ 	static void hbf_lpa_to_static_address(const AddressMappingDomain* domain, LPA_type lpa,
+ 		unsigned int pages_no_per_block, NVM::FlashMemory::Physical_Page_Address& addr)
+ 	{
+@@ -519,6 +547,13 @@ namespace SSD_Components
+ 			for (std::list<NVM_Transaction*>::const_iterator it = transactionList.begin();
+ 				it != transactionList.end(); it++) {
+ 				if (((NVM_Transaction_Flash*)(*it))->Physical_address_determined) {
++					if (((NVM_Transaction_Flash*)(*it))->Type == Transaction_Type::WRITE) {
++						NVM_Transaction_Flash_ER* rel_er = ((NVM_Transaction_Flash_WR*)(*it))->RelatedErase;
++						if (rel_er != NULL && !rel_er->Hbf_submitted) {
++							rel_er->Hbf_submitted = true;
++							ftl->TSU->Submit_transaction(rel_er);
++						}
++					}
+ 					ftl->TSU->Submit_transaction(static_cast<NVM_Transaction_Flash*>(*it));
+ 					if (((NVM_Transaction_Flash*)(*it))->Type == Transaction_Type::WRITE) {
+ 						if (((NVM_Transaction_Flash_WR*)(*it))->RelatedRead != NULL) {
+@@ -1188,6 +1223,7 @@ namespace SSD_Components
+ 		AddressMappingDomain* domain = domains[transaction->Stream_id];
+ 		if (hbf_static_map() && !is_for_gc) {
+ 			block_manager->Allocate_block_and_page_in_plane_for_user_write(transaction->Stream_id, transaction->Address);
++			hbf_attach_auto_erase(block_manager, transaction);
+ 			transaction->PPA = Convert_address_to_ppa(transaction->Address);
+ 			domain->Update_mapping_info(ideal_mapping_table, transaction->Stream_id, transaction->LPA, transaction->PPA,
+ 				transaction->write_sectors_bitmap);
+@@ -1236,6 +1272,7 @@ namespace SSD_Components
+ 			block_manager->Allocate_block_and_page_in_plane_for_gc_write(transaction->Stream_id, transaction->Address);
+ 		} else {
+ 			block_manager->Allocate_block_and_page_in_plane_for_user_write(transaction->Stream_id, transaction->Address);
++			hbf_attach_auto_erase(block_manager, transaction);
+ 		}
+ 		transaction->PPA = Convert_address_to_ppa(transaction->Address);
+ 		domain->Update_mapping_info(ideal_mapping_table, transaction->Stream_id, transaction->LPA, transaction->PPA,
+diff --git a/src/ssd/Data_Cache_Manager_Flash_Advanced.cpp b/src/ssd/Data_Cache_Manager_Flash_Advanced.cpp
+index af29528..3395aa0 100644
+--- a/src/ssd/Data_Cache_Manager_Flash_Advanced.cpp
++++ b/src/ssd/Data_Cache_Manager_Flash_Advanced.cpp
+@@ -360,6 +360,9 @@ namespace SSD_Components
+ 		if (transaction->Source != Transaction_Source_Type::USERIO && transaction->Source != Transaction_Source_Type::CACHE) {
+ 			return;
+ 		}
++		if (transaction->Type == Transaction_Type::ERASE) {
++			return;
++		}
+ 
+ 		if (transaction->Source == Transaction_Source_Type::USERIO) {
+ 			_my_instance->broadcast_user_memory_transaction_serviced_signal(transaction);
+diff --git a/src/ssd/Data_Cache_Manager_Flash_Simple.cpp b/src/ssd/Data_Cache_Manager_Flash_Simple.cpp
+index 0d49020..64f2e18 100644
+--- a/src/ssd/Data_Cache_Manager_Flash_Simple.cpp
++++ b/src/ssd/Data_Cache_Manager_Flash_Simple.cpp
+@@ -217,6 +217,9 @@ namespace SSD_Components
+ 		if (transaction->Source != Transaction_Source_Type::USERIO && transaction->Source != Transaction_Source_Type::CACHE) {
+ 			return;
+ 		}
++		if (transaction->Type == Transaction_Type::ERASE) {
++			return;
++		}
+ 
+ 		if (transaction->Source == Transaction_Source_Type::USERIO)
+ 			_my_instance->broadcast_user_memory_transaction_serviced_signal(transaction);
+diff --git a/src/ssd/Flash_Block_Manager_Base.h b/src/ssd/Flash_Block_Manager_Base.h
+index 8e09193..a5d8b1b 100644
+--- a/src/ssd/Flash_Block_Manager_Base.h
++++ b/src/ssd/Flash_Block_Manager_Base.h
+@@ -43,6 +43,8 @@ namespace SSD_Components
+ 		bool Hot_block = false;//Used for hot/cold separation mentioned in the "On the necessity of hot and cold data identification to reduce the write amplification in flash-based SSDs", Perf. Eval., 2014.
+ 		int Ongoing_user_read_count;
+ 		int Ongoing_user_program_count;
++		bool Hbf_written = false;//HBF T-HBFW2: true once any page of this block has been written
++		NVM_Transaction_Flash_ER* Hbf_ongoing_erase = NULL;//HBF T-HBFW2: active auto-erase for this block
+ 		void Erase();
+ 	};
+ 
+diff --git a/src/ssd/GC_and_WL_Unit_Base.cpp b/src/ssd/GC_and_WL_Unit_Base.cpp
+index fef869d..6a4e234 100644
+--- a/src/ssd/GC_and_WL_Unit_Base.cpp
++++ b/src/ssd/GC_and_WL_Unit_Base.cpp
+@@ -55,6 +55,21 @@ namespace SSD_Components
+ 					case Transaction_Type::WRITE:
+ 						_my_instance->block_manager->Program_transaction_serviced(transaction->Address);
+ 						break;
++					case Transaction_Type::ERASE:
++					{
++						NVM_Transaction_Flash_ER* erase_tr = static_cast<NVM_Transaction_Flash_ER*>(transaction);
++						Block_Pool_Slot_Type* block = &pbke->Blocks[transaction->Address.BlockID];
++						for (NVM_Transaction_Flash_WR* wr : erase_tr->Hbf_waiting_writes) {
++							wr->RelatedErase = NULL;
++						}
++						erase_tr->Hbf_waiting_writes.clear();
++						if (block->Hbf_ongoing_erase == erase_tr) {
++							block->Hbf_ongoing_erase = NULL;
++						}
++						block->Current_page_write_index = 0;
++						block->Erase_count++;
++						return;
++					}
+ 					default:
+ 						PRINT_ERROR("Unexpected situation in the GC_and_WL_Unit_Base function!")
+ 				}
+diff --git a/src/ssd/NVM_Transaction_Flash_ER.h b/src/ssd/NVM_Transaction_Flash_ER.h
+index 6b6f3b0..f51d387 100644
+--- a/src/ssd/NVM_Transaction_Flash_ER.h
++++ b/src/ssd/NVM_Transaction_Flash_ER.h
+@@ -13,6 +13,9 @@ namespace SSD_Components
+ 	public:
+ 		NVM_Transaction_Flash_ER(Transaction_Source_Type source, stream_id_type streamID, const NVM::FlashMemory::Physical_Page_Address& address);
+ 		std::list<NVM_Transaction_Flash_WR *> Page_movement_activities;
++		//HBF T-HBFW2: user writes waiting on this auto-erase before they may program
++		std::list<NVM_Transaction_Flash_WR *> Hbf_waiting_writes;
++		bool Hbf_submitted = false;
+ 	};
+ }
+ 
+diff --git a/src/ssd/NVM_Transaction_Flash_WR.cpp b/src/ssd/NVM_Transaction_Flash_WR.cpp
+index 981aa1d..af2ee9e 100644
+--- a/src/ssd/NVM_Transaction_Flash_WR.cpp
++++ b/src/ssd/NVM_Transaction_Flash_WR.cpp
+@@ -8,7 +8,7 @@ namespace SSD_Components
+ 		SSD_Components::User_Request* user_io_request, NVM::memory_content_type content,
+ 		NVM_Transaction_Flash_RD* related_read, page_status_type written_sectors_bitmap, data_timestamp_type data_timestamp) :
+ 		NVM_Transaction_Flash(source, Transaction_Type::WRITE, stream_id, data_size_in_byte, lpa, ppa, address, user_io_request, IO_Flow_Priority_Class::UNDEFINED),
+-		Content(content), RelatedRead(related_read), write_sectors_bitmap(written_sectors_bitmap), DataTimeStamp(data_timestamp),
++		Content(content), RelatedRead(related_read), RelatedErase(NULL), write_sectors_bitmap(written_sectors_bitmap), DataTimeStamp(data_timestamp),
+ 		ExecutionMode(WriteExecutionModeType::SIMPLE)
+ 	{
+ 	}
+@@ -17,7 +17,7 @@ namespace SSD_Components
+ 		unsigned int data_size_in_byte, LPA_type lpa, PPA_type ppa, SSD_Components::User_Request* user_io_request,
+ 		NVM::memory_content_type content, NVM_Transaction_Flash_RD* related_read, page_status_type written_sectors_bitmap, data_timestamp_type data_timestamp) :
+ 		NVM_Transaction_Flash(source, Transaction_Type::WRITE, stream_id, data_size_in_byte, lpa, ppa, user_io_request, IO_Flow_Priority_Class::UNDEFINED),
+-		Content(content), RelatedRead(related_read), write_sectors_bitmap(written_sectors_bitmap), DataTimeStamp(data_timestamp),
++		Content(content), RelatedRead(related_read), RelatedErase(NULL), write_sectors_bitmap(written_sectors_bitmap), DataTimeStamp(data_timestamp),
+ 		ExecutionMode(WriteExecutionModeType::SIMPLE)
+ 	{
+ 	}
+@@ -26,7 +26,7 @@ namespace SSD_Components
+ 		unsigned int data_size_in_byte, LPA_type lpa, SSD_Components::User_Request* user_io_request, IO_Flow_Priority_Class::Priority priority_class, NVM::memory_content_type content,
+ 		page_status_type written_sectors_bitmap, data_timestamp_type data_timestamp) :
+ 		NVM_Transaction_Flash(source, Transaction_Type::WRITE, stream_id, data_size_in_byte, lpa, NO_PPA, user_io_request, priority_class),
+-		Content(content), RelatedRead(NULL), write_sectors_bitmap(written_sectors_bitmap), DataTimeStamp(data_timestamp),
++		Content(content), RelatedRead(NULL), RelatedErase(NULL), write_sectors_bitmap(written_sectors_bitmap), DataTimeStamp(data_timestamp),
+ 		ExecutionMode(WriteExecutionModeType::SIMPLE)
+ 	{
+ 	}
+@@ -35,7 +35,7 @@ namespace SSD_Components
+ 		unsigned int data_size_in_byte, LPA_type lpa, SSD_Components::User_Request* user_io_request, NVM::memory_content_type content,
+ 		page_status_type written_sectors_bitmap, data_timestamp_type data_timestamp) :
+ 		NVM_Transaction_Flash(source, Transaction_Type::WRITE, stream_id, data_size_in_byte, lpa, NO_PPA, user_io_request, IO_Flow_Priority_Class::UNDEFINED),
+-		Content(content), RelatedRead(NULL), write_sectors_bitmap(written_sectors_bitmap), DataTimeStamp(data_timestamp),
++		Content(content), RelatedRead(NULL), RelatedErase(NULL), write_sectors_bitmap(written_sectors_bitmap), DataTimeStamp(data_timestamp),
+ 		ExecutionMode(WriteExecutionModeType::SIMPLE)
+ 	{
+ 	}
+diff --git a/src/ssd/TSU_Base.cpp b/src/ssd/TSU_Base.cpp
+index b304927..26e2638 100644
+--- a/src/ssd/TSU_Base.cpp
++++ b/src/ssd/TSU_Base.cpp
+@@ -106,9 +106,33 @@ namespace SSD_Components
+ 
+ 	bool TSU_Base::issue_command_to_chip(Flash_Transaction_Queue *sourceQueue1, Flash_Transaction_Queue *sourceQueue2, Transaction_Type transactionType, bool suspensionRequired)
+ 	{
+-		flash_die_ID_type dieID = sourceQueue1->front()->Address.DieID;
+-		flash_page_ID_type pageID = sourceQueue1->front()->Address.PageID;
+-		flash_block_ID_type blockID = sourceQueue1->front()->Address.BlockID;
++		NVM_Transaction_Flash *first_ready = NULL;
++		for (Flash_Transaction_Queue::iterator it = sourceQueue1->begin(); it != sourceQueue1->end(); it++)
++		{
++			if (transaction_is_ready(*it))
++			{
++				first_ready = *it;
++				break;
++			}
++		}
++		if (first_ready == NULL && sourceQueue2 != NULL)
++		{
++			for (Flash_Transaction_Queue::iterator it = sourceQueue2->begin(); it != sourceQueue2->end(); it++)
++			{
++				if (transaction_is_ready(*it))
++				{
++					first_ready = *it;
++					break;
++				}
++			}
++		}
++		if (first_ready == NULL)
++		{
++			return false;
++		}
++		flash_die_ID_type dieID = first_ready->Address.DieID;
++		flash_page_ID_type pageID = first_ready->Address.PageID;
++		flash_block_ID_type blockID = first_ready->Address.BlockID;
+ 		uint64_t planeVector = 0;//HBF T-PLANE: 64 bits, upstream's unsigned int overflows past 32 planes
+ 		static int issueCntr = 0;
+ 		
+@@ -124,6 +148,10 @@ namespace SSD_Components
+ 					//Check for identical pages when running multiplane command
+ 					if (planeVector == 0 || hbf_joins_command(*it, blockID, pageID))
+ 					{
++						if (planeVector == 0) {
++							blockID = (*it)->Address.BlockID;
++							pageID = (*it)->Address.PageID;
++						}
+ 						(*it)->SuspendRequired = suspensionRequired;
+ 						planeVector |= (uint64_t)1 << (*it)->Address.PlaneID;
+ 						transaction_dispatch_slots.push_back(*it);
+@@ -144,6 +172,10 @@ namespace SSD_Components
+ 						//Check for identical pages when running multiplane command
+ 						if (planeVector == 0 || hbf_joins_command(*it, blockID, pageID))
+ 						{
++							if (planeVector == 0) {
++								blockID = (*it)->Address.BlockID;
++								pageID = (*it)->Address.PageID;
++							}
+ 							(*it)->SuspendRequired = suspensionRequired;
+ 							planeVector |= (uint64_t)1 << (*it)->Address.PlaneID;
+ 							transaction_dispatch_slots.push_back(*it);
+diff --git a/src/ssd/TSU_Base.h b/src/ssd/TSU_Base.h
+index 564a5f6..9971b1c 100644
+--- a/src/ssd/TSU_Base.h
++++ b/src/ssd/TSU_Base.h
+@@ -90,7 +90,7 @@ protected:
+ 	static void handle_channel_idle_signal(flash_channel_ID_type);
+ 	static void handle_chip_idle_signal(NVM::FlashMemory::Flash_Chip *chip);
+ 	int opened_scheduling_reqs;
+-	void process_chip_requests(NVM::FlashMemory::Flash_Chip* chip)
++	virtual void process_chip_requests(NVM::FlashMemory::Flash_Chip* chip)
+ 	{
+ 		if (!_my_instance->service_read_transaction(chip)) {
+ 			if (!_my_instance->service_write_transaction(chip)) {
+@@ -99,7 +99,6 @@ protected:
+ 		}
+ 	}
+ 
+-private:
+ 	bool transaction_is_ready(NVM_Transaction_Flash* transaction)
+ 	{
+ 		switch (transaction->Type)
+@@ -107,7 +106,8 @@ private:
+ 		case Transaction_Type::READ:
+ 			return true;
+ 		case Transaction_Type::WRITE:
+-			return static_cast<NVM_Transaction_Flash_WR*>(transaction)->RelatedRead == NULL;
++			return static_cast<NVM_Transaction_Flash_WR*>(transaction)->RelatedRead == NULL
++				&& static_cast<NVM_Transaction_Flash_WR*>(transaction)->RelatedErase == NULL;
+ 		case Transaction_Type::ERASE:
+ 			return static_cast<NVM_Transaction_Flash_ER*>(transaction)->Page_movement_activities.size() == 0;
+ 		default:
+diff --git a/src/ssd/TSU_Priority_OutOfOrder.cpp b/src/ssd/TSU_Priority_OutOfOrder.cpp
+index 5bbec4a..86e8b68 100644
+--- a/src/ssd/TSU_Priority_OutOfOrder.cpp
++++ b/src/ssd/TSU_Priority_OutOfOrder.cpp
+@@ -1,4 +1,7 @@
++#include <algorithm>
+ #include <cstdlib>
++#include <cstring>
++#include <iostream>
+ 
+ #include "TSU_Priority_OutOfOrder.h"
+ #include "Host_Interface_Defs.h"
+@@ -11,6 +14,25 @@ static bool hbf_program_suspend()
+     return std::getenv("HBF_T_SUSP") != nullptr;
+ }
+ 
++static bool hbf_auto_erase()
++{
++    static const bool enabled = (std::getenv("HBF_T_HBFW2") != nullptr);
++    return enabled;
++}
++
++//HBF T-HBFW2: read/write/erase service order on a chip ("read_first" default, or "fifo").
++static bool hbf_write_order_fifo()
++{
++    static const bool fifo = [] {
++        const char* value = std::getenv("HBF_WRITE_ORDER");
++        if (value == NULL || std::strcmp(value, "read_first") == 0) return false;
++        if (std::strcmp(value, "fifo") == 0) return true;
++        std::cerr << "ERROR:HBF_WRITE_ORDER must be read_first or fifo" << std::endl;
++        exit(1);
++    }();
++    return fifo;
++}
++
+ //HBF T-CMD: newly received transactions wait this long before they are dispatched, so that the
+ //transactions of one batch that reach a die within the window leave in one multi-plane command.
+ static sim_time_type hbf_coalesce_ns()
+@@ -326,13 +348,7 @@ void TSU_Priority_OutOfOrder::dispatch_to_idle_channels()
+             {
+                 NVM::FlashMemory::Flash_Chip *chip = _NVMController->Get_chip(channelID, Round_robin_turn_of_channel[channelID]);
+                 //The TSU does not check if the chip is idle or not since it is possible to suspend a busy chip and issue a new command
+-                if (!service_read_transaction(chip))
+-                {
+-                    if (!service_write_transaction(chip))
+-                    {
+-                        service_erase_transaction(chip);
+-                    }
+-                }
++                process_chip_requests(chip);
+                 Round_robin_turn_of_channel[channelID] = (flash_chip_ID_type)(Round_robin_turn_of_channel[channelID] + 1) % chip_no_per_channel;
+                 if (_NVMController->Get_channel_status(chip->ChannelID) != BusChannelStatus::IDLE)
+                 {
+@@ -411,7 +427,7 @@ bool TSU_Priority_OutOfOrder::service_read_transaction(NVM::FlashMemory::Flash_C
+         {
+             return false;
+         }
+-        else if (GCEraseTRQueue[chip->ChannelID][chip->ChipID].size() > 0)
++        else if (hbf_has_gc_erase(chip))
+         {
+             return false;
+         }
+@@ -484,9 +500,7 @@ bool TSU_Priority_OutOfOrder::service_read_transaction(NVM::FlashMemory::Flash_C
+         return false;
+     }
+ 
+-    issue_command_to_chip(sourceQueue1, sourceQueue2, Transaction_Type::READ, suspensionRequired);
+-
+-    return true;
++    return issue_command_to_chip(sourceQueue1, sourceQueue2, Transaction_Type::READ, suspensionRequired);
+ }
+ 
+ Flash_Transaction_Queue *TSU_Priority_OutOfOrder::get_next_write_service_queue(NVM::FlashMemory::Flash_Chip *chip)
+@@ -539,7 +553,7 @@ bool TSU_Priority_OutOfOrder::service_write_transaction(NVM::FlashMemory::Flash_
+             sourceQueue1 = &GCWriteTRQueue[chip->ChannelID][chip->ChipID];
+             sourceQueue2 = get_next_write_service_queue(chip);
+         }
+-        else if (GCEraseTRQueue[chip->ChannelID][chip->ChipID].size() > 0)
++        else if (hbf_has_gc_erase(chip))
+         {
+             return false;
+         }
+@@ -589,9 +603,72 @@ bool TSU_Priority_OutOfOrder::service_write_transaction(NVM::FlashMemory::Flash_
+         return false;
+     }
+ 
+-    issue_command_to_chip(sourceQueue1, sourceQueue2, Transaction_Type::WRITE, suspensionRequired);
++    return issue_command_to_chip(sourceQueue1, sourceQueue2, Transaction_Type::WRITE, suspensionRequired);
++}
++
++bool TSU_Priority_OutOfOrder::hbf_has_gc_erase(NVM::FlashMemory::Flash_Chip *chip)
++{
++    Flash_Transaction_Queue &q = GCEraseTRQueue[chip->ChannelID][chip->ChipID];
++    if (!hbf_auto_erase()) return q.size() > 0;
++    for (Flash_Transaction_Queue::iterator it = q.begin(); it != q.end(); it++)
++    {
++        if ((*it)->Source == Transaction_Source_Type::GC_WL) return true;
++    }
++    return false;
++}
++
++sim_time_type TSU_Priority_OutOfOrder::hbf_earliest_ready(Flash_Transaction_Queue &queue)
++{
++    sim_time_type best = INVALID_TIME;
++    for (Flash_Transaction_Queue::iterator it = queue.begin(); it != queue.end(); it++)
++    {
++        if (transaction_is_ready(*it) && (*it)->Issue_time < best)
++        {
++            best = (*it)->Issue_time;
++        }
++    }
++    return best;
++}
++
++void TSU_Priority_OutOfOrder::process_chip_requests(NVM::FlashMemory::Flash_Chip *chip)
++{
++    if (!hbf_write_order_fifo() || _NVMController->Hbf_cache_priority_pass())
++    {
++        if (!service_read_transaction(chip))
++        {
++            if (!service_write_transaction(chip))
++            {
++                service_erase_transaction(chip);
++            }
++        }
++        return;
++    }
+ 
+-    return true;
++    flash_channel_ID_type ch = chip->ChannelID;
++    flash_chip_ID_type w = chip->ChipID;
++    sim_time_type t_read = std::min(hbf_earliest_ready(MappingReadTRQueue[ch][w]), hbf_earliest_ready(GCReadTRQueue[ch][w]));
++    sim_time_type t_write = hbf_earliest_ready(GCWriteTRQueue[ch][w]);
++    for (unsigned int p = 0; p < IO_Flow_Priority_Class::NUMBER_OF_PRIORITY_LEVELS; p++)
++    {
++        t_read = std::min(t_read, hbf_earliest_ready(UserReadTRQueue[ch][w][p]));
++        t_write = std::min(t_write, hbf_earliest_ready(UserWriteTRQueue[ch][w][p]));
++    }
++    sim_time_type t_erase = hbf_earliest_ready(GCEraseTRQueue[ch][w]);
++
++    struct Candidate { sim_time_type time; int kind; };
++    Candidate order[3] = { {t_read, 0}, {t_write, 1}, {t_erase, 2} };
++    std::sort(order, order + 3, [](const Candidate &a, const Candidate &b) {
++        return a.time < b.time || (a.time == b.time && a.kind < b.kind);
++    });
++    for (int i = 0; i < 3; i++)
++    {
++        if (order[i].time == INVALID_TIME) break;
++        bool issued = false;
++        if (order[i].kind == 0) issued = service_read_transaction(chip);
++        else if (order[i].kind == 1) issued = service_write_transaction(chip);
++        else issued = service_erase_transaction(chip);
++        if (issued) return;
++    }
+ }
+ 
+ bool TSU_Priority_OutOfOrder::service_erase_transaction(NVM::FlashMemory::Flash_Chip *chip)
+@@ -611,8 +688,6 @@ bool TSU_Priority_OutOfOrder::service_erase_transaction(NVM::FlashMemory::Flash_
+         return false;
+     }
+ 
+-    issue_command_to_chip(source_queue, NULL, Transaction_Type::ERASE, false);
+-
+-    return true;
++    return issue_command_to_chip(source_queue, NULL, Transaction_Type::ERASE, false);
+ }
+ } // namespace SSD_Components
+diff --git a/src/ssd/TSU_Priority_OutOfOrder.h b/src/ssd/TSU_Priority_OutOfOrder.h
+index 79297c0..9387c67 100644
+--- a/src/ssd/TSU_Priority_OutOfOrder.h
++++ b/src/ssd/TSU_Priority_OutOfOrder.h
+@@ -63,6 +63,9 @@ private:
+     bool service_read_transaction(NVM::FlashMemory::Flash_Chip *chip);
+     bool service_write_transaction(NVM::FlashMemory::Flash_Chip *chip);
+     bool service_erase_transaction(NVM::FlashMemory::Flash_Chip *chip);
++    void process_chip_requests(NVM::FlashMemory::Flash_Chip *chip) override;//HBF T-HBFW2: read_first vs fifo
++    bool hbf_has_gc_erase(NVM::FlashMemory::Flash_Chip *chip);//HBF T-HBFW2: exclude USERIO auto-erases from GC urgency
++    sim_time_type hbf_earliest_ready(Flash_Transaction_Queue &queue);
+     Flash_Transaction_Queue *get_next_read_service_queue(NVM::FlashMemory::Flash_Chip *chip);
+     Flash_Transaction_Queue *get_next_write_service_queue(NVM::FlashMemory::Flash_Chip *chip);
+ };

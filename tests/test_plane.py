@@ -176,7 +176,7 @@ def test_coalesced_command_time(binary, evidence, planes, step, window):
 def test_patch_series_lists_every_patch():
     from hbf.backends.mqsim.build import patch_series
     names = [path.name for path in patch_series()]
-    assert names[-3:] == ["T-CMD.patch", "T-CACHE.patch", "T-PERF.patch"] and len(names) == len(set(names)) == 10
+    assert names[-4:] == ["T-HBFW1.patch", "T-HBFW2.patch", "T-HBFW3.patch", "T-HBFW4.patch"] and len(names) == len(set(names)) == 14
 
 
 def cache_cfg(**overrides):

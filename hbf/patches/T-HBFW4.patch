@@ -1,0 +1,111 @@
+diff --git a/src/ssd/FTL.cpp b/src/ssd/FTL.cpp
+index 234661e..14b29de 100644
+--- a/src/ssd/FTL.cpp
++++ b/src/ssd/FTL.cpp
+@@ -886,6 +886,7 @@ namespace SSD_Components
+ 		xmlwriter.Write_attribute_string_inline(attr, val);
+ 
+ 		xmlwriter.Write_end_element_tag();
++		BlockManager->Hbf_dump_block_counts();
+ 	}
+ 
+ 	void FTL::Start_simulation()
+diff --git a/src/ssd/Flash_Block_Manager_Base.cpp b/src/ssd/Flash_Block_Manager_Base.cpp
+index adbd853..54dc11f 100644
+--- a/src/ssd/Flash_Block_Manager_Base.cpp
++++ b/src/ssd/Flash_Block_Manager_Base.cpp
+@@ -1,4 +1,6 @@
+ #include <cstdlib>
++#include <fstream>
++#include <stdexcept>
+ #include "Flash_Block_Manager.h"
+ 
+ 
+@@ -95,6 +97,7 @@ namespace SSD_Components
+ 		Current_page_write_index = 0;
+ 		Invalid_page_count = 0;
+ 		Erase_count++;
++		Hbf_erase_count++;
+ 		for (unsigned int i = 0; i < Block_Pool_Slot_Type::Page_vector_size; i++) {
+ 			Invalid_page_bitmap[i] = All_VALID_PAGE;
+ 		}
+@@ -218,12 +221,44 @@ namespace SSD_Components
+ 	{
+ 		PlaneBookKeepingType *plane_record = &plane_manager[page_address.ChannelID][page_address.ChipID][page_address.DieID][page_address.PlaneID];
+ 		plane_record->Blocks[page_address.BlockID].Ongoing_user_program_count--;
++		plane_record->Blocks[page_address.BlockID].Hbf_program_count++;
+ 	}
+ 
+ 	void Flash_Block_Manager_Base::Read_transaction_serviced(const NVM::FlashMemory::Physical_Page_Address& page_address)
+ 	{
+ 		PlaneBookKeepingType *plane_record = &plane_manager[page_address.ChannelID][page_address.ChipID][page_address.DieID][page_address.PlaneID];
+ 		plane_record->Blocks[page_address.BlockID].Ongoing_user_read_count--;
++		plane_record->Blocks[page_address.BlockID].Hbf_read_count++;
++	}
++
++	void Flash_Block_Manager_Base::Hbf_erase_transaction_serviced(const NVM::FlashMemory::Physical_Page_Address& block_address)
++	{
++		PlaneBookKeepingType *plane_record = &plane_manager[block_address.ChannelID][block_address.ChipID][block_address.DieID][block_address.PlaneID];
++		plane_record->Blocks[block_address.BlockID].Hbf_erase_count++;
++	}
++
++	void Flash_Block_Manager_Base::Hbf_dump_block_counts() const
++	{
++		const char* path = std::getenv("HBF_T_HBFW4");
++		if (!path || !*path) return;
++		std::ofstream out(path);
++		if (!out) throw std::runtime_error("Cannot write HBF_T_HBFW4");
++		out << "channel,chip,die,plane,block,reads,programs,erases\n";
++		for (unsigned int ch = 0; ch < channel_count; ch++) {
++			for (unsigned int w = 0; w < chip_no_per_channel; w++) {
++				for (unsigned int d = 0; d < die_no_per_chip; d++) {
++					for (unsigned int p = 0; p < plane_no_per_die; p++) {
++						for (unsigned int b = 0; b < block_no_per_plane; b++) {
++							const Block_Pool_Slot_Type& blk = plane_manager[ch][w][d][p].Blocks[b];
++							if (blk.Hbf_read_count || blk.Hbf_program_count || blk.Hbf_erase_count) {
++								out << ch << ',' << w << ',' << d << ',' << p << ',' << b << ','
++									<< blk.Hbf_read_count << ',' << blk.Hbf_program_count << ',' << blk.Hbf_erase_count << '\n';
++							}
++						}
++					}
++				}
++			}
++		}
+ 	}
+ 	
+ 	bool Flash_Block_Manager_Base::Is_having_ongoing_program(const NVM::FlashMemory::Physical_Page_Address& block_address)
+diff --git a/src/ssd/Flash_Block_Manager_Base.h b/src/ssd/Flash_Block_Manager_Base.h
+index a5d8b1b..29f9033 100644
+--- a/src/ssd/Flash_Block_Manager_Base.h
++++ b/src/ssd/Flash_Block_Manager_Base.h
+@@ -45,6 +45,9 @@ namespace SSD_Components
+ 		int Ongoing_user_program_count;
+ 		bool Hbf_written = false;//HBF T-HBFW2: true once any page of this block has been written
+ 		NVM_Transaction_Flash_ER* Hbf_ongoing_erase = NULL;//HBF T-HBFW2: active auto-erase for this block
++		uint64_t Hbf_read_count = 0;//HBF T-HBFW4: per-block read count
++		uint64_t Hbf_program_count = 0;//HBF T-HBFW4: per-block program count
++		uint64_t Hbf_erase_count = 0;//HBF T-HBFW4: per-block erase count
+ 		void Erase();
+ 	};
+ 
+@@ -96,6 +99,8 @@ namespace SSD_Components
+ 		void Read_transaction_issued(const NVM::FlashMemory::Physical_Page_Address& page_address);//Updates the block bookkeeping record
+ 		void Read_transaction_serviced(const NVM::FlashMemory::Physical_Page_Address& page_address);//Updates the block bookkeeping record
+ 		void Program_transaction_serviced(const NVM::FlashMemory::Physical_Page_Address& page_address);//Updates the block bookkeeping record
++		void Hbf_erase_transaction_serviced(const NVM::FlashMemory::Physical_Page_Address& block_address);//HBF T-HBFW4
++		void Hbf_dump_block_counts() const;//HBF T-HBFW4: export non-zero per-block counts to HBF_T_HBFW4 CSV path
+ 		bool Is_having_ongoing_program(const NVM::FlashMemory::Physical_Page_Address& block_address);//Cheks if block has any ongoing program request
+ 		bool Is_page_valid(Block_Pool_Slot_Type* block, flash_page_ID_type page_id);//Make the page invalid in the block bookkeeping record
+ 	protected:
+diff --git a/src/ssd/GC_and_WL_Unit_Base.cpp b/src/ssd/GC_and_WL_Unit_Base.cpp
+index 2218f9b..38c1f10 100644
+--- a/src/ssd/GC_and_WL_Unit_Base.cpp
++++ b/src/ssd/GC_and_WL_Unit_Base.cpp
+@@ -69,6 +69,7 @@ namespace SSD_Components
+ 						}
+ 						block->Current_page_write_index = 0;
+ 						block->Erase_count++;
++						_my_instance->block_manager->Hbf_erase_transaction_serviced(transaction->Address);
+ 						return;
+ 					}
+ 					default:

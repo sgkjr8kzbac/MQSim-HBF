@@ -81,11 +81,19 @@ def check_gc_budget(cfg, batches):
 
 
 def simulate(cfg, batches, directory, binary, *, physical=False, suspension=False, onfi=False,
-             overlap=False, timeout=1200, allow_unwritten=False):
+             overlap=False, timeout=1200, allow_unwritten=False, hbf_write=False,
+             hbfw1=None, hbfw2=None, hbfw3=None, hbfw4=None, write_order=None):
     directory.mkdir(parents=True, exist_ok=True)
     if (directory / "trace.txt").exists():
         raise ValueError(f"Run directory already contains a trace: {directory}")
     binary = binary.resolve()
+    use_w1 = hbf_write if hbfw1 is None else bool(hbfw1)
+    use_w2 = hbf_write if hbfw2 is None else bool(hbfw2)
+    use_w3 = hbf_write if hbfw3 is None else bool(hbfw3)
+    use_w4 = hbf_write if hbfw4 is None else bool(hbfw4)
+    if write_order not in {None, "read_first", "fifo"}:
+        raise ValueError(f"write_order must be None, 'read_first', or 'fifo', got {write_order!r}")
+    allow_overlap = overlap or hbf_write
     if suspension and (cfg.dies != 1 or cfg.planes != 1 or cfg.suspend != "PROGRAM"):
         raise ValueError("T-SUSP probe requires PROGRAM with one die and plane per chip")
     if not (directory / "meta.json").exists():
@@ -96,7 +104,8 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     workload_xml(cfg, directory / "workload.xml")
     if not batches or not all(batch.requests for batch in batches):
         raise ValueError("At least one nonempty batch is required")
-    check_gc_budget(cfg, batches)
+    if not use_w3:
+        check_gc_budget(cfg, batches)
     unwritten = unwritten_reads(cfg, batches)
     if unwritten and cfg.planes > 1 and not allow_unwritten:
         raise ValueError(f"{unwritten} reads of pages that were never written; the OCP spec answers them "
@@ -125,7 +134,12 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
              "T_ONFI": "1" if onfi else None, "T_PLANE": cfg.plane_rule,
              "T_COALESCE_NS": None if cfg.coalesce_ns is None else str(cfg.coalesce_ns),
              "T_READ_PLANE_NS": None if cfg.read_plane_ns is None else str(cfg.read_plane_ns),
-             "T_CACHE": "1" if cfg.cache_read else None}
+             "T_CACHE": "1" if cfg.cache_read else None,
+             "T_HBFW1": "1" if use_w1 else None,
+             "T_HBFW2": "1" if use_w2 else None,
+             "T_HBFW3": "1" if use_w3 else None,
+             "T_HBFW4": "block_counts.csv" if use_w4 else None,
+             "WRITE_ORDER": write_order}
     env = {key: value for key, value in os.environ.items() if not key.startswith("HBF_")}
     env.update({f"HBF_{key}": value for key, value in flags.items() if value is not None})
     command = [str(binary), "-i", "device.xml", "-w", "workload.xml"]
@@ -144,6 +158,7 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     multi = cfg.planes > 1
     read_cmds = stats["Issued_Flash_Read_CMD"] + stats["Issued_Flash_Multiplane_Read_CMD"]
     program_cmds = stats["Issued_Flash_Program_CMD"] + stats["Issued_Flash_Multiplane_Program_CMD"]
+    erase_cmds = stats.get("Issued_Flash_Erase_CMD", 0) + stats.get("Issued_Flash_Multiplane_Erase_CMD", 0)
     if (stats["request_count"] != len(expected)
             or not (multi or stats["Issued_Flash_Read_CMD"] == reads and stats["Issued_Flash_Program_CMD"] == writes)
             or multi and not (stats["Issued_Flash_Read_CMD"] + 2 * stats["Issued_Flash_Multiplane_Read_CMD"]
@@ -153,8 +168,11 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
                               <= writes <= stats["Issued_Flash_Program_CMD"]
                               + cfg.planes * stats["Issued_Flash_Multiplane_Program_CMD"])):
         raise ValueError(f"MQSim statistics do not match trace request/read/write counts: {stats}")
-    stats["read_commands"], stats["program_commands"] = read_cmds, program_cmds
-    if stats["Issued_Flash_Erase_CMD"] or stats["gc_enqueued"]:
+    stats["read_commands"], stats["program_commands"], stats["erase_commands"] = read_cmds, program_cmds, erase_cmds
+    if use_w2:
+        if stats.get("Total_GC_Executions", 0) or stats.get("gc_read_write_enqueued", 0):
+            raise ValueError(f"Garbage collection ran during the experiment: {stats}")
+    elif stats["Issued_Flash_Erase_CMD"] or stats["gc_enqueued"]:
         raise ValueError(f"Garbage collection ran during the experiment: {stats}")
 
     last = [0] * len(batches)
@@ -165,7 +183,7 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
         last[idx] = max(done.complete_ns, last[idx])
     if expected:
         raise ValueError(f"Missing {len(expected)} completions")
-    if not overlap and any(end >= batch.arrival_ns for end, batch in zip(last, batches[1:])):
+    if not allow_overlap and any(end >= batch.arrival_ns for end, batch in zip(last, batches[1:])):
         raise ValueError("Overlapping sub-batches: detected completion at or after the next arrival")
 
     rows, groups, by_step = [], defaultdict(list), defaultdict(list)

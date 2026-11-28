@@ -1,0 +1,38 @@
+diff --git a/src/ssd/GC_and_WL_Unit_Base.cpp b/src/ssd/GC_and_WL_Unit_Base.cpp
+index 6a4e234..2218f9b 100644
+--- a/src/ssd/GC_and_WL_Unit_Base.cpp
++++ b/src/ssd/GC_and_WL_Unit_Base.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "GC_and_WL_Unit_Base.h"
+ 
+ namespace SSD_Components
+@@ -230,6 +231,9 @@ namespace SSD_Components
+ 	
+ 	bool GC_and_WL_Unit_Base::Stop_servicing_writes(const NVM::FlashMemory::Physical_Page_Address& plane_address)
+ 	{
++		if (std::getenv("HBF_T_HBFW3") != nullptr) {
++			return false;
++		}
+ 		PlaneBookKeepingType* pbke = &(_my_instance->block_manager->plane_manager[plane_address.ChannelID][plane_address.ChipID][plane_address.DieID][plane_address.PlaneID]);
+ 		return block_manager->Get_pool_size(plane_address) < max_ongoing_gc_reqs_per_plane;
+ 	}
+diff --git a/src/ssd/GC_and_WL_Unit_Page_Level.cpp b/src/ssd/GC_and_WL_Unit_Page_Level.cpp
+index 6ed658c..b312e43 100644
+--- a/src/ssd/GC_and_WL_Unit_Page_Level.cpp
++++ b/src/ssd/GC_and_WL_Unit_Page_Level.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include <math.h>
+ #include <vector>
+ #include <set>
+@@ -42,6 +43,9 @@ namespace SSD_Components
+ 
+ 	void GC_and_WL_Unit_Page_Level::Check_gc_required(const unsigned int free_block_pool_size, const NVM::FlashMemory::Physical_Page_Address& plane_address)
+ 	{
++		if (std::getenv("HBF_T_HBFW3") != nullptr) {
++			return;
++		}
+ 		if (free_block_pool_size < block_pool_gc_threshold) {
+ 			flash_block_ID_type gc_candidate_block_id = block_manager->Get_coldest_block_id(plane_address);
+ 			PlaneBookKeepingType* pbke = block_manager->Get_plane_bookkeeping_entry(plane_address);

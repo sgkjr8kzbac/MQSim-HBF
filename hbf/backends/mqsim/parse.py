@@ -24,16 +24,35 @@ def completions(path):
             yield Completion(int(arrival), int(enqueue), int(done), int(lba), int(size), op)
 
 
+def block_counts(path):
+    """Read T-HBFW4 per-block counts CSV into {(ch, chip, die, plane, block): (reads, programs, erases)}."""
+    counts = {}
+    with path.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        for row in reader:
+            key = (int(row["channel"]), int(row["chip"]), int(row["die"]), int(row["plane"]), int(row["block"]))
+            counts[key] = (int(row["reads"]), int(row["programs"]), int(row["erases"]))
+    return counts
+
+
 def flash_stats(path):
     tree = ET.parse(path)
     ftl = tree.find(".//SSDDevice.FTL")
     if ftl is None:
         raise ValueError("MQSim output is missing FTL statistics")
     stats = {key: int(val) for key, val in ftl.attrib.items() if key.startswith("Issued_Flash")}
+    for key in ("Total_GC_Executions", "Total_WL_Executions"):
+        if key in ftl.attrib:
+            stats[key] = int(ftl.attrib[key])
     stats["request_count"] = int(tree.findtext(".//Request_Count"))
     stats["gc_enqueued"] = sum(
         int(el.get("No_Of_Transactions_Enqueued"))
         for el in tree.iter() if ".GC_" in el.tag and el.get("No_Of_Transactions_Enqueued") is not None
+    )
+    stats["gc_read_write_enqueued"] = sum(
+        int(el.get("No_Of_Transactions_Enqueued"))
+        for el in tree.iter()
+        if (".GC_Read_" in el.tag or ".GC_Write_" in el.tag) and el.get("No_Of_Transactions_Enqueued") is not None
     )
     return stats
 
