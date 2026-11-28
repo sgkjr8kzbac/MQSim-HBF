@@ -876,6 +876,34 @@ MQSim 与 `interference.py` 的核对结论与差异来源：
 
 结论：核心 `ReadTimeClock`（0–5 ms 计算项）紧密包络 `ext/system` B200 TPOT 时钟结果；`long32k`（404 vs 解析 416 次/天）与 `agentic` $X=10^5$（339 vs 解析 360 次/天，刷新比 22.34 vs 22.99）高度一致；`agentic` $X=10^6$ 时事件模拟因 `packed` 合并刷新与离散释放比解析值略低约 10%（38.5 vs 42.8 次/天，到 1e5 为 7.13 年）。
 
+#### R7：公共请求级轨迹接入（Mooncake）与合成负载对比
+
+R7 在 [hbf/frontend/trace/requests.py](hbf/frontend/trace/requests.py) 中接入统一请求级轨迹接口（`arrival_s,prompt_tokens,output_tokens[,prefix_id]`，兼容可选 `prefix_tokens` 列），并提供 `kvcache-ai/Mooncake` FAST'25 线上对话轨迹（`conversation_trace.jsonl`，Apache-2.0，12,031 条请求，时长 3,537 s，均速率 3.40 req/s；输入均值 12,035 / P90 27,367 / 最大 126,195 token，输出均值 342.6 / P90 597 / 最大 2,000 token）的下载与校验脚本 [scripts/download_mooncake.sh](scripts/download_mooncake.sh)（数据集本体不入仓）及格式说明 [docs/traces.md](docs/traces.md)。所有既有合成负载预设（`chat`、`long32k`、`agentic`、`reasoning`）与合成选页模式均完整保留，并可与真实请求流自由组合。复现脚本 [scripts/r7_mooncake_eval.py](scripts/r7_mooncake_eval.py)，完整汇总见 [evidence/r7-mooncake-eval.csv](evidence/r7-mooncake-eval.csv)。
+
+1. **前缀共享特征**：`hash_ids` 按 512 token 分块，全部 12,031 条请求共享块 0（512 token 通用系统提示），57.49%（6,917 条）跨 2,259 个对话根共享 $\ge 2$ 块（$\ge 1,024$ token），相邻轮次间隔中位数 123 s（78.6% $\le 300$ s）。默认 `conversation` 平台分组抽出 2,260 个前缀组，请求命中率 81.22%，覆盖全部输入 token 的 32.05%（因果块级上限 37.36%）。
+2. **缩小窗口三后端端到端核对**：取 9 条 Mooncake 多轮请求按 `build_timeline` 展开为 120 步地址轨迹（16 bank、`ppb=8`、$X=256$），同一份 `AddressTrace` 分别送入 MQSim（`T-HBFW1`–`T-HBFW4`）、轮数模型和 HBFSim（R9）：
+   - **操作与擦除计数三方逐项一致**：读 **81,128 页**、编程 **2,888 页**、自动擦除 **48 次**、读干扰刷新 **14 次**（MQSim 与 Python 逐块 `(R, W, E)` 100% 相同，`Total_GC_Executions = 0`；HBFSim 实测 `reads = 81,128`、`programs = 2,888`、`erases = 48`）。
+   - **时延对比**：轮数只读估算 62.28 ms，HBFSim（分批同步提交）57.95 ms（墙钟 0.28 s，其中 2,088 页命中 bank 读缓冲），MQSim（带写干扰与子批重叠）91.87 ms（墙钟 0.16 s）。
+3. **全尺寸 24 小时寿命外推与合成负载对比**（512 GiB OCP stack、1,024 bank、`ppb=256`、Llama-3.1-8B BF16、`packed`、`m5=gaps`、B200 TPOT 时钟，零停顿）：
+
+| 场景 | Stack | 选页模式（读占比） | X | 均值并发 B | TPOT (ms) | req/s | KV 写 (GB/s) | 刷新÷KV | P/E 每天 | 到 P/E 1e5 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Mooncake（前缀保留 300 s） | 4 | dense (1.00) | 1e5 / 1e6 | 3.7 / 3.0 | 8.08 / 7.35 | 0.83 | 1.04 | 0.73 / 0.00 | 282.6 / 163.7 | 354 / 611 天 |
+| Mooncake（前缀保留 60 s） | 4 | dense (1.00) | 1e5 / 1e6 | 3.7 / 3.0 | 8.06 / 7.33 | 0.83 | 1.26 | 0.55 / 0.00 | 307.7 / 198.9 | 325 / 503 天 |
+| Mooncake（无前缀共享） | 4 | dense (1.00) | 1e5 / 1e6 | 3.6 / 3.0 | 7.75 / 7.11 | 0.85 | 1.41 | 0.43 / 0.00 | 316.1 / 221.4 | 316 / 452 天 |
+| Mooncake + `uniform_tokens` 10% | 4 | sparse (0.101) | 1e5 | 1.0 | 3.30 | 0.83 | 1.04 | 0.00 | 163.7 | 611 天 |
+| Mooncake + `sink_recent` 10% | 4 | sparse (0.102) | 1e5 | 0.9 | 3.06 | 0.83 | 1.04 | 0.00 | 163.7 | 611 天 |
+| Mooncake + `uniform_tokens` 10% | 1 | sparse (0.101) | 1e5 | 6.0 | 4.43 | 3.40 | 4.51 | 0.00 | 710.6 | 141 天 |
+| Mooncake（1 stack 稠密饱和对照） | 1 | dense (1.00) | 1e5 | 256.0 | 461.36 | 1.49 | 2.13 | 0.49 | 576.6 | 173 天 |
+| 合成 `chat`（闭环并发 8） | 1 | dense (1.00) | 1e5 / 1e6 | 8.0 | 4.25 | 10.55 | 2.17 | 0.01 / 0.00 | 348.1 / 345.0 | 287 / 290 天 |
+| 合成 `long32k`（闭环并发 8） | 1 | dense (1.00) | 1e5 / 1e6 | 8.0 | 38.85 | 0.59 | 2.57 | 0.00 / 0.00 | 403.9 / 403.9 | 248 / 248 天 |
+| 合成 `agentic`（闭环并发 8） | 1 | dense (1.00) | 1e5 / 1e6 | 6.2 / 5.6 | 66.07 / 54.14 | 0.38 / 0.48 | 0.08 / 0.10 | 22.36 / 1.44 | 288.4 / 38.4 | 347 / 2,604 天 |
+
+主要发现：
+- **前缀缓存对寿命的净收益**：300 s 空闲保留把 Mooncake 的 KV 写入从 1.41 降至 1.04 GB/s（−26.2%），$X=10^6$ 时寿命延长 **+35.3%**（452 → 611 天）；$X=10^5$ 时多轮前缀复用使刷新比从 0.43 升至 0.73，但净日均 P/E 仍下降 **10.6%**（316.1 → 282.6）。
+- **真实长尾与固定长度合成的差异**：Mooncake 输出均值（342.6）与 `long32k`（338）几乎一致，但输出长尾（P90 = 597、最大 2,000）使其在 $X=10^5$ 时即便无前缀缓存也触发 `ref/KV = 0.43`（300 s 缓存时 0.73），而固定长度 `long32k` 的 `ref/KV = 0.00`。
+- **真实请求流与合成稀疏选页组合**：叠加 10% `uniform_tokens` 或 `sink_recent` 后，$X=10^5$ 下的读干扰刷新清零（4 stack 日均 P/E 降 42.1%，282.6 → 163.7），且单 stack 即可不饱和承载全部 3.40 req/s 线上流量（并发 5–6、TPOT 3.8–4.4 ms），而稠密 BF16 单 stack 在 1.49 req/s 即饱和（TPOT 461 ms）。
+
 ### 第 4 项：压缩后的寿命收益
 
 8B，单 stack，并发 8，每块 256 页（[evidence/phase2b/endurance-formats.csv](evidence/phase2b/endurance-formats.csv)）：
@@ -940,6 +968,74 @@ KIVI 的字节数只算 HBF 上的部分，残差窗口在 HBM。汇总表 `kv_b
 - 只有单个 stack，理想磨损均衡，没有前缀缓存。prefill 计算不经过 HBF，只计它的写入。
 - 放置实验在 T-B7 之前运行，`dedicated` 和 `packed` 的 κ 需要重跑确认；写顺序合法性不受影响。
 - 寿命模型中 `Device(banks=1024)` 与 `blocking_units(dies=64)` 写死了 16 主机通道（`ocp`），因此 `ocp-8ch`（8 主机通道、512 bank）暂时不能用于寿命模型。
+
+## R9：HBFSim 作为第二独立后端的评估
+
+R9 将 [HBFSim](https://github.com/FlashLabAE/HBFSim)（MIT 许可，锁定提交 `8ab183cc511770649c084eb58b048aabfc60afbc`，见 [hbf/hbfsim.commit](hbf/hbfsim.commit)）作为第二个独立后端接入地址轨迹接口（[hbf/backends/hbfsim/](hbf/backends/hbfsim/)），用于与 MQSim 和轮数模型交叉核对，**不替换 MQSim 本体，也不改动 MQSim 的任何结果**。构建脚本见 [scripts/hbfsim_build.sh](scripts/hbfsim_build.sh)，OCP 配置文件见 [hbf/configs/hbfsim-ocp.cfg](hbf/configs/hbfsim-ocp.cfg)，对比脚本见 [scripts/r9_hbfsim_compare.py](scripts/r9_hbfsim_compare.py)。
+
+### 构建、几何映射与小例子验收
+
+- **几何约束说明**：HBFSim 在 `src/physical/hbf/hbf_device.cpp` 中严格校验 OCP 表 2/4 的单 stack core die 上限 `channels_per_stack * dies_per_channel <= maximum_dies`（档位 2/3 为 16、档位 1 为 8）。因此 64 die / 1,024 bank / 512 GiB 的 `ocp` 参数在 [hbf/configs/hbfsim-ocp.cfg](hbf/configs/hbfsim-ocp.cfg) 中写作 `hbf-stacks=4, hbf-channels=4, hbf-dies-per-channel=4, hbf-planes-per-die=16`，保持 `stack * 4 + ch == host_channel`（字节地址与 `device/address.py` §4.6 映射逐位一致）、总 plane 数 1,024、总容量 512 GiB 与档位 2 主机带宽 1,536 GB/s 完全对齐。
+- **小例子验收（[tests/test_hbfsim.py](tests/test_hbfsim.py)）**：
+  1. 预装入静态初始镜像的页读成功，读未写页返回 OCP 表 12 错误码 **`0x7`**；
+  2. 乱序写返回状态 **`0x6`**（附加状态 `0x1`）；顺序写满 1 块后经 `ZONE_INVALIDATE` + `ZONE_RESET` 重写第 0 页，擦除计数精确 +1 并计入 `tBERS + tPROG`；
+  3. 128 个随机 LPA 经 HBFSim HBF-physical 地址热图（`hbfsim.address_heatmap.v1`）与页内读/未写边界核对，与 `hbf/device/address.py` **100% 逐页一致**。
+
+### 第 2 阶段 A 15 点三方计时对比（[evidence/r9-phase2a-3way.csv](evidence/r9-phase2a-3way.csv)）
+
+同一份前端地址轨迹分别交给 MQSim（`ocp`）、轮数模型与 HBFSim（`matched` 将每通道有效载荷带宽匹配为 `cfg.aggregate_gb_s`；`native` 保持 HBFSim 档位默认内部通道带宽 101.25 GB/s）：
+
+| 测点 | 读页数 | 轮数 | 轮数下界 (ns) | 轮数估算 (ns) | MQSim (ns) | HBFSim 匹配带宽 (ns) | HBFSim 原生带宽 (ns) | HBFSim / MQSim |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `dense-128k-1024` | 262,144 | 256 | 1,048,576 | 1,259,072 | 1,320,544 | 1,197,986 | 1,154,285 | 0.907 |
+| `dense-128k-384` | 262,144 | 256 | 2,785,280 | 2,991,296 | 3,057,248 | 2,946,881 | 1,547,354 | 0.964 |
+| `dense-128k-3072` | 262,144 | 256 | 1,048,576 | 1,171,008 | 1,172,000 | 1,109,891 | 1,153,592 | 0.947 |
+| `dense-32k-b8` | 262,144 | 256 | 1,048,576 | 1,259,072 | 1,320,544 | 1,197,986 | 1,154,285 | 0.907 |
+| `tokens1-128k-striped` | 2,624 | 11 | 45,056 | 49,238 | 49,448 | 46,742 | 46,592 | 0.945 |
+| `tokens5-128k-striped` | 13,120 | 31 | 126,976 | 137,102 | 138,818 | 128,898 | 128,834 | 0.929 |
+| `tokens5-128k-layer` | 13,120 | 40 | 163,840 | 176,500 | 177,393 | 165,674 | 165,631 | 0.934 |
+| `kivi2-dense-32k` | 12,256 | 12 | 49,152 | 61,068 | 63,798 | 58,362 | 55,674 | 0.915 |
+| `kivi2-tokens1-16` | 4,976 | 17 | 69,632 | 75,162 | 75,560 | 70,952 | 70,909 | 0.939 |
+| `kivi2-tokens1-128` | 702 | 6 | 24,576 | 26,824 | 27,464 | 25,984 | 25,941 | 0.946 |
+| `int4-dense-32k` | 17,408 | 18 | 73,728 | 91,604 | 95,508 | 88,308 | 84,211 | 0.925 |
+| `quest-tokens5-32k` | 7,392 | 22 | 90,112 | 97,192 | 98,144 | 91,514 | 91,471 | 0.932 |
+| `tr2048-dense-8k` | 16,384 | 16 | 65,536 | 74,316 | 78,438 | 70,778 | 48,932 | 0.902 |
+| `tr8192-tokens5-32k` | 3,296 | 18 | 147,456 | 153,296 | 153,680 | 148,858 | 148,815 | 0.969 |
+| `staggered-sink` | 3,328 | 4 | 16,384 | 23,260 | 23,810 | 22,740 | 21,039 | 0.955 |
+
+全部 15 点在匹配核心通道带宽后，`HBFSim / MQSim` 落在 **0.902–0.969**（中位数 **0.934**），单点墙钟 0.2–1.1 s。**稠密 128K（1 GiB、256 轮）1.03 ms vs 1.32 ms 差异的逐项拆解**：
+1. **`tR` 默认值差（+24.6 µs）**：HBFSim 默认 `tR = 4,000 ns`（256 轮下界 1.024 ms，云端实测 1.03 ms）；对齐到 `parameters.json` 的 `tR = 4,096 ns` 后下界为 1.049 ms（HBFSim 不拆分子批直接跑为 **1.058 ms**，仅高出下界 +0.9%，因为 HBFSim 的命令/TSV/通道/ECC/SRAM/HBIO 均走独立流水时间轴，除首尾排空外完全掩盖在 4,096 ns 感测循环下）。
+2. **子批栅栏排空（+99–140 µs）**：地址轨迹按 `batch_pages = 8,192` 拆为 32 个子批，每子批末尾需排空末轮的通道传输 + 500 ns ECC + HBIO 尾延迟，使 HBFSim 从 1.058 ms 增至 **1.198 ms**（原生带宽 1.154 ms）。
+3. **MQSim 半双工 ONFI 逐轮命令/读忙与核心通道争用（+122.6 µs，1.198 → 1.321 ms）**：MQSim 即使开启 `cache_read` 与 `read_plane_ns=0`，每轮仍串行付出 `cmd_ns (290 ns) + rb_ns (20 ns) = 310 ns`（256 轮合 +79.4 µs），且 32 GB/s 半双工 ONFI 通道上的数据传出（4,096 ns/轮）与下轮读命令争用总线（+43 µs）。`dense-128k-3072` 将核心带宽提高 3 倍后，MQSim 立刻下降 148.5 µs 至 1.172 ms，验证了该机制；`dense-128k-384`（通道受限）下两后端收窄到 3.6%（2.947 vs 3.057 ms）。
+
+### R5.3 9 点写入干扰对比与按 die 阻塞补丁（[evidence/r9-write-interference-3way.csv](evidence/r9-write-interference-3way.csv)）
+
+[hbf/patches/hbfsim/0001-die-blocking.patch](hbf/patches/hbfsim/0001-die-blocking.patch) 在 HBFSim 中加入可选配置键 `hbf-die-blocking=false|true`（默认 `false` 保持上游按 plane 阻塞；开启后在 `DieState` 上维护编程/擦除与读时间窗，使编程/擦除阻塞同 die 全部 plane 而不串行化同 die 多 plane 并发编程）：
+
+| 测点 | MQSim `fifo` (µs) | MQSim `read_first` (µs) | HBFSim 按 plane (µs) | HBFSim 按 die (µs) | 解析 `fifo` (µs) | 解析 `gaps` (µs) |
+|---|---:|---:|---:|---:|---:|---:|
+| `P1_prog_fits_gap` | 0.0 | 0.0 | 0.0 | 0.0 | 100.0 | 0.0 |
+| `P2_prog_overflows_gap` | 86.5 | 86.5 | 60.6 | 61.9 | 100.0 | 60.0 |
+| `P3_prog_burst_tight` | 230.4 | 102.6 | 190.6 | 191.9 | 200.0 | 180.0 |
+| `P4_prog_350us_spread` | 553.0 | 553.0 | 501.3 | 503.8 | 700.0 | 500.0 |
+| `P5_erase_fits_gap` | 0.0 | 0.0 | 0.0 | 0.0 | 1,100.0 | 0.0 |
+| `P6_erase_overflows_gap` | 737.2 | 629.0 | 700.6 | 701.2 | 1,100.0 | 600.0 |
+| `P7_partial_1die_wave` | 102.6 | 102.6 | 86.5 | 87.8 | 25.0 | 22.5 |
+| `P8_full_ocp_64die` | 153.0 | 153.0 | 101.2 | 102.5 | 200.0 | 100.0 |
+| `P9_p2_coalesce_1ns` | 172.2 | 77.8 | 60.6 | 61.9 | 100.0 | 60.0 |
+
+- **机制对照**：HBFSim 无 MQSim 的 ONFI 串行写数据 DMA 固定偏移（+26.5 µs/波），在 P1/P2/P4/P5/P8/P9 上与 `interference.py` (`gaps`) 误差 $\le 1.3\%$，且 P9 与 P2 完全一致（印证 MQSim P9 的 172.2 µs 来自 `coalesce_ns=1 ns` 命令拆分）；在 P3/P6 上 HBFSim 按到达顺序执行（FIFO），不把后到达的读抢占到已排队写之前。
+- **按 plane vs 按 die 阻塞**：P1–P9 的写波覆盖目标 die 的全部 16 个 plane，因此 `hbf-die-blocking=true` 仅增加 0.6–2.6 µs 的 die 内错开；另加**单 plane 写（die 0 plane 0）+ 同 die 其余 15 个 plane 稀疏读**（`gap = 40 µs`、`tPROG = 100 µs`）诊断：关闭补丁时额外延迟为 **0.0 ns**，开启 `hbf-die-blocking=true` 后立即对齐为 **`+60.6 µs`**（`tPROG - gap`）。
+
+### 两后端差异清单（决策参考）
+
+| 维度 | MQSim（`ocp` + 补丁） | HBFSim（`8ab183c` + die-blocking 补丁） |
+|---|---|---|
+| 速度与内存 | 1 GiB 约 5–15 s、内存 ~4 GB（7.6 GiB 宿主机仅能单进程） | 1 GiB 约 1.0 s、内存 ~0.4 GB（低 10 倍） |
+| 拓扑/堆叠 | 任意 `(ch, chip, die, plane)`，单 stack 建模 1,024 bank | 严格按 OCP 表 2/4 校验每 stack ≤ 16 die；原生支持多 stack + HBM4 + D2D 链路 + §9.2 热模型 |
+| 读流水线 | 半双工 ONFI（290 ns cmd + 20 ns RB + 总线争用）；T-PLANE + T-CACHE | 各级独立流水时间轴（含 500 ns ECC、64 B 突发、每 bank 2 页缓存）；15 点为 MQSim 的 0.90–0.97× |
+| 写入与阻塞 | `T-HBFW1`–`T-HBFW4`，支持 `fifo` / `read_first`，天然按 die 阻塞 | 原生 `raw-physical`（`0x6`/`0x7`/页 0 擦除/无 GC），仅 FIFO；默认按 plane 阻塞，可用 `hbf-die-blocking=true` 切至按 die |
+| 读干扰/刷新/协议 | `T-HBFW4` 导出每块 `(R, W, E)` 计数；MOCS 与发射序在轮数模型 | 无每块读计数、无读干扰/刷新、无每通道 MOCS/发射序 |
 
 ## 规范一致性审查（OCP HBF v0.7.0）
 
