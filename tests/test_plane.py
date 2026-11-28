@@ -332,12 +332,12 @@ def test_default_cli_runs_compliant_ocp_with_auto_prefill(binary, tmp_path):
     import json
     from hbf.cli import main
     out_a = tmp_path / "default-analysis"
-    main(["--analysis-only", "--layers", "1", "--heads", "2", "--context", "256", "--output", str(out_a)])
+    main(["run", "--analysis-only", "--layers", "1", "--heads", "2", "--context", "256", "--output", str(out_a)])
     assert (out_a / "analysis_layers.csv").is_file()
     report_a = (out_a / "report.md").read_text()
     assert "拓扑 `ocp`" in report_a and "T-CACHE 开" in report_a and "## 读时间估计" in report_a
     out_m = tmp_path / "default-mqsim"
-    main(["--layers", "1", "--heads", "2", "--context", "256", "--blocks-per-plane", "32", "--output", str(out_m)])
+    main(["run", "--layers", "1", "--heads", "2", "--context", "256", "--blocks-per-plane", "32", "--output", str(out_m)])
     meta = json.loads((out_m / "meta.json").read_text())
     stats = json.loads((out_m / "statistics.json").read_text())
     assert meta["prefill"] and stats["unwritten_reads"] == 0 and stats["Issued_Flash_Multiplane_Program_CMD"] > 0

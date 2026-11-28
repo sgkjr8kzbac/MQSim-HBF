@@ -1,7 +1,19 @@
 {
-  "base": {"topology": "ocp", "read_plane_ns": 0, "coalesce_ns": 1, "cache_read": true,
-           "layout": "striped_contiguous", "mode": "dense", "gpu": "b200"},
-  "vary": {"model": ["llama-3.1-8b", "llama-3.1-70b"], "context": [8192, 32768, 131072], "batch": [1, 4, 16, 32]},
-  "zip": [{"read_ns": 8192, "aggregate_gb_s": 1024}, {"read_ns": 4096, "aggregate_gb_s": 1024},
-          {"read_ns": 4096, "aggregate_gb_s": 3072}, {"read_ns": 2048, "aggregate_gb_s": 3072}]
+  "base": {
+    "device.topology": "ocp",
+    "kv.layout": "striped_contiguous",
+    "trace.mode": "dense",
+    "ext.system.gpu": "b200"
+  },
+  "vary": {
+    "kv.model": ["llama-3.1-8b", "llama-3.1-70b"],
+    "kv.context": [8192, 32768, 131072],
+    "placement.batch": [1, 4, 16, 32]
+  },
+  "zip": [
+    {"device.read_ns": 8192, "device.aggregate_gb_s": 1024},
+    {"device.read_ns": 4096, "device.aggregate_gb_s": 1024},
+    {"device.read_ns": 4096, "device.aggregate_gb_s": 3072},
+    {"device.read_ns": 2048, "device.aggregate_gb_s": 3072}
+  ]
 }

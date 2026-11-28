@@ -92,22 +92,18 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 
 | 模块 | 作用 |
 |---|---|
-| [`hbf/access.py`](hbf/access.py) | 访问记录格式与校验、张量规格 `TensorSpec`、三种布局、9 种生成模式（含 StreamingLLM 式 `sink_recent`、Quest 式按 token 块选择的 `uniform_tokens`）、整体 prefill |
-| [`hbf/controller.py`](hbf/controller.py) | token 区间到页的转换、批内去重、有用字节按区间并集计算、64 B 突发传输字节、子批划分、两个估算器和负载指标 |
-| [`hbf/analysis.py`](hbf/analysis.py) | 机制分析：不跑 MQSim，按层计算读轮数、最少轮数、plane 利用率、均衡损失和感测放大，支持独立 plane 与同偏移联动两种组织；纯 Python 参考实现与 numpy 引擎结果逐行相同 |
-| [`hbf/pages.py`](hbf/pages.py) | numpy 引擎的页集合：把访问记录直接变成每层去重后的页数组（有用字节、64 B 突发、连续段数）及其位置，HBM 层字节、被注意 token 数、反量化运算量 |
-| [`hbf/timing.py`](hbf/timing.py) | 读时间估计（`--timing`）：理想下界，以及按核心通道逐轮累加、与 MQSim 校准过的估算；每块读次数 |
-| [`hbf/formats.py`](hbf/formats.py) | 命名的 KV 存储格式（`--format`）：bf16、fp8、int4/int2、kivi4/kivi2（可选 `fused=1` 量化参数同页）、think、quest、mla/mla_fp8（可选 DSA 索引器） |
-| [`hbf/kvspec.py`](hbf/kvspec.py) | 按层、按头的 KV 分组（`--kv-spec`）：hybrid（局部/全局层）、ssm、cla（跨层共享）、yoco、duo（检索头/流式头）、pyramid（逐层预算） |
-| [`hbf/model.py`](hbf/model.py)、[`hbf/system.py`](hbf/system.py) | 模型与 GPU 预设；系统级评估：线性层与注意力计算、HBF 读与计算的重叠、TPOT、KV 全放 HBM 的基线、HBM 容量 |
-| [`hbf/simulator.py`](hbf/simulator.py) | 校验源码散列、打补丁、编译 MQSim；GC 预算检查；写轨迹；运行并对回逐请求完成日志；聚合结果 |
-| [`hbf/config.py`](hbf/config.py) | 参数文件、三套 chip 当 plane 拓扑与 `ocp` 规范示例拓扑、设备与 workload XML 的生成和互相校验、CWDP 与 OCP 地址映射、主机通道、逻辑容量上界 |
-| [`hbf/cli.py`](hbf/cli.py) | 一键入口：生成或导入 → 轨迹 → MQSim → 解析 → 简报 |
-| [`hbf/mqsim/`](hbf/mqsim) | MQSim 上游原版源码，逐文件 SHA-256 校验，不直接修改 |
-| [`hbf/patches/`](hbf/patches) | I1–I4 仪表与修复补丁，T-SUSP、T-ONFI 时序对照补丁，T-PLANE 多 plane 补丁，T-CMD HBF 命令模型，T-CACHE cache read；`series` 规定应用顺序 |
-| [`hbf/configs/`](hbf/configs) | 参数 JSON、设备模板、三种拓扑的设备和 workload XML、模型与 GPU 预设（每项注明来源） |
-| [`tests/`](tests) | T0–T10 验证测试、机制分析与 T-PLANE 测试、上游行为探针、规模测试 |
-| [`evidence/`](evidence) | 随仓库保存的实测摘要和测试日志 |
+| [`hbf/device/`](hbf/device) | `config.py`（参数、拓扑、XML 校验、统一资源路径）、`address.py`（CWDP 与 OCP 静态地址映射唯一实现） |
+| [`hbf/frontend/trace/`](hbf/frontend/trace) | `tokens.py`（token 级 `access.csv` 格式与校验）、`synthetic.py`（合成访问生成器）、`requests.py`（请求流与负载预设） |
+| [`hbf/frontend/kv/`](hbf/frontend/kv) | `tensors.py`（`TensorSpec` 与模型形状）、`formats.py`（KV 压缩存储格式）、`layouts.py`（4 种静态布局）、`placement.py`（多请求放置与写序检查） |
+| [`hbf/frontend/addrtrace.py`](hbf/frontend/addrtrace.py) | 前后端唯一接口：`addr.npz`、`layers.npz`、`addr.json` 的流式读写与规范合法性校验（§5.4.1 / §5.4.3） |
+| [`hbf/backends/rounds/`](hbf/backends/rounds) | 轮数与解析后端：`pages.py`（numpy 页集合）、`analysis.py`（机制分析与协议约束）、`timing.py`（读时间估计与时间分解） |
+| [`hbf/backends/mqsim/`](hbf/backends/mqsim) | MQSim 后端：`build.py`（源码散列校验、打补丁与编译）、`schedule.py`（地址轨迹转子批与未写页检查）、`run.py`（运行、对回完成日志、聚合指标） |
+| [`hbf/lifetime/`](hbf/lifetime) | 寿命模型：`geometry.py`、`clock.py`（核心 `StepClock`/`ReadTimeClock` 与轮数校准）、`analytic.py`、`sim/`（事件模拟）、`interference.py`、`report.py`、`cli.py` |
+| [`hbf/run.py`](hbf/run.py)、[`hbf/cli.py`](hbf/cli.py)、[`hbf/sweep.py`](hbf/sweep.py) | TOML/JSON 配置与 `--set` 覆盖、统一子命令入口 `python3 -m hbf`（`run`/`sweep`/`lifetime`/`check`/`system`/`interference`）、笛卡儿积参数扫描 |
+| [`hbf/models.py`](hbf/models.py)、[`hbf/system.py`](hbf/system.py)、[`hbf/kvspec.py`](hbf/kvspec.py) | 模型与 GPU 预设、系统级 TPOT 评估、层/头 KV 分组（R4 规划迁入扩展） |
+| [`hbf/mqsim/`](hbf/mqsim)、[`hbf/patches/`](hbf/patches) | MQSim 上游原版源码（SHA-256 校验）与 I1–I4、T-SUSP、T-ONFI、T-PLANE、T-CMD、T-CACHE、T-PERF 补丁 |
+| [`hbf/configs/`](hbf/configs) | 参数 JSON（含产品假设与出处注释）、XML 模板、模型/GPU/负载预设 |
+| [`tests/`](tests)、[`evidence/`](evidence) | 验证测试、模块导入与快速开始测试、实测摘要和配置网格 |
 
 ---
 
@@ -187,65 +183,47 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 
 ## 快速开始
 
-环境：Linux，Python 3.10+、numpy、g++、make、git、GNU time（`/usr/bin/time`）。核心包只依赖 numpy，测试另需 pytest。仓库自带固定版本的 MQSim 源码，构建不需要联网；首次运行会在当前目录的 `.build/` 下校验源码、打补丁并编译，约 10–30 秒。
+环境：Linux，Python 3.11+、numpy、g++、make、git、GNU time（`/usr/bin/time`）。核心包只依赖 numpy，测试另需 pytest。仓库自带固定版本的 MQSim 源码，构建不需要联网；首次运行会在当前目录的 `.build/` 下校验源码、打补丁并编译，约 10–30 秒。
+
+统一命令行入口为 `python3 -m hbf <子命令>`（`run`、`check`、`sweep`、`lifetime`、`system`、`interference`），旧入口到新子命令的对照表见 [docs/cli-migration.md](docs/cli-migration.md)。默认拓扑为合规的 `ocp`（已开启 HBF 命令模型，单请求 MQSim 运行自动 prefill）。
+
+最小 MQSim 运行（默认 `ocp` 拓扑、自动 prefill，同时产出 `addr.npz` 地址轨迹和 `config.json`）：
 
 ```bash
-python3 -m hbf.cli --topology 64x16 --mode uniform_pages --seed 234 --fraction 0.1
+python3 -m hbf run --layers 1 --heads 2 --context 512 --blocks-per-plane 32
 ```
+
+轮数后端 + MQSim 同轨迹核对（`check` 子命令，输出 `check.json` 对比估算与实测时延）：
 
 ```bash
-python3 -m hbf.cli --topology 256x4 --mode dense --layers 32 --heads 8 --context 32768
+python3 -m hbf check --layers 1 --heads 2 --context 512 --blocks-per-plane 32 --mode uniform_pages --fraction 0.25
 ```
 
-用 KIVI 式的存储格式（2 bit K 加 16 bit 量化参数）：
+只跑轮数与机制分析后端（不编译、不运行 MQSim），同时比较独立 plane 和 16-plane 联动组：
 
 ```bash
-python3 -m hbf.cli --topology 64x16 --mode dense --tensors '[{"name":"K","bits":2,"dims":128},{"name":"K_scale","bits":16,"dims":2},{"name":"V","bits":16,"dims":128}]'
+python3 -m hbf run --analysis-only --layers 4 --context 8192 --mode uniform_pages --fraction 0.05 --plane-group 1 --plane-group 16
 ```
 
-只做机制分析（不编译、不运行 MQSim），同时比较独立 plane 和 32 个 plane 的同偏移联动。分析默认按规范的静态位置计算，假定数据已写入，所以不需要 `--prefill`；跑 MQSim 的多 plane 配置则必须加 `--prefill`：
+使用 `--set section.key=value` 覆盖配置项（支持 TOML/JSON 配置文件，如 `python3 -m hbf run CONFIG.toml --set kv.format=kivi2`）：
 
 ```bash
-python3 -m hbf.cli --analysis-only --topology 16x64 --layers 32 --context 32768 --mode uniform_pages --fraction 0.05 --plane-group 1 --plane-group 32
+python3 -m hbf run --set backend.name=rounds --set kv.model=llama-3.1-8b --set kv.layout=striped_contiguous --set kv.context=8192 --set kv.format=kivi2 --set placement.batch=8 --set ext.system.gpu=b200
 ```
 
-按固定 token 块选择（每个 KV 头选 5% 的 16-token 块，K、V 读同一批 token），这里是 2 bit 的 K、V；去掉 `--tensors` 即为 BF16，可对比两者。`uniform_pages` 按存储页抽样，选择单位会随压缩变大，`uniform_tokens` 不会：
+加上协议约束（UCIe 档位 2、每主机通道 MOCS = 256、`fcfs` 主机顺序）：
 
 ```bash
-python3 -m hbf.cli --analysis-only --topology ocp --layers 32 --context 32768 --mode uniform_tokens --select-tokens 16 --fraction 0.05 --tensors '[{"name":"K","bits":2,"dims":128},{"name":"V","bits":2,"dims":128}]'
+python3 -m hbf run --analysis-only --layers 4 --context 8192 --mode sink_recent --layout striped_contiguous --mocs 256 --host-order fcfs --ucie-grade 2
 ```
 
-加上协议约束（每主机通道 256 条命令、不支持读突发、一页命令一起排队），看命令额度对轮数的影响；把 `--host-order` 换成 `trigger` 可以比较另一种主机发送策略：
+运行寿命解析模型（`lifetime` 子命令，支持配置文件与 `--set`）：
 
 ```bash
-python3 -m hbf.cli --analysis-only --topology ocp --layers 32 --context 32768 --mode sink_recent --layout striped_contiguous --mocs 256 --host-order fcfs
+python3 -m hbf lifetime --analytic --no-calibrate --model llama-3.1-8b --format bf16,kivi2 --workload long32k --rd-threshold 1e6
 ```
 
-真实层级（16 die × 64 plane），先整体写入再读，plane 独立寻址，使用 HBF 命令模型（每多一个 plane 10 ns，合并窗口 1 ns）、cache read：
-
-```bash
-python3 -m hbf.cli --topology 16x1 --planes 64 --plane-rule independent --read-plane-ns 10 --coalesce-ns 1 --cache-read --prefill --mode uniform_pages --fraction 0.05 --context 8192
-```
-
-读时间估计（`--timing`）：给出每层、每步的理想下界和与 MQSim 校准过的估算，并把时间拆成均衡部分、不均衡、协议、核心通道和开销。估算只在 HBF 命令模型下校准过，所以多 plane 拓扑请带上这三个参数：
-
-```bash
-python3 -m hbf.cli --analysis-only --timing --topology ocp --read-plane-ns 0 --coalesce-ns 1 --cache-read --layout striped_contiguous --layers 32 --context 131072
-```
-
-系统级评估：按模型和 GPU 预设计算 decode 的 TPOT，并与 KV 全放 HBM 的方案对比。`--batch` 把一个 stack 上的 ceil(B / stacks) 个请求按层优先排成额外的 KV 头（批的近似），`--format` 选择 KV 存储格式：
-
-```bash
-python3 -m hbf.cli --analysis-only --topology ocp --read-plane-ns 0 --coalesce-ns 1 --cache-read --layout striped_contiguous --model llama-3.1-8b --gpu b200 --context 32768 --batch 8 --format kivi2 --overlap serial
-```
-
-导入已有的访问记录：
-
-```bash
-python3 -m hbf.cli --access-csv my_access.csv --layers 32 --heads 8 --head-dim 128 --context 32768
-```
-
-命令最后会打印运行目录；省略 `--output` 时，目录建在 `runs/` 下。也可以先 `python3 -m pip install .`，然后用 `hbf-stage0` 代替 `python3 -m hbf.cli`。全部参数见 `--help`。
+命令最后会打印运行目录；省略 `--output` 时，目录建在 `runs/` 下，每次运行均写出解析后的 `config.json` 与 `meta.json`。也可以先 `python3 -m pip install .`，然后用 `hbf` 代替 `python3 -m hbf`。全部参数见 `python3 -m hbf <子命令> --help`。
 
 运行测试：
 
@@ -368,20 +346,23 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 .
 ├── README.md            项目介绍（本文件）
 ├── REPORT.md            验证与实验报告：第 0 阶段验证、第 1 阶段改进、规范一致性、协议与选择粒度实验
-├── hbf/                 中间件 Python 包
-│   ├── access.py        访问记录、张量规格、布局、生成器
-│   ├── controller.py    分批、去重、估算器、指标
-│   ├── analysis.py      机制分析：读轮数与 plane 利用率
-│   ├── simulator.py     构建、GC 预算、运行、结果对回与聚合
-│   ├── config.py        参数、XML 生成与校验、地址映射
-│   ├── cli.py           命令行入口
-│   ├── configs/         参数 JSON、设备模板、三种拓扑的 XML
-│   ├── patches/         I1–I4、T-SUSP、T-ONFI、T-PLANE、T-CMD、T-CACHE；series 规定应用顺序
-│   ├── mqsim/           MQSim 上游源码（固定 commit）
+├── docs/                设计文档、参数来源、本地运行清单与 CLI 迁移表（cli-migration.md）
+├── hbf/                 中间件 Python 包（python3 -m hbf）
+│   ├── __main__.py      统一入口 python3 -m hbf
+│   ├── cli.py           子命令分发（run / check / sweep / lifetime / system / interference）
+│   ├── run.py           TOML/JSON 配置加载、--set 覆盖、config.json 生成与 check 核对
+│   ├── sweep.py         配置键笛卡儿积参数扫描
+│   ├── device/          参数、拓扑、XML 校验（config.py）与静态地址映射唯一实现（address.py）
+│   ├── frontend/        trace/（tokens/synthetic/requests）、kv/（tensors/formats/layouts/placement）、addrtrace.py
+│   ├── backends/        rounds/（pages/analysis/timing）与 mqsim/（build/schedule/run）
+│   ├── lifetime/        寿命模型（geometry/clock/analytic/report/cli/interference/sim/）
+│   ├── configs/         参数 JSON（含假设标注）、XML 模板、模型/GPU/负载预设
+│   ├── patches/         I1–I4、T-SUSP、T-ONFI、T-PLANE、T-CMD、T-CACHE、T-PERF；series 规定应用顺序
+│   ├── mqsim/           MQSim 上游源码（固定 commit，SHA-256 校验）
 │   ├── mqsim.commit     固定的上游 commit
 │   └── mqsim.sha256     逐文件校验清单
-├── tests/               pytest：验证项、上游行为探针、规模测试
-└── evidence/            随仓库保存的实测摘要和日志
+├── tests/               pytest：验证项、模块导入、快速开始端到端、上游行为探针、规模测试
+└── evidence/            随仓库保存的实测摘要、配置键网格和日志
 ```
 
 ## 路线图

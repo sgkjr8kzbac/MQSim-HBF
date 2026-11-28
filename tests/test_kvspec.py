@@ -14,7 +14,7 @@ from hbf.device.config import load
 from hbf.kvspec import GroupedLayout, KVGroup, KVSpec, from_model, generate_grouped, parse_kvspec
 from hbf.backends.rounds.pages import iter_layer_pages
 
-HBF_FLAGS = ["--analysis-only", "--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read"]
+HBF_FLAGS = ["run", "--analysis-only", "--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read"]
 
 
 def grouped(text, shape, mode="dense", intra="contiguous", requests=1, **generation):

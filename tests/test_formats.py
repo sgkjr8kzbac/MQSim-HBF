@@ -104,7 +104,7 @@ def test_layer_with_only_hbm_reads_gives_a_zero_row():
 
 def test_system_model_in_the_pipeline(tmp_path):
     out = tmp_path / "s"
-    main(["--topology", "ocp", "--layout", "striped_contiguous", "--model", "llama-3.1-8b", "--gpu", "h100-sxm",
+    main(["run", "--topology", "ocp", "--layout", "striped_contiguous", "--model", "llama-3.1-8b", "--gpu", "h100-sxm",
           "--context", "4096", "--batch", "4", "--stacks", "2", "--format", "kivi2", "--read-plane-ns", "0",
           "--coalesce-ns", "1", "--cache-read", "--analysis-only", "--output", str(out)])
     meta = json.loads((out / "meta.json").read_text())
@@ -122,7 +122,7 @@ def test_system_model_in_the_pipeline(tmp_path):
 
 
 def test_system_flags_are_checked(tmp_path):
-    base = ["--topology", "ocp", "--model", "llama-3.1-8b", "--analysis-only", "--context", "1024"]
+    base = ["run", "--topology", "ocp", "--model", "llama-3.1-8b", "--analysis-only", "--context", "1024"]
     for index, extra in enumerate((["--layers", "2"], ["--overlap", "prefetch:1", "--mode", "uniform_tokens"],
                                    ["--format", "kivi2", "--tensors", "[]"], ["--batch", "0"], ["--plane-group", "16"])):
         with pytest.raises(SystemExit):
@@ -130,7 +130,7 @@ def test_system_flags_are_checked(tmp_path):
         assert not (tmp_path / str(index)).exists()
 
 
-HBF_FLAGS = ["--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read", "--analysis-only"]
+HBF_FLAGS = ["run", "--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read", "--analysis-only"]
 
 
 def test_batched_trace_must_cover_every_request(tmp_path):
@@ -165,7 +165,7 @@ def test_step_without_hbf_pages_still_reports(tmp_path):
                       "--access-csv", str(trace), "--output", str(tmp_path / "hbm")])
     report = (tmp_path / "hbm" / "report.md").read_text()
     assert "| 1 | 0 | 1 | 0 | 0 |" in report and "—" in report
-    main(["--topology", "ocp", "--analysis-only", "--format", "kivi2", "--layers", "1", "--heads", "1",
+    main(["run", "--topology", "ocp", "--analysis-only", "--format", "kivi2", "--layers", "1", "--heads", "1",
           "--context", "256", "--access-csv", str(trace), "--output", str(tmp_path / "plain")])
     assert (tmp_path / "plain" / "analysis_layers.csv").is_file()  # timing is always computed (zero row kept)
 

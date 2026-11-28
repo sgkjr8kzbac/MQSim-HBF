@@ -43,7 +43,11 @@ def _list(text, kind=str, name="value"):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="python -m hbf.endurance", description="Endurance of KV cache stored on HBF")
+    parser = argparse.ArgumentParser(prog="python -m hbf lifetime", description="Endurance of KV cache stored on HBF")
+    parser.add_argument("config", nargs="?", type=Path,
+                        help="optional TOML or JSON config ([device], [kv], [trace], [placement], [lifetime], [ext.*])")
+    parser.add_argument("--set", dest="overrides", action="append", default=[],
+                        help="override a config key, e.g. --set kv.format=kivi2 (repeatable)")
     parser.add_argument("--analytic", action="store_true",
                         help="closed-form steady state instead of the event simulation (which needs --hours)")
     parser.add_argument("--model", default="llama-3.1-8b", help="model preset(s), comma separated")
@@ -311,6 +315,10 @@ def run(directory, **config):
     else:
         rows, calibrations = _analytic_rows(directory, config)
     write_table(directory / "endurance_summary.csv", rows)
+    from ..run import resolved_lifetime_config
+    (directory / "config.json").write_text(
+        json.dumps(resolved_lifetime_config(config), indent=2, ensure_ascii=False, default=str) + "\n"
+    )
     meta = {key: value for key, value in config.items()
             if key not in ("models", "gpu", "workloads", "options", "calibration_dir")}
     meta |= {"models": [model.name for model in config["models"]], "gpu": config["gpu_name"],
@@ -425,9 +433,24 @@ def summarize_run(directory, head_dim=None):
 
 
 
+def _parse_lifetime_argv(parser, argv):
+    """Parse optional CONFIG file + ``--set`` overrides, then apply explicit CLI flags."""
+    from ..run import apply_overrides, config_to_lifetime_argv, load_config, split_config_and_overrides
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    config_path, overrides, rest = split_config_and_overrides(tokens)
+    if config_path is None and not overrides:
+        return parser.parse_args(tokens)
+    cfg_dict = load_config(config_path) if config_path is not None else {}
+    cfg_dict = apply_overrides(cfg_dict, overrides)
+    return parser.parse_args(config_to_lifetime_argv(cfg_dict) + rest)
+
+
 def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = _parse_lifetime_argv(parser, argv)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     directory = args.output or Path("runs") / f"endurance-{now}-{uuid4().hex[:8]}"
     try:

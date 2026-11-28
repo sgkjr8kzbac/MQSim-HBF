@@ -233,7 +233,7 @@ def test_generator_parameter_validation():
                 list(generate(cfg, layout, mode, **kwargs))
 
 
-HBF_FLAGS = ["--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read", "--analysis-only"]
+HBF_FLAGS = ["run", "--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read", "--analysis-only"]
 
 
 def test_cli_round_trip_and_default_meta_unchanged(tmp_path):

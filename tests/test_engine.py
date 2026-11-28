@@ -76,8 +76,8 @@ def test_numpy_engine_rows_equal_reference(topology, mode, batch_pages):
 
 
 def test_removed_cli_flags_are_rejected():
-    from hbf.cli import build_parser
-    parser = build_parser()
+    from hbf.cli import build_run_parser
+    parser = build_run_parser()
     for flag in (["--engine", "python"], ["--timing"], ["--placement", "mqsim"], ["--dbsy-ns", "0"]):
         with pytest.raises(SystemExit):
             parser.parse_args(flag)

@@ -12,7 +12,7 @@ from hbf.frontend.kv.placement import BatchRequest, BatchSpec, PageTableLayout, 
 from hbf.cli import main
 from hbf.device.config import load
 
-HBF_FLAGS = ["--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read", "--analysis-only"]
+HBF_FLAGS = ["run", "--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read", "--analysis-only"]
 
 
 def batch(allocation, requests, **kwargs):

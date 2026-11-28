@@ -271,6 +271,7 @@ def parse_topology(topology, named=None):
 
 def load(topology="ocp", **overrides):
     params = json.loads(PARAMETERS.read_text())
+    params.pop("assumptions", None)
     fields = parse_topology(topology, params.pop("topologies"))
     reference = params.pop("calibration_reference")
     if reference["width_gb_s"] * reference["xfer_ns"] != params["page_bytes"]:

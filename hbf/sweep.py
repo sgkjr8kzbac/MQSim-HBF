@@ -41,7 +41,8 @@ from pathlib import Path
 from typing import Callable
 
 from .backends.rounds.analysis import TIMING_KEYS
-from .cli import build_parser, configure, pipeline
+from .cli import build_run_parser, configure, pipeline
+from .run import resolve_grid_key
 from .util import write_table
 
 MAX_JOBS = 3
@@ -114,7 +115,7 @@ class Tool:
 
 
 TOOLS = {
-    "analysis": Tool("hbf.cli", build_parser, configure, _analysis_check, _analysis_execute, lambda: METRICS,
+    "analysis": Tool("hbf.cli", build_run_parser, configure, _analysis_check, _analysis_execute, lambda: METRICS,
                      ("--analysis-only",), ("output", "help", "analysis_only")),
     "endurance": Tool("hbf.lifetime.cli", lambda: _endurance().build_parser(), lambda args: _endurance().configure(args),
                       _endurance_check, _endurance_execute, lambda: _endurance().METRICS, (), ("output", "help")),
@@ -156,14 +157,18 @@ def load_grid(text):
         raise ValueError(f"Keys in both vary and zip: {', '.join(sorted(set(vary) & zip_keys))}")
     if seeds is not None and "seed" in set(vary) | zip_keys:
         raise ValueError("Give the seed in seeds or in vary/zip, not both")
+    tool_name = grid.get("tool") or "analysis"
     tool = tool_of(grid)
     options = tool.parser()._option_string_actions
     for key in set(base) | set(vary) | zip_keys:
-        if key in tool.reserved:
+        if not isinstance(key, str):
+            raise ValueError(f"Unknown option {key!r}: keys must be strings")
+        opt_key = resolve_grid_key(key, tool_name)
+        if opt_key in tool.reserved:
             raise ValueError(f"{key} is set by the sweep")
-        if not isinstance(key, str) or flag(key) not in options:
-            raise ValueError(f"Unknown option {key!r}: use {tool.module} long options with _ for -")
-    return {"tool": grid.get("tool") or "analysis", "base": base, "vary": vary, "zip": zipped, "seeds": seeds}
+        if flag(opt_key) not in options:
+            raise ValueError(f"Unknown option {key!r}: use config keys or {tool.module} long options with _ for -")
+    return {"tool": tool_name, "base": base, "vary": vary, "zip": zipped, "seeds": seeds}
 
 
 def flag(key):
@@ -172,13 +177,16 @@ def flag(key):
 
 def expand(grid):
     """Runs as (params, varied) pairs: product of vary, times each zip entry, times each seed."""
+    tool_name = grid.get("tool") or "analysis"
     seeds = [{"seed": seed} for seed in grid["seeds"]] if grid["seeds"] is not None else [{}]
     runs = []
     for values in itertools.product(*grid["vary"].values()):
         for entry in grid["zip"] or [{}]:
             for seed in seeds:
                 varied = dict(zip(grid["vary"], values)) | entry | seed
-                runs.append((grid["base"] | varied, varied))
+                raw = grid["base"] | varied
+                params = {resolve_grid_key(k, tool_name): v for k, v in raw.items()}
+                runs.append((params, varied))
     return runs
 
 

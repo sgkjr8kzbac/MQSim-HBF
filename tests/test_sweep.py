@@ -220,3 +220,27 @@ def test_workload_length_validation_and_describe():
     assert "None" not in desc and "会话 4 次调用" in desc
     with_hist = Workload(name="s", calls=4, history="fixed:512", think_s=1.0)
     assert "初始历史 fixed:512" in with_hist.describe()
+
+
+def test_config_key_grids_and_evidence_grids(tmp_path):
+    """R3.6: sweep accepts dotted config keys and all evidence/grids/*.json load and expand cleanly."""
+    from pathlib import Path
+    grids_dir = Path(__file__).resolve().parent.parent / "evidence" / "grids"
+    grid_files = sorted(grids_dir.glob("*.json"))
+    assert len(grid_files) >= 5
+    for path in grid_files:
+        loaded = load_grid(str(path))
+        runs = expand(loaded)
+        assert runs, f"{path.name} expanded to zero runs"
+        # Every base/vary/zip key in evidence/grids should be a dotted config key.
+        all_keys = set(loaded["base"]) | set(loaded["vary"]) | {k for e in loaded["zip"] for k in e}
+        assert all("." in k for k in all_keys), f"non-dotted key in {path.name}: {all_keys}"
+
+    tiny = {
+        "base": {"device.topology": "ocp", "kv.layers": 1, "kv.heads": 2, "kv.context": 512},
+        "vary": {"kv.format": ["bf16", "fp8"], "kv.layout": ["layer_contiguous", "striped_contiguous"]},
+    }
+    rows = sweep(tiny, tmp_path / "dotted", progress=io.StringIO())
+    assert [row["status"] for row in rows] == ["ok"] * 4
+    assert (tmp_path / "dotted" / "runs" / rows[0]["run"] / "config.json").is_file()
+

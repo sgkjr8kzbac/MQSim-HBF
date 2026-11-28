@@ -231,6 +231,12 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                           and not isinstance(requests, BatchSpec) and mode != "write_then_read")
     if prefill_layout and any(access.op == "W" for access in accesses):
         raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
+    from .run import resolved_run_config
+    dump(directory / "config.json", resolved_run_config(
+        cfg, shape, layout_name, mode, generation, input_csv, physical, tensors, plane_groups,
+        prefill_layout, protocol, system, kv_format, requests, check_writes, kv_spec,
+        "rounds" if binary is None else "mqsim",
+    ))
     dump(directory / "meta.json", {"shape": asdict(shape), "layout": layout_name,
                                    "system": system_meta,
                                    "format": None if fmt is None else {"name": fmt.name, "params": fmt.params,
@@ -337,8 +343,12 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     return result
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_run_parser(prog="python -m hbf run"):
+    parser = argparse.ArgumentParser(prog=prog, description=__doc__)
+    parser.add_argument("config", nargs="?", type=Path,
+                        help="optional TOML or JSON run config ([device], [trace], [kv], [placement], [backend], [ext.*])")
+    parser.add_argument("--set", dest="overrides", action="append", default=[],
+                        help="override a config key, e.g. --set kv.format=kivi2 (repeatable)")
     parser.add_argument("--topology", default="ocp",
                         help="ocp (16 host channels, Figure 4; default), ocp-8ch (8 host channels, grade 1), "
                              "16x64, 64x16, 256x4 or any <channels>x<chips per channel>")
@@ -640,21 +650,92 @@ def configure(args):
             "requests": requests, "check_writes": args.check_writes, "kv_spec": kv_spec}
 
 
-def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def _parse_config_and_flags(parser, argv, to_argv_fn):
+    """Parse optional CONFIG file + ``--set`` overrides, then let explicit CLI flags win."""
+    from .run import apply_overrides, load_config, split_config_and_overrides
+    config_path, overrides, rest = split_config_and_overrides(argv)
+    if config_path is None and not overrides:
+        return parser.parse_args(argv)
+    cfg_dict = load_config(config_path) if config_path is not None else {}
+    cfg_dict = apply_overrides(cfg_dict, overrides)
+    merged_argv = to_argv_fn(cfg_dict) + rest
+    return parser.parse_args(merged_argv)
+
+
+SUBCOMMANDS = ("run", "sweep", "lifetime", "check", "system", "interference")
+
+
+def build_parser():
+    """Top-level ``python -m hbf`` parser with subcommands."""
+    parser = argparse.ArgumentParser(
+        prog="python -m hbf",
+        description="HBF KV-cache page-level simulator, rounds model, and lifetime toolkit.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("run", help="run frontend + backend (rounds or MQSim) from a config file and/or flags")
+    sub.add_parser("sweep", help="run a Cartesian parameter sweep over a JSON grid")
+    sub.add_parser("lifetime", help="run closed-form or event-simulated HBF endurance analysis")
+    sub.add_parser("check", help="spot-check the rounds estimate against MQSim on the same address trace")
+    sub.add_parser("system", help="re-evaluate decode TPOT on an existing run directory")
+    sub.add_parser("interference", help="re-time an existing run with write/erase interference")
+    return parser
+
+
+def _main_run(argv, *, force_mqsim=False):
+    from .run import config_to_run_argv, summarize_check
+    prog = "python -m hbf check" if force_mqsim else "python -m hbf run"
+    parser = build_run_parser(prog=prog)
+    try:
+        args = _parse_config_and_flags(parser, argv, config_to_run_argv)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    if force_mqsim and args.analysis_only:
+        parser.error("hbf check runs MQSim against the rounds backend; do not pass --analysis-only")
     now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    directory = args.output or Path("runs") / f"{now}-{uuid4().hex[:8]}"
+    prefix = "check-" if force_mqsim else ""
+    directory = args.output or Path("runs") / f"{prefix}{now}-{uuid4().hex[:8]}"
     try:
         run = configure(args)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
-    binary = None if args.analysis_only else build()
+    binary = None if (args.analysis_only and not force_mqsim) else build()
     try:
         pipeline(directory=directory, binary=binary, **run)
     except ValueError as error:
         parser.error(str(error))
+    if force_mqsim:
+        summary = summarize_check(directory)
+        for row in summary["steps"]:
+            err = "n/a" if row["rel_error"] is None else f"{row['rel_error'] * 100:+.2f}%"
+            print(f"step {row['step']}: mqsim={row['mqsim_ns']:.0f} ns  "
+                  f"est_batches={row['est_batches_ns']} ns  err={err}")
     print(directory.resolve())
+    return directory
+
+
+def main(argv=None):
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    if not tokens or tokens[0] in ("-h", "--help"):
+        build_parser().parse_args(tokens)
+        return
+    command, rest = tokens[0], tokens[1:]
+    if command == "run":
+        return _main_run(rest, force_mqsim=False)
+    if command == "check":
+        return _main_run(rest, force_mqsim=True)
+    if command == "sweep":
+        from .sweep import main as sweep_main
+        return sweep_main(rest)
+    if command == "lifetime":
+        from .lifetime.cli import main as lifetime_main
+        return lifetime_main(rest)
+    if command == "system":
+        from .system import main as system_main
+        return system_main(rest)
+    if command == "interference":
+        from .lifetime.interference import main as interference_main
+        return interference_main(rest)
+    build_parser().error(f"invalid choice: {command!r} (choose from {', '.join(repr(c) for c in SUBCOMMANDS)})")
 
 
 if __name__ == "__main__":

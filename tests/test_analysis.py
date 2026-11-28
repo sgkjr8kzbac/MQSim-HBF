@@ -156,7 +156,7 @@ def test_prefill_rejects_user_writes_and_cli_checks_groups(tmp_path, monkeypatch
     with pytest.raises(ValueError, match="must not contain writes"):
         pipeline(cfg, Shape(1, 1, 128, 64), "layer_contiguous", tmp_path / "w", None,
                  mode="write_then_read", prefill_layout=True)
-    monkeypatch.setattr("sys.argv", ["hbf", "--analysis-only", "--plane-group", "3",
+    monkeypatch.setattr("sys.argv", ["hbf", "run", "--analysis-only", "--plane-group", "3",
                                      "--output", str(tmp_path / "g")])
     with pytest.raises(SystemExit):
         main()
@@ -451,7 +451,7 @@ def test_cwdp_topologies_keep_sixteen_host_channels():
 def test_link_bound_follows_ucie_grade():
     """A dense round of 64 pages per host channel moves 256 KiB: 5.46 us at grade 1 (48 GB/s)."""
     from hbf.backends.rounds.analysis import Protocol, analyze_accesses, _protocol_part, protocol_rounds
-    from hbf.cli import build_parser, configure, topology_name
+    from hbf.cli import build_run_parser, configure, topology_name
     from hbf.backends.rounds.pages import iter_layer_pages, place
     cfg8 = load("ocp-8ch")
     assert (cfg8.channels, cfg8.chips, cfg8.planes, cfg8.units, cfg8.host_channels, cfg8.aggregate_gb_s,
@@ -479,8 +479,8 @@ def test_link_bound_follows_ucie_grade():
     with pytest.raises(ValueError, match="at most 8 host channels"):
         _protocol_part(cfg16, layer, place(cfg16, layer.lpa), 1, grade1, slice(None))
     with pytest.raises(ValueError, match="at most 8 host channels"):
-        configure(build_parser().parse_args(["--topology", "ocp", "--ucie-grade", "1"]))
-    configure(build_parser().parse_args(["--topology", "ocp-8ch", "--ucie-grade", "1"]))
+        configure(build_run_parser().parse_args(["--topology", "ocp", "--ucie-grade", "1"]))
+    configure(build_run_parser().parse_args(["--topology", "ocp-8ch", "--ucie-grade", "1"]))
     with pytest.raises(ValueError, match="ucie_grade"):
         Protocol(256, ucie_grade=4)
 
@@ -559,12 +559,12 @@ def test_generator_and_cli_edge_cases(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="multiple of the unit count"):
         cfg.unit_lpa(512, 0, 512)
     # A link grade alone sets no credit limit: rounds stay at the bank bound.
-    monkeypatch.setattr("sys.argv", ["hbf", "--analysis-only", "--topology", "ocp", "--context", "32768",
+    monkeypatch.setattr("sys.argv", ["hbf", "run", "--analysis-only", "--topology", "ocp", "--context", "32768",
                                      "--ucie-grade", "3", "--output", str(tmp_path / "u")])
     main()
     (row,) = csv.DictReader((tmp_path / "u" / "analysis_steps.csv").open())
     assert row["protocol_rounds"] == row["rounds"] == "32" and "MOCS = 不限" in (tmp_path / "u" / "report.md").read_text()
-    monkeypatch.setattr("sys.argv", ["hbf", "--analysis-only", "--layers", "0", "--output", str(tmp_path / "z")])
+    monkeypatch.setattr("sys.argv", ["hbf", "run", "--analysis-only", "--layers", "0", "--output", str(tmp_path / "z")])
     with pytest.raises(SystemExit):
         main()
     with pytest.raises(ValueError):  # a generator error leaves no output directory behind

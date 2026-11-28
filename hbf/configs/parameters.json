@@ -60,5 +60,16 @@
     "width_gb_s": 64,
     "xfer_ns": 64,
     "single_read_ns": 4471
+  },
+  "assumptions": {
+    "note": "OCP HBF v0.7.0 leaves NAND timing, erase-block geometry, core-die bandwidth, and endurance limits product specific. Values below are modelling assumptions; see docs/research/params.md.",
+    "read_ns": "assumption: 4096 ns (SPLASH Table 1; docs/research/params.md)",
+    "program_ns": "assumption: 100000 ns (SPLASH Table 1; docs/research/params.md)",
+    "erase_ns": "assumption: 1000000 ns (SPLASH Table 1; docs/research/params.md)",
+    "pages_per_block": "assumption: 256 pages/block (OCP v0.7.0 section 11.5.1.8 hints 256/512/1024; SPLASH/FlashAccel use 192; docs/research/params.md)",
+    "blocks_per_plane": "assumption: 512 blocks/plane (512 GiB physical capacity per stack; docs/research/params.md)",
+    "aggregate_gb_s": "assumption: 1024 GB/s core-die aggregate (SPLASH; OCP v0.7.0 Table 4 host link grades are 384/1536/3072 GB/s; docs/research/params.md)",
+    "op_ratio": "assumption: 0.07 (MQSim SSD overprovisioning; OCP HBF has no host-visible OP or GC)",
+    "pe_limits": "assumption: 1e4-1e6 P/E cycles swept in lifetime models (product specific; docs/research/params.md)"
   }
 }

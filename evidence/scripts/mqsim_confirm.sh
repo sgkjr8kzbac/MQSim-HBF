@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # MQSim confirmations of the phase A read-time estimate on new formats, batch emulation and tR.
 # usage: evidence/scripts/mqsim_confirm.sh OUTPUT_DIR   (runs one 1,024-plane MQSim at a time)
-# then: python evidence/scripts/time_calibration.py OUTPUT_DIR/*/ > confirm.csv
+# Uses the default ocp topology (HBF command model + automatic prefill).
 set -euo pipefail
 out=${1:?output directory}
 mkdir -p "$out"
-hbf=(--topology ocp --read-plane-ns 0 --coalesce-ns 1 --cache-read --prefill)
 run() {  # name, flags...
     local name=$1; shift
     [ -e "$out/$name" ] && return
-    python3 -m hbf.cli "${hbf[@]}" "$@" --output "$out/$name" > /dev/null
+    python3 -m hbf check "$@" --output "$out/$name" > /dev/null
 }
 run dense-128k-1024 --layers 2 --context 131072
 run dense-128k-384 --layers 2 --context 131072 --aggregate-gb-s 384

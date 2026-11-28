@@ -1,6 +1,15 @@
 {
-  "base": {"topology": "ocp", "read_plane_ns": 0, "coalesce_ns": 1, "cache_read": true,
-           "layout": "striped_contiguous", "mode": "dense", "gpu": "b200", "stacks": 8},
-  "vary": {"model": ["llama-3.1-8b", "llama-3.1-70b"], "context": [8192, 32768, 131072], "batch": [8, 16, 32, 64],
-           "overlap": ["serial", "prefetch:1"]}
+  "base": {
+    "device.topology": "ocp",
+    "kv.layout": "striped_contiguous",
+    "trace.mode": "dense",
+    "ext.system.gpu": "b200",
+    "placement.stacks": 8
+  },
+  "vary": {
+    "kv.model": ["llama-3.1-8b", "llama-3.1-70b"],
+    "kv.context": [8192, 32768, 131072],
+    "placement.batch": [8, 16, 32, 64],
+    "ext.system.overlap": ["serial", "prefetch:1"]
+  }
 }

@@ -415,7 +415,7 @@ def test_cancellation_stops_mqsim_process_group(evidence, termination):
 def test_batch_limit_at_cli_and_config(monkeypatch, capsys):
     with pytest.raises(ValueError, match="8192"):
         load(batch_pages=8193)
-    monkeypatch.setattr(sys, "argv", ["hbf-stage0", "--batch-pages", "16384"])
+    monkeypatch.setattr(sys, "argv", ["hbf", "run", "--batch-pages", "16384"])
     with pytest.raises(SystemExit, match="2"):
         main()
     assert "8192" in capsys.readouterr().err

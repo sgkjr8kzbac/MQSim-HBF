@@ -68,16 +68,16 @@ git push origin claude/hbf-kv-study
 |---|---|---|
 | 第 2 阶段 B（一）开始 | 新增分配方式、写入干扰、寿命解析模型；M2 审查修复 | `tests`、`placement`、`interference`、`endurance`（已完成，提交 `fb9631d`） |
 | T-B7、T-B2 之后 | `dedicated`、`packed` 默认错开各请求的起点（`--align stagger`），读并行度会变；扫描脚本新增 `"tool": "endurance"` | `placement`、`tests` |
-| 事件模拟（T-B1d）合并后 | 新增 `hbf.endurance` 的事件模拟（不加 `--analytic`，需要 `--hours`） | `tests`；另跑下面两条验证命令 |
+| 事件模拟（T-B1d）合并后 | 新增 `python3 -m hbf lifetime` 的事件模拟（不加 `--analytic`，需要 `--hours`） | `tests`；另跑下面两条验证命令 |
 
 ## 事件模拟的验证（T-B1d）
 
 ```bash
-python3 -m hbf.endurance --workload long32k --concurrency 8 --alloc packed --hours 24 --warmup-h 1 --rd-threshold 1e5,1e6 --output runs/sim-long32k
+python3 -m hbf lifetime --workload long32k --concurrency 8 --alloc packed --hours 24 --warmup-h 1 --rd-threshold 1e5,1e6 --output runs/sim-long32k
 ```
 
 ```bash
-python3 -m hbf.endurance --workload agentic --concurrency 8 --alloc packed --hours 48 --warmup-h 2 --rd-threshold 1e5,1e6 --output runs/sim-agentic
+python3 -m hbf lifetime --workload agentic --concurrency 8 --alloc packed --hours 48 --warmup-h 2 --rd-threshold 1e5,1e6 --output runs/sim-agentic
 ```
 
 每条约 1–2 分钟。在 `endurance_summary.csv` 里检查：
