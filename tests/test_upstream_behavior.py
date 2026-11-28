@@ -2,8 +2,10 @@
 import subprocess
 from xml.etree import ElementTree as ET
 
-from hbf.config import device_xml, workload_xml
-from hbf.simulator import completions, dump, flash_stats, version
+from hbf.device.config import device_xml, workload_xml
+from hbf.backends.mqsim.build import version
+from hbf.backends.mqsim.parse import completions, flash_stats
+from hbf.util import dump
 from test_validation import micro, phy
 
 

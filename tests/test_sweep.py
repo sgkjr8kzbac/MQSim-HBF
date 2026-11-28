@@ -209,7 +209,7 @@ def test_endurance_sweep_jobs_two_matches_jobs_one(tmp_path):
 
 def test_workload_length_validation_and_describe():
     # M5 & L5: parse_length rejects lo > hi, min > max, median <= 0; describe omits None history.
-    from hbf.workload import Workload, parse_length
+    from hbf.frontend.trace.requests import Workload, parse_length
     for bad in ("uniform:lo=100,hi=50", "lognormal:median=0,sigma=0.8",
                 "lognormal:median=100,sigma=0.8,min=50,max=20",
                 "lognormal:median=100,sigma=0.8,max=0", "uniform:lo=10,hi=20,min=30,max=10"):

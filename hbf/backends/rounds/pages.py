@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .config import OCP_DIES_PER_HOST_CHANNEL
-from .controller import BURST_BYTES, schedule
+from ...device.config import OCP_DIES_PER_HOST_CHANNEL
+from ..mqsim.schedule import BURST_BYTES, schedule
 
 
 @dataclass

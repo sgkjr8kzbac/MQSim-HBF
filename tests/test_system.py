@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from hbf.model import GPUS, MODELS, GpuSpec, ModelSpec, experts_touched, load_gpu, load_model, presets
+from hbf.models import GPUS, MODELS, GpuSpec, ModelSpec, experts_touched, load_gpu, load_model, presets
 from hbf.system import SystemOptions, evaluate, linear_ns, main, parse_overlap, read_layers, timeline
 
 LLAMA = load_model("llama-3.1-8b")
@@ -330,9 +330,9 @@ def test_mla_absorbed_decode_flops_and_fallback():
 
 
 def test_k3_end_to_end_evaluate_all_new_presets():
-    from hbf.access import Shape, default_tensors
-    from hbf.analysis import analyze_accesses
-    from hbf.config import load
+    from hbf.frontend.kv.tensors import Shape, default_tensors
+    from hbf.backends.rounds.analysis import analyze_accesses
+    from hbf.device.config import load
     from hbf.kvspec import GroupedLayout, from_model, generate_grouped
 
     cfg = load("ocp")

@@ -4,12 +4,15 @@ from collections import defaultdict
 
 import pytest
 
-from hbf.access import LAYOUTS, Shape, read_access
-from hbf.analysis import locate, placement
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape
+from hbf.frontend.trace.tokens import read_access
+from hbf.backends.rounds.analysis import locate, placement
 from hbf.cli import pipeline
-from hbf.config import load
-from hbf.controller import Batch, Request, schedule_run
-from hbf.simulator import completions, simulate
+from hbf.device.config import load
+from hbf.backends.mqsim.schedule import Batch, Request, schedule_run
+from hbf.backends.mqsim.parse import completions
+from hbf.backends.mqsim.run import simulate
 
 
 def die_rounds(cfg, requests, group, placed=None):
@@ -171,7 +174,7 @@ def test_coalesced_command_time(binary, evidence, planes, step, window):
 
 
 def test_patch_series_lists_every_patch():
-    from hbf.simulator import patch_series
+    from hbf.backends.mqsim.build import patch_series
     names = [path.name for path in patch_series()]
     assert names[-3:] == ["T-CMD.patch", "T-CACHE.patch", "T-PERF.patch"] and len(names) == len(set(names)) == 10
 

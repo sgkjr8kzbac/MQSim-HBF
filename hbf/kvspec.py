@@ -24,7 +24,10 @@ from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from random import Random
 
-from .access import Access, Layout, TensorSpec, share
+from .frontend.kv.layouts import Layout
+from .frontend.kv.tensors import TensorSpec
+from .frontend.trace.synthetic import share
+from .frontend.trace.tokens import Access
 
 PRESETS = ("hybrid", "ssm", "cla", "yoco", "duo", "pyramid")
 DEFAULTS = {
@@ -222,7 +225,7 @@ def parse_kvspec(text, layers, heads, context):
 
 def resolve_format(model, fmt):
     """Resolve ``fmt`` (None, format string or KVFormat) for ``model``."""
-    from .formats import KVFormat, parse_format, parse_params as parse_fmt_params
+    from .frontend.kv.formats import KVFormat, parse_format, parse_params as parse_fmt_params
     if isinstance(fmt, KVFormat):
         return fmt
     q_heads = model.q_heads // model.kv_heads
@@ -260,7 +263,7 @@ def from_model(model, fmt="bf16", local_tier="hbm", *, tensors=None):
     is provided, attention groups use those tensor specs directly instead of resolving ``fmt``.
     """
     if isinstance(model, str):
-        from .model import load_model
+        from .models import load_model
         model = load_model(model)
     tier = _tier(local_tier, "local_tier")
     if tensors is not None:
@@ -1089,8 +1092,8 @@ class KVGeometry:
 
     def region_span(self, slots, prompt, pages_per_block=256):
         """Pages a ``layer_major`` wave writes under ``GroupedLayout`` (striped)."""
-        from .access import Shape
-        from .config import load
+        from .device.config import load
+        from .frontend.kv.tensors import Shape
         cfg = load("ocp", pages_per_block=pages_per_block, blocks_per_plane=max(1, 131072 // pages_per_block))
         head_dim = max((s.dims for s in self.tensors), default=128)
         lay = GroupedLayout(cfg, Shape(self.layers, self.heads * slots, head_dim, int(prompt)),

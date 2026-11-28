@@ -13,12 +13,16 @@ from pathlib import Path
 
 import pytest
 
-from hbf.access import (Access, LAYOUTS, Shape, TensorSpec, _tensor_meta, generate, parse_tensors, read_access,
-                        write_access)
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape, TensorSpec, _tensor_meta, parse_tensors
+from hbf.frontend.trace.synthetic import generate
+from hbf.frontend.trace.tokens import Access, read_access, write_access
 from hbf.cli import main, pipeline
-from hbf.config import CONFIG, PARAMETERS, ROOT, check_xml, load, workload_fields, xml_settings
-from hbf.controller import Batch, Request, metrics, schedule
-from hbf.simulator import check_gc_budget, completions, dump, simulate
+from hbf.device.config import CONFIG, PARAMETERS, ROOT, check_xml, load, workload_fields, xml_settings
+from hbf.backends.mqsim.schedule import Batch, Request, metrics, schedule
+from hbf.backends.mqsim.parse import completions
+from hbf.backends.mqsim.run import check_gc_budget, simulate
+from hbf.util import dump
 
 
 def cases(cfg, page_sets):
@@ -378,9 +382,9 @@ def test_cancellation_stops_mqsim_process_group(evidence, termination):
             runner = (
                 "import sys\n"
                 "from pathlib import Path\n"
-                "from hbf.config import load\n"
-                "from hbf.controller import Batch, Request\n"
-                "from hbf.simulator import simulate\n"
+                "from hbf.device.config import load\n"
+                "from hbf.backends.mqsim.schedule import Batch, Request\n"
+                "from hbf.backends.mqsim.run import simulate\n"
                 "cfg = load('16x64', channels=1, chips=4, aggregate_gb_s=64)\n"
                 "simulate(cfg, [Batch(0, 0, 0, 0, (Request(0),))], "
                 "Path(sys.argv[1]), Path(sys.argv[2]), timeout=30)\n"

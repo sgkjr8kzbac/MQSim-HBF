@@ -4,13 +4,16 @@ import json
 
 import pytest
 
-from hbf.access import LAYOUTS, Access, Shape, TensorSpec, generate, parse_tensors
-from hbf.analysis import analyze_accesses
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape, TensorSpec, parse_tensors
+from hbf.frontend.trace.synthetic import generate
+from hbf.frontend.trace.tokens import Access
+from hbf.backends.rounds.analysis import analyze_accesses
 from hbf.cli import main
-from hbf.config import load
-from hbf.controller import schedule
-from hbf.formats import parse_format
-from hbf.pages import iter_layer_pages
+from hbf.device.config import load
+from hbf.backends.mqsim.schedule import schedule
+from hbf.frontend.kv.formats import parse_format
+from hbf.backends.rounds.pages import iter_layer_pages
 from tests.reference import analyze
 
 
@@ -265,7 +268,7 @@ def test_fused_rows_cut_pages_per_selected_block(name, per_block):
 
 
 def test_attention_flops_use_attn_dims():
-    from hbf.model import ModelSpec, load_gpu
+    from hbf.models import ModelSpec, load_gpu
     from hbf.system import SystemOptions, evaluate
     fmt, layout, pages, _ = dense_pages("mla", 3)
     model = ModelSpec("mla-tiny", layers=1, hidden=256, q_heads=16, kv_heads=1, head_dim=128, intermediate=512,
@@ -278,7 +281,7 @@ def test_attention_flops_use_attn_dims():
 
 
 def test_new_tensor_fields_are_optional_in_meta():
-    from hbf.access import tensors_meta
+    from hbf.frontend.kv.tensors import tensors_meta
     cfg = load("ocp")
     plain = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 64))
     assert set(tensors_meta(plain)[0]) == {"name", "bits", "dims", "window", "tier", "role", "dequant_ops"}
@@ -307,7 +310,7 @@ def test_mla_rejects_both_indexers_and_invalid_q_heads():
 @pytest.mark.parametrize("mode", ["dense", "uniform_tokens", "sink_recent"])
 def test_engines_agree_on_non_64b_aligned_formats(name, q_heads, mode):
     # L6: numpy and reference engines agree on non-64B-aligned rows (656 B, 132 B, 96 B).
-    from hbf.analysis import Protocol
+    from hbf.backends.rounds.analysis import Protocol
     cfg = load("ocp")
     fmt = parse_format(name, 128, q_heads=q_heads)
     layout = LAYOUTS["striped_contiguous"](cfg, Shape(2, 2, 128, 2048), tensors=fmt.tensors)

@@ -4,10 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from hbf.access import LAYOUTS, Shape, generate
-from hbf.analysis import Protocol, analyze_accesses
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape
+from hbf.frontend.trace.synthetic import generate
+from hbf.backends.rounds.analysis import Protocol, analyze_accesses
 from hbf.cli import main, pipeline
-from hbf.config import load
+from hbf.device.config import load
 
 HBF_COMMANDS = {"read_plane_ns": 0, "coalesce_ns": 1, "cache_read": True}
 EVIDENCE = Path(__file__).parents[1] / "evidence" / "time-calibration.csv"

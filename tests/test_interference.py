@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from hbf.interference import hbf_gaps, interference, main, pack, residual_max, retime, unit_ops
+from hbf.lifetime.interference import hbf_gaps, interference, main, pack, residual_max, retime, unit_ops
 from hbf.system import timeline
 
 T_PROG, T_BERS = 100_000, 1_000_000

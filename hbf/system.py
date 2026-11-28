@@ -11,7 +11,8 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model import load_gpu, load_model
+from .models import load_gpu, load_model
+from .util import _plain, parse_overlap, write_table
 
 NS = 1e9
 KV_CONSUME = ("stream", "staged")
@@ -20,16 +21,6 @@ WEIGHTS = ("hbm", "hbf")
 ROW_KEYS = ("step", "layer", "est_ns", "bound_ns", "burst_bytes", "hbm_bytes", "attended_tokens", "dequant_ops",
             "attended_elements")
 REQUIRED_ROW_KEYS = ("step", "layer", "bound_ns", "burst_bytes", "attended_tokens")
-
-
-def parse_overlap(text):
-    """'serial', 'ideal' or 'prefetch:<d>' (reads run up to d layers ahead) -> (mode, d or None)."""
-    if text in ("serial", "ideal"):
-        return text, None
-    mode, _, depth = str(text).partition(":")
-    if mode == "prefetch" and depth.isdigit():
-        return mode, int(depth)
-    raise ValueError(f"Invalid overlap {text!r}: use serial, ideal or prefetch:<d>")
 
 
 @dataclass(frozen=True)
@@ -386,16 +377,6 @@ def report_lines(result):
             f"{_fits(row['hbm_fits'])} | {_fits(row['hbm_fits_hbf'])} |")
     lines += ["", "## 假设", ""] + [f"- {line}" for line in result.assumptions]
     return lines
-
-
-def write_table(path, rows):
-    """CSV of plain Python values (numpy scalars converted; None written empty)."""
-    if not rows:
-        return
-    with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows({key: _plain(value) for key, value in row.items()} for row in rows)
 
 
 def write_outputs(result, directory):

@@ -3,11 +3,13 @@ import itertools
 
 import pytest
 
-from hbf.access import LAYOUTS, Shape, TensorSpec, generate
-from hbf.analysis import Protocol, analyze_accesses, locate
-from hbf.config import load
-from hbf.controller import schedule
-from hbf.pages import iter_layer_pages, place
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape, TensorSpec
+from hbf.frontend.trace.synthetic import generate
+from hbf.backends.rounds.analysis import Protocol, analyze_accesses, locate
+from hbf.device.config import load
+from hbf.backends.mqsim.schedule import schedule
+from hbf.backends.rounds.pages import iter_layer_pages, place
 from tests.reference import analyze
 
 TWO_BIT = (TensorSpec("K", 2, 128), TensorSpec("V", 2, 128))

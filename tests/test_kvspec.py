@@ -4,12 +4,15 @@ import json
 
 import pytest
 
-from hbf.access import LAYOUTS, Access, Shape, default_tensors, generate
-from hbf.analysis import analyze_accesses
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape, default_tensors
+from hbf.frontend.trace.synthetic import generate
+from hbf.frontend.trace.tokens import Access
+from hbf.backends.rounds.analysis import analyze_accesses
 from hbf.cli import main
-from hbf.config import load
+from hbf.device.config import load
 from hbf.kvspec import GroupedLayout, KVGroup, KVSpec, from_model, generate_grouped, parse_kvspec
-from hbf.pages import iter_layer_pages
+from hbf.backends.rounds.pages import iter_layer_pages
 
 HBF_FLAGS = ["--analysis-only", "--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read"]
 
@@ -203,8 +206,8 @@ def test_cli_pads_missing_sparse_layers_under_timing(tmp_path):
 @pytest.mark.parametrize("intra", ["contiguous", "striped"])
 def test_grouped_layout_engine_parity(spec_text, intra):
     # L6: numpy and pure-Python reference engines must agree row-by-row on GroupedLayout.
-    from hbf.analysis import Protocol
-    from hbf.controller import schedule
+    from hbf.backends.rounds.analysis import Protocol
+    from hbf.backends.mqsim.schedule import schedule
     from tests.reference import analyze
     cfg = load("ocp")
     shape = Shape(6, 4, 128, 4096)
@@ -230,7 +233,7 @@ def test_grouped_layout_engine_parity(spec_text, intra):
     ("llama-3.1-8b", 32 * 8 * 2 * 128 * 2),       # 131,072 B (32 uniform layers)
 ])
 def test_from_model_kv_bytes_per_token(name, expected_bpt):
-    from hbf.model import load_model
+    from hbf.models import load_model
     model = load_model(name)
     spec = from_model(model)
     assert spec.bytes_per_token(model.kv_heads) == expected_bpt
@@ -238,7 +241,7 @@ def test_from_model_kv_bytes_per_token(name, expected_bpt):
 
 
 def test_from_model_mla_formats_and_layout():
-    from hbf.model import load_model
+    from hbf.models import load_model
     cfg = load("ocp")
     ds = load_model("deepseek-v2-lite")
     bf16 = from_model(ds)
@@ -259,7 +262,7 @@ def test_from_model_mla_formats_and_layout():
 
 
 def test_from_model_hybrid_default_hbm_and_hbf_variant():
-    from hbf.model import load_model
+    from hbf.models import load_model
     cfg = load("ocp")
     gpt = load_model("gpt-oss-120b")
     spec_hbm = from_model(gpt)  # default local_tier="hbm"
@@ -285,7 +288,7 @@ def test_from_model_hybrid_default_hbm_and_hbf_variant():
 
 
 def test_from_model_ssm_emits_state_and_attention_groups():
-    from hbf.model import load_model
+    from hbf.models import load_model
     cfg = load("ocp")
     qn = load_model("qwen3-next-80b-a3b")
     spec = from_model(qn)
@@ -302,9 +305,9 @@ def test_from_model_ssm_emits_state_and_attention_groups():
 
 def test_cli_mla_format_and_hybrid_tensors_integration(tmp_path):
     from fractions import Fraction
-    from hbf.access import TensorSpec
+    from hbf.frontend.kv.tensors import TensorSpec
     from hbf.kvspec import resolve_format
-    from hbf.model import load_model
+    from hbf.models import load_model
 
     # MLA --model with --format fp8 / bf16 resolves through resolve_format; incompatible formats raise.
     ds = load_model("deepseek-v2-lite")
@@ -357,7 +360,7 @@ def test_k4_sliding_window_token_flow_and_geometry():
     """Design section 3 K4: window (-4096, -128), prompt 32,768 -> admission writes 3,968 tokens;
     after +1,000 generated, decode writes 1,000 and 1,000 die; stored stays 3,968."""
     import numpy as np
-    from hbf.access import TensorSpec
+    from hbf.frontend.kv.tensors import TensorSpec
     from hbf.kvspec import flow
 
     tensor = TensorSpec("kv", 8, 4096, window=(-4096, -128))  # 1 token per 4 KiB page
@@ -385,7 +388,7 @@ def test_k4_sliding_window_token_flow_and_geometry():
 def test_k4_kivi4_to_kivi2_age_based_ladder():
     """Design section 3 K4: kivi4 (-4096, -128) -> kivi2 (0, -4096) writes 160 + 96 = 256 B per
     decode token per head against 96 B for direct kivi2 (2.67x), and the kivi4 pages die."""
-    from hbf.formats import parse_format
+    from hbf.frontend.kv.formats import parse_format
     from hbf.kvspec import flow
 
     k4 = parse_format("kivi4", 128)
@@ -423,7 +426,7 @@ def test_k4_kivi4_to_kivi2_age_based_ladder():
 def test_k4_eviction_policies_and_h2o_live_page_fraction():
     """Design section 3 K4: H2O live-page fraction 1 - 0.75^16 = 0.98998; compaction threshold
     theta drives rewrite traffic; prefill/flush eviction compact before writing."""
-    from hbf.access import TensorSpec
+    from hbf.frontend.kv.tensors import TensorSpec
     from hbf.kvspec import flow, live_page_fraction, parse_evict
 
     # H2O keep=25%, BF16 tpp=16, cluster=1 -> 1 - 0.75^16 = 0.989977... (~0.98998).

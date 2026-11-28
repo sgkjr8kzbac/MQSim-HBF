@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-PRESETS = Path(__file__).resolve().parent / "configs" / "workloads.json"
+from ...device.config import WORKLOADS_JSON as PRESETS
 ARRIVALS = ("closed", "poisson", "script")
 KINDS = ("fixed", "lognormal", "uniform")
 

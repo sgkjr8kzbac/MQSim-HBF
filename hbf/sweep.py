@@ -40,9 +40,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .analysis import TIMING_KEYS
+from .backends.rounds.analysis import TIMING_KEYS
 from .cli import build_parser, configure, pipeline
-from .system import write_table
+from .util import write_table
 
 MAX_JOBS = 3
 GRID_KEYS = ("tool", "base", "vary", "zip", "seeds")

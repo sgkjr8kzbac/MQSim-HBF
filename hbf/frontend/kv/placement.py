@@ -48,8 +48,11 @@ from random import Random
 
 import numpy as np
 
-from .access import LAYOUTS, Access, Layout, Shape, default_tensors, share
-from .pages import place
+from ...backends.rounds.pages import place
+from ..trace.synthetic import share
+from ..trace.tokens import Access
+from .layouts import LAYOUTS, Layout
+from .tensors import Shape, default_tensors
 
 ALLOCATIONS = ("layer_major", "dedicated", "packed", "vllm_pool")
 PARTITIONS = ("none", "channel", "die")

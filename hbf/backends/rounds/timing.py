@@ -23,7 +23,7 @@ topologies (16x64 etc.) have no estimate: there every page is its own command.
 """
 import numpy as np
 
-from .config import DEFAULT_DBSY_NS
+from ...device.config import DEFAULT_DBSY_NS
 
 HBF_COMMAND_MODEL = "--read-plane-ns 0 --coalesce-ns 1 --cache-read"
 

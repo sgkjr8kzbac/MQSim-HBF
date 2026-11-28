@@ -3,11 +3,14 @@ from statistics import mean
 
 import pytest
 
-from hbf.access import LAYOUTS, Shape, generate
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape
+from hbf.frontend.trace.synthetic import generate
 from hbf.cli import pipeline
-from hbf.config import load
-from hbf.controller import Batch, Request, schedule
-from hbf.simulator import dump, simulate
+from hbf.device.config import load
+from hbf.backends.mqsim.schedule import Batch, Request, schedule
+from hbf.backends.mqsim.run import simulate
+from hbf.util import dump
 
 
 def run_dense_case(binary, evidence, topology, layout, expected_mq_est_ns):

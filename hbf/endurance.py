@@ -40,8 +40,10 @@ from uuid import uuid4
 
 import numpy as np
 
-from .interference import MODES as M5_MODES, hbf_gaps, interference
-from .workload import Stream, load_workload, per_stack, presets as workload_presets
+from .device.config import PARAMETERS
+from .frontend.trace.requests import Stream, load_workload, per_stack, presets as workload_presets
+from .lifetime.interference import MODES as M5_MODES, hbf_gaps, interference
+from .util import write_table
 
 GIB = 2 ** 30
 DAY = 86400.0
@@ -215,7 +217,7 @@ class Geometry:
 
 def geometry_for(model, kv_format=None, page_bytes=4096, *, kv_spec=None, context=32768, local_tier="hbm"):
     if kv_spec is None and not model.layer_pattern and model.attention == "gqa":
-        from .formats import parse_format
+        from .frontend.kv.formats import parse_format
         fmt = parse_format(kv_format or "bf16", model.head_dim, model.q_heads // model.kv_heads)
         return Geometry(model.layers, model.kv_heads, fmt.tensors, page_bytes), fmt
     from .kvspec import KVSpec, from_model, parse_kvspec, resolve_format
@@ -382,9 +384,10 @@ class ConstantClock:
 
 def layout_rounds(model, kv_format=None, layout="striped_contiguous", pages_per_block=256):
     """rounds_fn for Clock: exact phase A rounds of b equal requests (layer-major, dense) from the layout."""
-    from .access import LAYOUTS, Shape
-    from .config import load
-    from .formats import parse_format
+    from .device.config import load
+    from .frontend.kv.formats import parse_format
+    from .frontend.kv.layouts import LAYOUTS
+    from .frontend.kv.tensors import Shape
     cfg = load("ocp", pages_per_block=pages_per_block, blocks_per_plane=max(1, 131072 // pages_per_block))
     tensors = parse_format(kv_format or "bf16", model.head_dim, model.q_heads // model.kv_heads).tensors
     cache = {}
@@ -452,7 +455,7 @@ def phase_a(directory, model, gpu, kv_format, batch, context, *, mode="dense", g
 
 def calibration_batches(model, kv_format, context, rounds=(32, 128), limit=256, kv_spec=None):
     """Batches whose dense layer-major runs read about ``rounds`` rounds per layer (the F1 fit range)."""
-    from .model import load_model
+    from .models import load_model
     geometry, _ = geometry_for(load_model(model), kv_format, kv_spec=kv_spec, context=context)
     if hasattr(geometry, "layer_row_pages"):
         pages = float(geometry.layer_row_pages(np.array([context])).max())
@@ -523,7 +526,7 @@ def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, cont
                      partition, snapshot_batch, kv_spec=None):
     """The phase A runs and fits of ``calibrate`` (called with the cache lock held)."""
     import shutil
-    from .model import load_model
+    from .models import load_model
 
     def fresh(name):
         target = root / name
@@ -652,8 +655,9 @@ def erase_amp(pages, segment_pages):
 
 def region_pages(model, tensors, slots, prompt, pages_per_block=256, layout="striped_contiguous"):
     """Pages a layer_major wave writes: phase A's layout of H x slots heads at the prompt length, padding included."""
-    from .access import LAYOUTS, Shape
-    from .config import load
+    from .device.config import load
+    from .frontend.kv.layouts import LAYOUTS
+    from .frontend.kv.tensors import Shape
     cfg = load("ocp", pages_per_block=pages_per_block, blocks_per_plane=max(1, 131072 // pages_per_block))
     lay = LAYOUTS[layout](cfg, Shape(model.layers, model.kv_heads * slots, model.head_dim, int(prompt)),
                           tensors=tensors)
@@ -2581,7 +2585,7 @@ def build_parser():
 
 def configure(args):
     """Run configuration from parsed arguments (raises ValueError on bad input)."""
-    from .model import load_gpu, load_model
+    from .models import load_gpu, load_model
     from .system import SystemOptions
     if not args.analytic:
         if args.hours is None:
@@ -2606,7 +2610,7 @@ def configure(args):
                 int(args.free_order[9:])
             except ValueError:
                 raise ValueError(f"Invalid --free-order {args.free_order!r}: use fresh or shuffled:<int>") from None
-    params = json.loads((Path(__file__).resolve().parent / "configs" / "parameters.json").read_text())
+    params = json.loads(PARAMETERS.read_text())
     models = [load_model(name) for name in _list(args.model, name="model")]
     formats = _list(args.kv_format, name="format")
     overrides = {"input": args.input_len, "output": args.output_len, "history": args.history, "calls": args.calls,
@@ -2715,7 +2719,7 @@ def run(directory, **config):
     With ``analytic`` false (no ``--analytic``) every (model, format, workload, ppb, X) is simulated
     (``simulate``) and endurance_timeseries.csv and endurance_segments.csv are written too.
     """
-    from .system import write_table
+    from .util import write_table
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     analytic_mode = config.get("analytic", True)
@@ -2750,7 +2754,7 @@ def _read_share(config, clock, calib):
 
 def _simulation_run(directory, config):
     """Simulate every combination; writes the timeseries and segment CSVs, returns (summary rows, calibrations)."""
-    from .system import write_table
+    from .util import write_table
     rows, calibrations, series, segments = [], [], [], []
     for model, kv_format, workload in itertools.product(config["models"], config["formats"], config["workloads"]):
         clock, geometry, calib = make_clock(config, model, kv_format, workload, directory)

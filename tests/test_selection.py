@@ -9,13 +9,16 @@ from fractions import Fraction
 import numpy as np
 import pytest
 
-from hbf.access import LAYOUTS, Access, Shape, TensorSpec, generate, parse_density, parse_tensors, tensors_meta
-from hbf.analysis import analyze_accesses
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape, TensorSpec, parse_density, parse_tensors, tensors_meta
+from hbf.frontend.trace.synthetic import generate
+from hbf.frontend.trace.tokens import Access
+from hbf.backends.rounds.analysis import analyze_accesses
 from hbf.cli import main
-from hbf.config import load
-from hbf.controller import schedule
-from hbf.formats import parse_format
-from hbf.pages import iter_layer_pages
+from hbf.device.config import load
+from hbf.backends.mqsim.schedule import schedule
+from hbf.frontend.kv.formats import parse_format
+from hbf.backends.rounds.pages import iter_layer_pages
 from tests.reference import analyze
 
 

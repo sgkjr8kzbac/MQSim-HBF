@@ -4,12 +4,13 @@ import json
 import numpy as np
 import pytest
 
-from hbf.access import LAYOUTS, Shape, generate
-from hbf.analysis import analyze_accesses
-from hbf.batch import (BatchRequest, BatchSpec, PageTableLayout, check_write_order, generate_batch,
-                       partition_geometry, place_batch)
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape
+from hbf.frontend.trace.synthetic import generate
+from hbf.backends.rounds.analysis import analyze_accesses
+from hbf.frontend.kv.placement import BatchRequest, BatchSpec, PageTableLayout, check_write_order, generate_batch, partition_geometry, place_batch
 from hbf.cli import main
-from hbf.config import load
+from hbf.device.config import load
 
 HBF_FLAGS = ["--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read", "--analysis-only"]
 
@@ -162,7 +163,7 @@ def test_default_batch_flags_keep_phase_a_outputs(tmp_path):
 def test_windowed_tensors_flush_after_admission():
     # kivi2: the body [0, -128] fills a 2-bit K page (128 tokens) only 128 tokens after the context does.
     cfg = load("ocp")
-    from hbf.formats import parse_format
+    from hbf.frontend.kv.formats import parse_format
     tensors = parse_format("kivi2", 128).tensors
     for allocation in ("packed", "dedicated", "vllm_pool", "layer_major"):
         layout = PageTableLayout(cfg, Shape(1, 2, 128, 1), batch(allocation, [(4000, 128), (3000, 300)]),
@@ -208,7 +209,7 @@ def test_write_check_only_on_request(tmp_path):
 def test_stagger_spreads_short_requests():
     # kivi2 at 2K: one request's layer is 96 HBF pages; with every prompt at bank 0 of a row all eight
     # requests' layer l sit on the same banks (5.3x the minimum rounds); staggering spreads them.
-    from hbf.formats import parse_format
+    from hbf.frontend.kv.formats import parse_format
     cfg = load("ocp")
     rounds = {}
     for align in ("row", "stagger"):
@@ -226,7 +227,7 @@ def test_short_kivi_prompt_and_partial_blocks_in_segments():
     # H5: kivi2 prompt <= residual (0 full HBF pages at admission) and prompt where only some tensors
     # have full pages (e.g. prompt=256 -> K has 1 full page, K_qp has 0); HBM residual clamped when
     # context < residual; partial trailing prompt blocks not wasted as padding.
-    from hbf.formats import parse_format
+    from hbf.frontend.kv.formats import parse_format
     cfg = load("ocp")
     tensors = parse_format("kivi2", 128).tensors
     for allocation in ("packed", "dedicated"):
@@ -385,7 +386,7 @@ def test_k7_shared_prefix_aliasing_and_reads():
 
 
 def test_k7_sliding_age_ladder_and_grouped_presets():
-    from hbf.access import TensorSpec
+    from hbf.frontend.kv.tensors import TensorSpec
     from hbf.kvspec import parse_kvspec
 
     # Age-based re-quantization ladder without kv_spec: int4 (-4096, -128) is short-lived, int2 (0, -4096) long-lived.

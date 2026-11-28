@@ -13,13 +13,13 @@ import pytest
 from hbf.endurance import (METRICS, Clock, ConstantClock, Device, analytic, build_parser, calibrate,
                            calibration_batches, configure, erase_amp, geometry_for, layout_rounds, main, sci,
                            summarize_run, threshold_steps)
-from hbf.model import load_gpu, load_model
-from hbf.workload import Workload, load_workload, parse_length, presets
+from hbf.models import load_gpu, load_model
+from hbf.frontend.trace.requests import Workload, load_workload, parse_length, presets
 # Event simulation (design-B section 4, tests 10-15) and the seeded request stream.
-from hbf.access import TensorSpec
+from hbf.frontend.kv.tensors import TensorSpec
 from hbf.endurance import (CAUSE, GIB, CapacityError, Geometry, SimOptions, VllmTracker, prefill_tok_s, simulate)
-from hbf.interference import interference
-from hbf.workload import Stream, scripted
+from hbf.lifetime.interference import interference
+from hbf.frontend.trace.requests import Stream, scripted
 
 B200 = load_gpu("b200")
 LLAMA8 = load_model("llama-3.1-8b")
@@ -864,11 +864,13 @@ def test_wear_remap_rotates_static_waves():
 def test_k1_formats_demand_matches_phase_a_and_kv_bytes():
     """Geometry.demand uses attended_dims and logical_dims identically to pages.layer_pages;
     kv_bytes_per_token counts HBF bytes only; analytic and simulate work on MLA and fused formats."""
-    from hbf.access import LAYOUTS, Shape, generate
-    from hbf.config import load
-    from hbf.formats import parse_format
-    from hbf.model import ModelSpec
-    from hbf.pages import iter_layer_pages
+    from hbf.frontend.kv.layouts import LAYOUTS
+    from hbf.frontend.kv.tensors import Shape
+    from hbf.frontend.trace.synthetic import generate
+    from hbf.device.config import load
+    from hbf.frontend.kv.formats import parse_format
+    from hbf.models import ModelSpec
+    from hbf.backends.rounds.pages import iter_layer_pages
 
     cfg = load("ocp")
     mla_model = ModelSpec(name="mla-tiny", layers=4, hidden=2048, q_heads=16, kv_heads=1, head_dim=128,

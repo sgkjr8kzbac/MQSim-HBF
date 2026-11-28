@@ -291,7 +291,7 @@ def _protocol_part(cfg, pages, placed, group, protocol, part):
     otherwise the reference scheduler on rebuilt requests."""
     check_protocol(cfg, protocol)
     np = _numpy()
-    from .controller import Request
+    from ..mqsim.schedule import Request
     useful, burst, runs = pages.useful[part], pages.burst[part], pages.runs[part]
     if not len(useful):
         return 0, 0, 0, 0

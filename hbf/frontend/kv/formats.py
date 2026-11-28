@@ -30,7 +30,7 @@ element read: 1 for FP8 and 3 (unpack, scale, shift) for integer formats, both a
 """
 from dataclasses import dataclass, field
 
-from .access import TensorSpec
+from .tensors import TensorSpec
 
 INT_DEQUANT_OPS = 3  # assumption: unpack, multiply by scale, add zero point
 FP8_DEQUANT_OPS = 1  # assumption: one conversion per element

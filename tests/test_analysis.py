@@ -4,12 +4,15 @@ from collections import Counter
 
 import pytest
 
-from hbf.access import Access, LAYOUTS, Shape, TensorSpec, generate
-from hbf.analysis import locate, placement, plane_geometry
+from hbf.frontend.kv.layouts import LAYOUTS
+from hbf.frontend.kv.tensors import Shape, TensorSpec
+from hbf.frontend.trace.synthetic import generate
+from hbf.frontend.trace.tokens import Access
+from hbf.backends.rounds.analysis import locate, placement, plane_geometry
 from tests.reference import analyze, analyze_group
 from hbf.cli import main, pipeline
-from hbf.config import load, parse_topology
-from hbf.controller import Batch, Request, burst_bytes, metrics, schedule
+from hbf.device.config import load, parse_topology
+from hbf.backends.mqsim.schedule import Batch, Request, burst_bytes, metrics, schedule
 
 
 def tiny():
@@ -286,7 +289,7 @@ def test_ocp_topology_runs_in_mqsim(binary, tmp_path):
 
 
 def test_protocol_commands_per_page():
-    from hbf.analysis import Protocol
+    from hbf.backends.rounds.analysis import Protocol
     cfg = load("ocp")
     partial = Request(0, useful_bytes=96, burst_bytes=192, burst_runs=2)
     assert Protocol(256).commands(cfg, partial) == 64  # whole page, 64 B commands (section 5.3.1)
@@ -306,7 +309,7 @@ def test_protocol_commands_per_page():
 def test_credit_rounds_match_hbf_eventlab_probe():
     """HBF-EventLab, ocp geometry, 4 KiB interleave, 64 B reads: 128 pages (lpa 0-127, 8 per host
     channel on 8 banks) took two sensing rounds at MOCS 256 (8.4 us) and one at MOCS 1024 (4.5 us)."""
-    from hbf.analysis import Protocol, protocol_rounds
+    from hbf.backends.rounds.analysis import Protocol, protocol_rounds
     cfg = load("ocp")
     reads = [Request(lpa) for lpa in range(128)]
     assert analyze_group(cfg, reads)["rounds"] == 1
@@ -324,7 +327,7 @@ def test_credit_rounds_against_hbf_eventlab_four_pages_per_bank():
     when its response is delivered), 4 waves (the bank bound) with trigger-first order or MOCS 1024.
     The round model holds credits for a whole round, so under fcfs it is one round pessimistic.
     """
-    from hbf.analysis import Protocol, protocol_rounds
+    from hbf.backends.rounds.analysis import Protocol, protocol_rounds
     cfg = load("ocp")
     reads = [Request(16 * (bank + 64 * k)) for bank in range(8) for k in range(4)]
     assert {cfg.host_channel(req.lpa) for req in reads} == {0} and analyze_group(cfg, reads)["rounds"] == 4
@@ -337,7 +340,7 @@ def test_credit_rounds_against_hbf_eventlab_four_pages_per_bank():
 def test_greedy_credit_schedule_reaches_the_bound(seed):
     """Uniform commands per page: rounds = max(longest bank queue, ceil(pages / ceil(MOCS / c)))."""
     import random
-    from hbf.analysis import Protocol, protocol_rounds
+    from hbf.backends.rounds.analysis import Protocol, protocol_rounds
     rng = random.Random(seed)
     cfg = load("ocp")
     reads = [Request(lpa) for lpa in rng.sample(range(16 * 1024), 3000)]
@@ -358,7 +361,7 @@ def test_greedy_credit_schedule_reaches_the_bound(seed):
 
 
 def test_protocol_columns_in_pipeline(tmp_path):
-    from hbf.analysis import Protocol
+    from hbf.backends.rounds.analysis import Protocol
     cfg = load("ocp")
     pipeline(cfg, Shape(2, 8, 128, 8192), "layer_contiguous", tmp_path / "p", None, mode="uniform_pages",
              generation={"fraction": .05}, plane_groups=(1, 16), protocol=Protocol(256))
@@ -378,7 +381,7 @@ def test_items_larger_than_mocs_start_their_sense_once():
     hits), against 8.31 us (two rounds) at MOCS 256. With MOCS 256, seven pages of 2,560 B (40
     commands each, 280 in all) took one wave of 4.22 us, thirteen took 8.31 us.
     """
-    from hbf.analysis import Protocol, protocol_rounds
+    from hbf.backends.rounds.analysis import Protocol, protocol_rounds
     cfg = load("ocp")
     eight = [Request(16 * bank) for bank in range(8)]
     assert protocol_rounds(cfg, eight, 1, None, Protocol(1))[:2] == (8, 8)
@@ -397,7 +400,7 @@ def test_lock_step_group_sense_is_an_explicit_assumption():
     ``arrived`` senses only those four, so the offset is sensed four times; ``whole`` senses the
     whole group at the first command, and then a trigger host needs one command per offset.
     """
-    from hbf.analysis import Protocol, protocol_rounds
+    from hbf.backends.rounds.analysis import Protocol, protocol_rounds
     cfg = load("ocp")
     die0 = [Request(16 * bank) for bank in range(16)]  # host channel 0, die 0, banks 0-15, offset 0
     rounds = {(sense, order, mocs): protocol_rounds(cfg, die0, 16, None, Protocol(mocs, host_order=order,
@@ -419,7 +422,7 @@ def test_lock_step_group_sense_is_an_explicit_assumption():
 @pytest.mark.parametrize("seed", range(5))
 def test_credit_bound_never_exceeds_rounds(seed):
     import random
-    from hbf.analysis import Protocol, protocol_rounds
+    from hbf.backends.rounds.analysis import Protocol, protocol_rounds
     rng = random.Random(seed)
     cfg = load("ocp")
     reads = []
@@ -435,7 +438,7 @@ def test_credit_bound_never_exceeds_rounds(seed):
 
 
 def test_cwdp_topologies_keep_sixteen_host_channels():
-    from hbf.analysis import Protocol, protocol_rounds
+    from hbf.backends.rounds.analysis import Protocol, protocol_rounds
     for topology in ("16x64", "64x16", "256x4"):
         cfg = load(topology)
         assert cfg.host_channels == 16 and {cfg.host_channel(lpa) for lpa in range(64)} == set(range(16))
@@ -447,9 +450,9 @@ def test_cwdp_topologies_keep_sixteen_host_channels():
 
 def test_link_bound_follows_ucie_grade():
     """A dense round of 64 pages per host channel moves 256 KiB: 5.46 us at grade 1 (48 GB/s)."""
-    from hbf.analysis import Protocol, analyze_accesses, _protocol_part, protocol_rounds
+    from hbf.backends.rounds.analysis import Protocol, analyze_accesses, _protocol_part, protocol_rounds
     from hbf.cli import build_parser, configure, topology_name
-    from hbf.pages import iter_layer_pages, place
+    from hbf.backends.rounds.pages import iter_layer_pages, place
     cfg8 = load("ocp-8ch")
     assert (cfg8.channels, cfg8.chips, cfg8.planes, cfg8.units, cfg8.host_channels, cfg8.aggregate_gb_s,
             cfg8.width) == (16, 2, 16, 512, 8, 512, 32)
@@ -534,8 +537,8 @@ def test_per_page_estimate_is_withheld_for_multi_plane_dies(tmp_path):
 
 
 def test_generator_and_cli_edge_cases(tmp_path, monkeypatch):
-    from hbf.access import share
-    from hbf.controller import prefill_batches
+    from hbf.frontend.trace.synthetic import share
+    from hbf.backends.mqsim.schedule import prefill_batches
     assert share(100, .07) == 7 and share(100, .071) == 8 and share(3, 1) == 3
     cfg = load("ocp")
     shape = Shape(1, 1, 128, 1600)
@@ -586,7 +589,7 @@ def test_core_channel_bound_follows_bandwidth():
 
 def test_topology_preset_may_override_device_fields(tmp_path, monkeypatch):
     import json
-    from hbf import config as cfg_mod
+    from hbf.device import config as cfg_mod
     params = json.loads(cfg_mod.PARAMETERS.read_text())
     params["topologies"]["half"] = {"channels": 16, "chips": 2, "planes": 16, "address_map": "ocp",
                                     "plane_rule": "independent", "aggregate_gb_s": 512}
@@ -599,7 +602,7 @@ def test_topology_preset_may_override_device_fields(tmp_path, monkeypatch):
 
 
 def test_unwritten_reads_resets_block_on_page_zero_write():
-    from hbf.controller import unwritten_reads
+    from hbf.backends.mqsim.schedule import unwritten_reads
     cfg = load("ocp", pages_per_block=4)
     block0 = [cfg.unit_lpa(0, p) for p in range(4)]
     other = [cfg.unit_lpa(1, p) for p in range(4)]

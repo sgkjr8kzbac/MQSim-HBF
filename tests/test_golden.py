@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from hbf.access import Shape, TensorSpec
-from hbf.analysis import Protocol
+from hbf.frontend.kv.tensors import Shape, TensorSpec
+from hbf.backends.rounds.analysis import Protocol
 from hbf.cli import pipeline
-from hbf.config import load
+from hbf.device.config import load
 
 GOLDEN = Path(__file__).parent / "golden"
 FILES = ("analysis_layers.csv", "analysis_steps.csv", "report.md")

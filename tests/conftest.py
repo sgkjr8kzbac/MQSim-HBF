@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from hbf.simulator import build
+from hbf.backends.mqsim.build import build
 
 
 def pytest_addoption(parser):

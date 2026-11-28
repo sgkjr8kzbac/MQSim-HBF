@@ -5,10 +5,17 @@ from math import prod
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-PACKAGE = Path(__file__).resolve().parent
+PACKAGE = Path(__file__).resolve().parents[1]
 ROOT = PACKAGE.parent
-CONFIG = PACKAGE / "configs"
-PARAMETERS = CONFIG / "parameters.json"
+CONFIG_DIR = CONFIG = PACKAGE / "configs"
+PARAMETERS = CONFIG_DIR / "parameters.json"
+MODELS_JSON = CONFIG_DIR / "models.json"
+GPUS_JSON = CONFIG_DIR / "gpus.json"
+WORKLOADS_JSON = CONFIG_DIR / "workloads.json"
+MQSIM_SOURCE = PACKAGE / "mqsim"
+MQSIM_MANIFEST = PACKAGE / "mqsim.sha256"
+MQSIM_COMMIT = PACKAGE / "mqsim.commit"
+PATCHES_DIR = PACKAGE / "patches"
 MAX_BATCH_PAGES = 8192
 DEFAULT_READ_COMMAND_NS = 290
 DEFAULT_DBSY_NS = 500

@@ -6,13 +6,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from .access import (LAYOUTS, MODES, Shape, default_tensors, generate, parse_density, parse_tensors, read_access,
-                     tensors_meta, write_access)
-from .analysis import (GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group,
-                       check_protocol, plane_geometry, summarize)
-from .config import MAX_BATCH_PAGES, load
-from .controller import schedule_run, unwritten_reads
-from .simulator import build, dump, simulate, write_table
+from .backends.mqsim.build import build
+from .backends.mqsim.run import simulate
+from .backends.mqsim.schedule import schedule_run, unwritten_reads
+from .backends.rounds.analysis import (GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group,
+                                       check_protocol, plane_geometry, summarize)
+from .device.config import MAX_BATCH_PAGES, load
+from .frontend.kv.layouts import LAYOUTS
+from .frontend.kv.tensors import Shape, default_tensors, parse_density, parse_tensors, tensors_meta
+from .frontend.trace.synthetic import MODES, generate
+from .frontend.trace.tokens import read_access, write_access
+from .util import dump, write_table
 
 
 def fixed(value, digits):
@@ -36,7 +40,7 @@ def protocol_report(step_rows, protocol):
 
 
 def timing_report(cfg, step_rows, plane_groups=(1,), protocol=None):
-    from .timing import HBF_COMMAND_MODEL, hbf_command_model
+    from .backends.rounds.timing import HBF_COMMAND_MODEL, hbf_command_model
     report = ["## 读时间估计", "",
               f"tR = {cfg.read_ns} ns，每页传输 {cfg.transfer_ns} ns。理想下界：有效轮数 × tR、最忙核心通道的传输、"
               "最忙主机链路三者取大，不计命令开销，感测与传输完全重叠。估算：按核心通道逐轮累加命令、感测、R/B 和"
@@ -198,7 +202,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                 generation["channel_groups"] = list(kv_format.channel_groups)
             if "channels" not in generation and kv_format.channel_select_channels is not None:
                 generation["channels"] = kv_format.channel_select_channels
-    from .batch import BatchSpec, PageTableLayout, check_write_order, generate_batch, place_batch
+    from .frontend.kv.placement import BatchSpec, PageTableLayout, check_write_order, generate_batch, place_batch
     placed = isinstance(requests, BatchSpec) and not requests.default
     has_selection_realism = (generation.get("select_static") or generation.get("reuse", 0)
                              or generation.get("query_groups", 1) != 1 or generation.get("full_tensors")
@@ -315,7 +319,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     if write_check is not None:
         report += write_check_report(cfg, requests, write_check) + [""]
     if system is not None:
-        from .system import evaluate, report_lines, write_table as write_system_table
+        from .system import evaluate, report_lines
+        from .util import write_table as write_system_table
         rows = [row for row in layer_rows if row["group"] == 1] if 1 in plane_groups else []
         if not rows:
             raise ValueError("The system model needs plane group 1 (independent planes) in --plane-group")
@@ -492,7 +497,7 @@ def build_parser():
 
 def batch_spec(args, per_stack):
     """The BatchSpec of the placement flags, or None for phase A's plain --batch emulation."""
-    from .batch import BatchRequest, BatchSpec
+    from .frontend.kv.placement import BatchRequest, BatchSpec
 
     def values(text, name):
         try:
@@ -526,7 +531,7 @@ def configure(args):
                **{key: value for key, value in given.items() if value is not None})
     model = None
     if args.model is not None:
-        from .model import load_model
+        from .models import load_model
         model = load_model(args.model)
     def given(value, from_model, default):
         return value if value is not None else from_model if model else default
@@ -540,7 +545,7 @@ def configure(args):
         from .kvspec import resolve_format
         kv_format = resolve_format(model, args.kv_format)
     elif args.kv_format is not None:
-        from .formats import parse_format
+        from .frontend.kv.formats import parse_format
         kv_format = parse_format(args.kv_format, head_dim)
     tensors = kv_format.tensors if kv_format else parse_tensors(args.tensors)
     density = parse_density(args.density)
@@ -598,7 +603,7 @@ def configure(args):
         raise ValueError("--gpu, --overlap, --kv-consume and --selection need --model")
     system = None
     if model is not None:
-        from .model import load_gpu
+        from .models import load_gpu
         from .system import SystemOptions
         if (layers, heads, head_dim) != (model.layers, model.kv_heads, model.head_dim):
             raise ValueError(f"--model {model.name} has {model.layers} layers, {model.kv_heads} KV heads and "

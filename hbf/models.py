@@ -4,9 +4,7 @@ import math
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-CONFIGS = Path(__file__).resolve().parent / "configs"
-MODELS = CONFIGS / "models.json"
-GPUS = CONFIGS / "gpus.json"
+from .device.config import CONFIG_DIR as CONFIGS, GPUS_JSON as GPUS, MODELS_JSON as MODELS
 
 
 def _positive_int(value):

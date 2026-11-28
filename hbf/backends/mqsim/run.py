@@ -1,136 +1,18 @@
-"""Pinned build, trace validation, simulation, completion joins and artifacts."""
-import csv
-import fcntl
-import hashlib
-import json
+"""Run MQSim with trace validation, GC-budget guard, completion joins, and artifacts."""
 import os
-import shutil
 import signal
 import subprocess
 import threading
 import time
 from collections import defaultdict
 from contextlib import suppress
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from xml.etree import ElementTree as ET
+from dataclasses import asdict
 
-from .config import PACKAGE, ROOT, device_xml, workload_xml
-from .controller import metrics, unwritten_reads
-
-PIN = (PACKAGE / "mqsim.commit").read_text().strip()
-MQSIM_SOURCE = PACKAGE / "mqsim"
-MQSIM_MANIFEST = PACKAGE / "mqsim.sha256"
-
-
-def dump(path, value):
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
-
-
-def write_table(path, rows):
-    if not rows:
-        return
-    with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def patch_series():
-    """Patches in the order of patches/series; every patch file must be listed exactly once."""
-    directory = PACKAGE / "patches"
-    names = [line.strip() for line in (directory / "series").read_text().splitlines()
-             if line.strip() and not line.startswith("#")]
-    if sorted(names) != sorted(p.name for p in directory.glob("*.patch")) or len(set(names)) != len(names):
-        raise ValueError("patches/series must list every patch file exactly once")
-    return [directory / name for name in names]
-
-
-def build(cache=None):
-    cache = Path(cache or Path.cwd() / ".build").resolve()
-    patches = patch_series()
-    manifest = MQSIM_MANIFEST.read_bytes()
-    source_files = []
-    for line in manifest.decode().splitlines():
-        expected, relative_path = line.split("  ", 1)
-        upstream_file = MQSIM_SOURCE / relative_path
-        if not upstream_file.is_file() or sha256(upstream_file) != expected:
-            raise ValueError(f"Pinned MQSim source integrity check failed: {relative_path}")
-        source_files.append(relative_path)
-    build_inputs = manifest + (PIN + "".join(map(sha256, patches))).encode()
-    digest = hashlib.sha256(build_inputs).hexdigest()[:16]
-    source = cache / digest
-    binary = source / "MQSim"
-    ready = source / ".built"
-    if binary.is_file() and ready.is_file():
-        return binary
-    cache.mkdir(parents=True, exist_ok=True)
-    with (cache / "build.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if binary.is_file() and ready.is_file():
-            return binary
-        if source.exists():
-            shutil.rmtree(source)
-        source.mkdir()
-        for relative_path in source_files:
-            target = source / relative_path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(MQSIM_SOURCE / relative_path, target)
-        with (source / "build.log").open("w") as log:
-            subprocess.run(["git", "apply", *map(str, patches)], cwd=source, check=True, stdout=log, stderr=log,
-                           env={**os.environ, "GIT_CEILING_DIRECTORIES": str(cache)})
-            subprocess.run(["make", "-j", str(min(8, os.cpu_count() or 1))], cwd=source,
-                           check=True, stdout=log, stderr=log)
-        ready.touch()
-    return binary
-
-
-@dataclass(frozen=True)
-class Completion:
-    arrival_ns: int
-    enqueue_ns: int
-    complete_ns: int
-    start_lba: int
-    lba_count: int
-    op: str
-
-
-def completions(path):
-    with path.open(newline="") as stream:
-        for arrival, enqueue, done, lba, size, op in csv.reader(stream):
-            yield Completion(int(arrival), int(enqueue), int(done), int(lba), int(size), op)
-
-
-def flash_stats(path):
-    tree = ET.parse(path)
-    ftl = tree.find(".//SSDDevice.FTL")
-    if ftl is None:
-        raise ValueError("MQSim output is missing FTL statistics")
-    stats = {key: int(val) for key, val in ftl.attrib.items() if key.startswith("Issued_Flash")}
-    stats["request_count"] = int(tree.findtext(".//Request_Count"))
-    stats["gc_enqueued"] = sum(
-        int(el.get("No_Of_Transactions_Enqueued"))
-        for el in tree.iter() if ".GC_" in el.tag and el.get("No_Of_Transactions_Enqueued") is not None
-    )
-    return stats
-
-
-def version(patches):
-    rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True)
-    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
-                            cwd=ROOT, capture_output=True, text=True)
-    return {"mqsim_commit": PIN, "repository_commit": rev.stdout.strip() or None,
-            "working_tree_modified": bool(status.stdout.strip()), "patches_enabled": patches,
-            "patch_sha256": {p.name: sha256(p) for p in sorted((PACKAGE / "patches").glob("*.patch"))}}
-
+from ...device.config import device_xml, workload_xml
+from ...util import dump, write_table
+from .build import sha256, version
+from .parse import aggregate, completions, flash_stats
+from .schedule import metrics, unwritten_reads
 
 GNU_TIME = "/usr/bin/time"
 
@@ -153,8 +35,6 @@ def run_timed(command, directory, env, timeout):
         terminated = True
         stop_group()
 
-    # Python installs signal handlers only on the main thread. Keep the caller's
-    # disposition and restore it before delivering SIGTERM after cleanup.
     previous = None
     if threading.current_thread() is threading.main_thread():
         previous = signal.getsignal(signal.SIGTERM)
@@ -186,12 +66,7 @@ def run_timed(command, directory, env, timeout):
 
 
 def check_gc_budget(cfg, batches):
-    """Reject runs whose fresh page allocations could reach MQSim's GC threshold.
-
-    Every write and every first read of an LPA (online_create_entry_for_reads) consumes one
-    free physical page on its plane. Upstream MQSim livelocks instead of finishing once the
-    free block pool falls below the GC threshold with only fully valid blocks.
-    """
+    """Reject runs whose fresh page allocations could reach MQSim's GC threshold."""
     seen, used = set(), [0] * cfg.units
     for batch in batches:
         for req in batch.requests:
@@ -224,8 +99,6 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     check_gc_budget(cfg, batches)
     unwritten = unwritten_reads(cfg, batches)
     if unwritten and cfg.planes > 1 and not allow_unwritten:
-        # One plane per chip makes the offset irrelevant; with multi-plane commands MQSim's first-read
-        # allocation would put the pages at offsets the OCP spec does not allow (Table 12, error 0x7).
         raise ValueError(f"{unwritten} reads of pages that were never written; the OCP spec answers them "
                          "with error 0x7 and MQSim would place them at first-read offsets. Use --prefill "
                          "(device-level probes that only time commands may pass allow_unwritten=True)")
@@ -268,7 +141,6 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     stats.update(wall_seconds=elapsed, peak_rss_kib=int((directory / "rss_kib.txt").read_text()),
                  unwritten_reads=unwritten)
     dump(directory / "statistics.json", stats)
-    # A multi-plane command serves 2..planes pages; MQSim counts commands, not pages, for it.
     multi = cfg.planes > 1
     read_cmds = stats["Issued_Flash_Read_CMD"] + stats["Issued_Flash_Multiplane_Read_CMD"]
     program_cmds = stats["Issued_Flash_Program_CMD"] + stats["Issued_Flash_Multiplane_Program_CMD"]
@@ -312,25 +184,3 @@ def simulate(cfg, batches, directory, binary, *, physical=False, suspension=Fals
     write_table(directory / "layers.csv", layers)
     write_table(directory / "steps.csv", steps)
     return rows, layers, steps, stats
-
-
-def aggregate(cfg, group, keys):
-    result = {**keys, "mqsim_ns": sum(row["mqsim_ns"] for _, row in group),
-              **metrics(cfg, (req for batch, _ in group for req in batch.requests))}
-    result["mq_est_unsplit_ns"] = result["mq_est_ns"]
-    result["ideal_unsplit_ns"] = result["ideal_ns"]
-    estimates = [row["mq_est_ns"] for _, row in group]
-    result["mq_est_ns"] = None if None in estimates else sum(estimates)
-    result["ideal_ns"] = sum(row["ideal_ns"] for _, row in group)
-    result["estimate_gap_ns"] = None if result["mq_est_ns"] is None else result["mq_est_ns"] - result["ideal_ns"]
-    result["mqsim_over_est"] = result["mqsim_ns"] / result["mq_est_ns"] if result["mq_est_ns"] else None
-    if "layer" not in keys:
-        # Each layer runs serially in the reconstructed step. Keep unsplit bounds additive.
-        layers = defaultdict(list)
-        for batch, row in group:
-            layers[batch.layer].append((batch, row))
-        per_layer = [metrics(cfg, (req for batch, _ in items for req in batch.requests)) for items in layers.values()]
-        estimates = [layer["mq_est_ns"] for layer in per_layer]
-        result["mq_est_unsplit_ns"] = None if None in estimates else sum(estimates)
-        result["ideal_unsplit_ns"] = sum(layer["ideal_ns"] for layer in per_layer)
-    return result

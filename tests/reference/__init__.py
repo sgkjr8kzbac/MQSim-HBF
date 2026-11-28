@@ -5,8 +5,7 @@ Kept under tests/ as an independent oracle for the vectorised numpy engine in ``
 from collections import Counter, defaultdict
 from math import ceil
 
-from hbf.analysis import (check_group, check_protocol, locate, placement, plane_geometry,
-                          protocol_rounds, summarize)
+from hbf.backends.rounds.analysis import check_group, check_protocol, locate, placement, plane_geometry, protocol_rounds, summarize
 
 PLACEMENTS = ("static", "mqsim")
 

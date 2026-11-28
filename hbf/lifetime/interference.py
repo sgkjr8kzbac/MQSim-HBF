@@ -47,7 +47,7 @@ import numpy as np
 
 MODES = ("fifo", "gaps", "suspend", "random", "correlated")
 BLOCK_UNITS = ("die", "bank")
-PARAMETERS = Path(__file__).resolve().parent / "configs" / "parameters.json"
+from ..device.config import PARAMETERS
 
 
 def blocking_units(dies=64, banks_per_die=16, block_unit="die"):
@@ -216,7 +216,7 @@ def hbf_gaps(h, pre, attn, post, overlap="serial", staged=False, tail_ns=0.0):
     ``tail_ns`` is time after the last layer (lm_head, layer overheads); it is idle for HBF and
     is added to layer 0's gap (the wrap-around to the next step). The gaps sum to TPOT - sum(h).
     """
-    from .system import parse_overlap
+    from ..util import parse_overlap
     mode, depth = parse_overlap(overlap)
     layers = len(h)
     if not layers:
