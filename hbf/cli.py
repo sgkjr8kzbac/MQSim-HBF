@@ -312,15 +312,16 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     if write_check is not None:
         report += write_check_report(cfg, requests, write_check) + [""]
     if system is not None:
-        from .system import evaluate, report_lines
+        from .registry import REGISTRY
         from .util import write_table as write_system_table
+        ev = REGISTRY.get_evaluator("system", required=True)
         rows = [row for row in layer_rows if row["group"] == 1] if 1 in plane_groups else []
         if not rows:
             raise ValueError("The system model needs plane group 1 (independent planes) in --plane-group")
-        outcome = evaluate(rows, system["model"], system["gpu"], system["options"], system_meta)
+        outcome = ev.evaluate(rows, system["model"], system["gpu"], system["options"], system_meta)
         write_system_table(directory / "system_layers.csv", outcome.layers)
         write_system_table(directory / "system_steps.csv", outcome.steps)
-        report += report_lines(outcome) + [""]
+        report += ev.report_lines(outcome) + [""]
         if fmt and fmt.notes:
             report += ["KV 格式假设：", ""] + [f"- {note}" for note in fmt.notes] + [""]
     if kv_spec is not None:
@@ -600,24 +601,27 @@ def configure(args):
         raise ValueError("--gpu, --overlap, --kv-consume and --selection need --model")
     system = None
     if model is not None:
-        from .models import load_gpu
-        from .system import SystemOptions
+        from .registry import REGISTRY
         if (layers, heads, head_dim) != (model.layers, model.kv_heads, model.head_dim):
             raise ValueError(f"--model {model.name} has {model.layers} layers, {model.kv_heads} KV heads and "
                              f"head_dim {model.head_dim}; do not override them")
-        selection = args.selection
-        if selection == "auto":
-            selection = ("static" if args.access_csv is None
-                         and (args.mode in ("dense", "sink_recent") or args.select_static) else "dynamic")
-        options = SystemOptions(overlap=args.overlap, kv_consume=args.kv_consume)
-        if options.mode == "prefetch" and selection != "static":
-            raise ValueError("Prefetching the next layer's KV needs a static selection (dense or sink_recent, "
-                             "or --selection static)")
-        if 1 not in (args.plane_groups or (1,)):
-            raise ValueError("The system model needs plane group 1 (independent planes) in --plane-group")
-        system = {"model": model, "gpu": load_gpu(args.gpu or "b200"), "options": options, "batch": args.batch,
-                  "stacks": args.stacks, "analysis_batch": per_stack, "selection": selection,
-                  "kv_format": kv_format, "heads": heads}
+        explicit_sys = (args.gpu is not None or args.overlap != "serial"
+                        or args.kv_consume != "stream" or args.selection != "auto")
+        ev = REGISTRY.get_evaluator("system", required=explicit_sys)
+        if ev is not None:
+            selection = args.selection
+            if selection == "auto":
+                selection = ("static" if args.access_csv is None
+                             and (args.mode in ("dense", "sink_recent") or args.select_static) else "dynamic")
+            options = ev.SystemOptions(overlap=args.overlap, kv_consume=args.kv_consume)
+            if options.mode == "prefetch" and selection != "static":
+                raise ValueError("Prefetching the next layer's KV needs a static selection (dense or sink_recent, "
+                                 "or --selection static)")
+            if 1 not in (args.plane_groups or (1,)):
+                raise ValueError("The system model needs plane group 1 (independent planes) in --plane-group")
+            system = {"model": model, "gpu": ev.load_gpu(args.gpu or "b200"), "options": options, "batch": args.batch,
+                      "stacks": args.stacks, "analysis_batch": per_stack, "selection": selection,
+                      "kv_format": kv_format, "heads": heads}
     if tensors is not None and any(spec.density != 1 for spec in tensors):
         if args.prefill or not args.analysis_only or args.mode == "write_then_read" or args.check_writes:
             raise ValueError("Tensor density < 1 requires --analysis-only with no writes or --check-writes")
@@ -714,6 +718,8 @@ def _main_run(argv, *, force_mqsim=False):
 
 
 def main(argv=None):
+    from .registry import ensure_loaded
+    ensure_loaded()
     tokens = list(sys.argv[1:] if argv is None else argv)
     if not tokens or tokens[0] in ("-h", "--help"):
         build_parser().parse_args(tokens)
@@ -730,8 +736,12 @@ def main(argv=None):
         from .lifetime.cli import main as lifetime_main
         return lifetime_main(rest)
     if command == "system":
-        from .system import main as system_main
-        return system_main(rest)
+        from .registry import REGISTRY
+        try:
+            ev = REGISTRY.get_evaluator("system", required=True)
+        except ValueError as error:
+            build_parser().error(str(error))
+        return ev.main(rest)
     if command == "interference":
         from .lifetime.interference import main as interference_main
         return interference_main(rest)

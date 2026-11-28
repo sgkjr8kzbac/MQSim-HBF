@@ -445,7 +445,7 @@ def resolved_lifetime_config(config):
             "stagger": config["stagger"],
         },
         "ext": {
-            "system": {
+            "system": None if config.get("options") is None else {
                 "gpu": config["gpu_name"],
                 "overlap": config["options"].overlap,
                 "kv_consume": config["options"].kv_consume,

@@ -39,6 +39,7 @@ class SimOptions:
     reclaim: str = "evict"  # or compact: idle entries in a reclaim victim are copied too
     victim: str = "greedy"  # greedy (fewest pages to copy) or cost_benefit ((1 - u) * age / (1 + u))
     prefill: str = "disaggregated"  # disaggregated or colocated (adds input / prefill_tok_s per admission)
+    prefill_rate: float | None = None  # optional explicit prefill tok/s (core, no GPU required)
     pre_open: bool = False  # pre-open free segments in idle time (takes non-replay erases off M5)
     separate_prefix: bool = False  # keep shared prefixes on their own write frontier per partition
     low_watermark: int | None = None  # free segments per partition kept by reclaim (default 2 + one request)

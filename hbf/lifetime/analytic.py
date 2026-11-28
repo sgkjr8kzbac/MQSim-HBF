@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 
-from .geometry import (CAUSES, DAY, GIB, POLICIES, Device, erase_amp, prefill_tok_s,
+from .geometry import (CAUSES, DAY, GIB, POLICIES, Device, erase_amp,
                        region_pages, sci, threshold_steps)
 from .interference import MODES as M5_MODES, hbf_gaps, interference
 

@@ -222,21 +222,16 @@ class Device:
         return self.segment_banks * self.pages_per_block
 
 
-def prefill_tok_s(model, gpu, tokens):
-    """Analytic prefill rate: FLOP/token = 2P + attn_flops(S) at the GPU's compute_eff (params.md section 6)."""
-    s = max(tokens, 1)
-    if not model.experts and not model.layer_pattern and model.attention == "gqa":
-        params = model.layers * model.layer_params + model.embedding_params
-        return gpu.flops / (2 * params + 2 * model.layers * model.q_heads * model.head_dim * s)
-    params = model.active_params if model.experts else model.total_params
-    attn_per_tok = 0
-    for layer in range(model.layers):
-        kind = model.layer_kind(layer)
-        if kind == "S":
-            continue
-        span = min(s, model.window) if kind == "L" else s
-        attn_per_tok += model.q_heads * model.default_attn_dims * span
-    return gpu.flops / (2 * params + attn_per_tok)
+def resolve_prefill_tok_s(model, gpu, tokens, *, prefill_rate=None):
+    """Prefill throughput (tok/s): explicit ``prefill_rate`` (float or callable) or registered GPU hook."""
+    if prefill_rate is not None:
+        rate = prefill_rate(tokens) if callable(prefill_rate) else prefill_rate
+        if rate <= 0:
+            raise ValueError("prefill_rate must be positive")
+        return float(rate)
+    from ..registry import REGISTRY
+    fn = REGISTRY.get_prefill_rate("gpu_roofline", required=True)
+    return fn(model, gpu, tokens)
 
 
 def threshold_steps(x, ppb, share=1.0, hot=1.0):

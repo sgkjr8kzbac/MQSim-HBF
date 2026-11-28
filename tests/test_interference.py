@@ -6,7 +6,7 @@ import math
 import pytest
 
 from hbf.lifetime.interference import hbf_gaps, interference, main, pack, residual_max, retime, unit_ops
-from hbf.system import timeline
+from hbf.ext.system import timeline
 
 T_PROG, T_BERS = 100_000, 1_000_000
 G = 7_864.32 + 60_293.12  # pre + post of Llama-3.1-8B at B = 8 on B200 (design-B section 5.4)

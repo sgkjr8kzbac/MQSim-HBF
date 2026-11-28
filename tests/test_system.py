@@ -5,8 +5,9 @@ import json
 import numpy as np
 import pytest
 
-from hbf.models import GPUS, MODELS, GpuSpec, ModelSpec, experts_touched, load_gpu, load_model, presets
-from hbf.system import SystemOptions, evaluate, linear_ns, main, parse_overlap, read_layers, timeline
+from hbf.models import MODELS, ModelSpec, experts_touched, load_model, presets
+from hbf.ext.system import (GPUS, GpuSpec, SystemOptions, evaluate, linear_ns, load_gpu, main,
+                            parse_overlap, read_layers, timeline)
 
 LLAMA = load_model("llama-3.1-8b")
 META = {"batch": 1, "stacks": 1, "selection": "static", "kv_format": "bf16"}

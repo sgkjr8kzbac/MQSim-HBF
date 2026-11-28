@@ -14,7 +14,7 @@ from ..device.config import PARAMETERS
 from ..frontend.trace.requests import load_workload, per_stack, presets as workload_presets
 from ..util import write_table
 from .analytic import analytic
-from .clock import Clock, ConstantClock, calibrate, layout_rounds
+from .clock import ConstantClock, ReadTimeClock, calibrate, layout_rounds
 from .geometry import CAUSES, PARTITIONS, POLICIES, Device, geometry_for, sci
 from .interference import MODES as M5_MODES
 from .report import report_lines, sim_report_lines
@@ -51,7 +51,8 @@ def build_parser():
     parser.add_argument("--analytic", action="store_true",
                         help="closed-form steady state instead of the event simulation (which needs --hours)")
     parser.add_argument("--model", default="llama-3.1-8b", help="model preset(s), comma separated")
-    parser.add_argument("--gpu", default="b200", help="GPU preset (hbf/configs/gpus.json) or JSON")
+    parser.add_argument("--gpu", default=None,
+                        help="GPU preset (hbf.ext.system; default b200 when ext/system is loaded)")
     parser.add_argument("--format", dest="kv_format", default="bf16",
                         help="KV format(s), comma separated (hbf/formats.py presets, e.g. bf16,fp8,kivi2)")
     parser.add_argument("--kv-spec",
@@ -172,8 +173,10 @@ def build_parser():
 
 def configure(args):
     """Run configuration from parsed arguments (raises ValueError on bad input)."""
-    from ..models import load_gpu, load_model
-    from ..system import SystemOptions
+    from ..models import load_model
+    from ..registry import REGISTRY
+    explicit_sys = args.gpu is not None or args.overlap != "serial" or args.kv_consume != "stream"
+    sys_ev = REGISTRY.get_evaluator("system", required=explicit_sys)
     if not args.analytic:
         if args.hours is None:
             raise ValueError("The event simulation needs --hours (simulated time); use --analytic for the "
@@ -240,7 +243,10 @@ def configure(args):
     if args.mode != "dense":
         generation = {"fraction": args.fraction, "select_tokens": args.select_tokens, "count": args.count,
                       "seed": args.seed}
-    return {"models": models, "gpu": load_gpu(args.gpu), "gpu_name": args.gpu, "formats": formats,
+    gpu_name = (args.gpu or "b200") if sys_ev is not None else None
+    gpu_spec = sys_ev.load_gpu(gpu_name) if sys_ev is not None else None
+    sys_opts = sys_ev.SystemOptions(overlap=args.overlap, kv_consume=args.kv_consume) if sys_ev is not None else None
+    return {"models": models, "gpu": gpu_spec, "gpu_name": gpu_name, "formats": formats,
             "kv_spec": args.kv_spec,
             "mode": args.mode, "generation": generation, "policy": args.alloc, "partition": args.partition,
             "workloads": workloads, "pages_per_block": ppbs, "x_values": xs, "pe_limits": limits,
@@ -249,7 +255,7 @@ def configure(args):
             "prefix_reads": args.prefix_reads, "capacity_gib": args.capacity_gib, "stacks": args.stacks,
             "read_ns": args.read_ns or params["read_ns"], "device_flags": device_flags,
             "t_prog": args.program_ns or params["program_ns"], "t_bers": args.erase_ns or params["erase_ns"],
-            "options": SystemOptions(overlap=args.overlap, kv_consume=args.kv_consume), "m5": args.m5,
+            "options": sys_opts, "m5": args.m5,
             "suspend_ns": args.suspend_ns, "block_unit": args.block_unit, "calibrate": not args.no_calibrate,
             "calibration_dir": args.calibration_dir, "calib_context": args.calib_context,
             "analytic": args.analytic, "hours": args.hours, "warmup_h": args.warmup_h, "wear": args.wear,
@@ -279,24 +285,40 @@ def snapshot_batch(workload, stacks):
 
 
 def make_clock(config, model, kv_format, workload, directory):
-    """Clock for one (model, format, workload): calibrated against phase A, or the F1 constants."""
+    """Clock for one (model, format, workload): TPOT clock when ext/system is loaded, else ReadTimeClock."""
+    from ..registry import REGISTRY
     kv_spec = config.get("kv_spec")
     ctx = _calib_context(workload, config.get("calib_context"))
     geometry, fmt = geometry_for(model, kv_format, kv_spec=kv_spec, context=ctx)
+    use_tpot = config.get("gpu") is not None
     selection = "static" if config["mode"] in ("dense", "sink_recent") else "dynamic"
-    base = {"read_ns": config["read_ns"], "stacks": config["stacks"], "selection": selection,
-            "kv_format": fmt.name, "options": config["options"]}
     if not config["calibrate"]:
         rounds_fn = (layout_rounds(model, kv_format)
                      if config["policy"] == "layer_major" and not hasattr(geometry, "spec") else None)
-        return Clock(model, config["gpu"], geometry, rounds_fn=rounds_fn, **base), geometry, None
+        if use_tpot:
+            tpot_cls = REGISTRY.get_clock("tpot")
+            return tpot_cls(model, config["gpu"], geometry, rounds_fn=rounds_fn,
+                            read_ns=config["read_ns"], stacks=config["stacks"], selection=selection,
+                            kv_format=fmt.name, options=config["options"]), geometry, None
+        rt_cls = REGISTRY.get_clock("read_time")
+        return rt_cls(geometry, model.layers, rounds_fn=rounds_fn,
+                      read_ns=config["read_ns"], stacks=config["stacks"]), geometry, None
     cache = config["calibration_dir"] or Path(directory) / "calibration"
     calib = calibrate(cache, model.name, config["gpu_name"], kv_format, mode=config["mode"],
                       generation=config["generation"], context=ctx,
                       device=config["device_flags"], policy=config["policy"], partition=config["partition"],
                       snapshot_batch=snapshot_batch(workload, config["stacks"]), kv_spec=kv_spec)
-    clock = Clock(model, config["gpu"], geometry, layer_ns=calib["layer_ns"], round_ns=calib["round_ns"],
-                  balance=calib["balance"], ratios=calib["ratios"], **base)
+    if use_tpot:
+        tpot_cls = REGISTRY.get_clock("tpot")
+        clock = tpot_cls(model, config["gpu"], geometry, layer_ns=calib["layer_ns"], round_ns=calib["round_ns"],
+                         balance=calib["balance"], ratios=calib["ratios"],
+                         read_ns=config["read_ns"], stacks=config["stacks"], selection=selection,
+                         kv_format=fmt.name, options=config["options"])
+    else:
+        rt_cls = REGISTRY.get_clock("read_time")
+        clock = rt_cls(geometry, model.layers, layer_ns=calib["layer_ns"], round_ns=calib["round_ns"],
+                       balance=calib["balance"], ratios=calib["ratios"],
+                       read_ns=config["read_ns"], stacks=config["stacks"])
     return clock, geometry, calib
 
 
@@ -324,7 +346,8 @@ def run(directory, **config):
     meta |= {"models": [model.name for model in config["models"]], "gpu": config["gpu_name"],
              "workloads": [{"name": w.name, "description": w.describe(), "source": w.source}
                            for w in config["workloads"]],
-             "options": {"overlap": config["options"].overlap, "kv_consume": config["options"].kv_consume},
+             "options": None if config.get("options") is None else {
+                 "overlap": config["options"].overlap, "kv_consume": config["options"].kv_consume},
              "tool": "endurance", "analytic": analytic_mode, "argv": sys.argv}
     (directory / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str) + "\n")
     if calibrations:

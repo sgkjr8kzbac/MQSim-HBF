@@ -11,8 +11,9 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from .models import load_gpu, load_model
-from .util import _plain, parse_overlap, write_table
+from ...models import load_model
+from ...util import _plain, parse_overlap, write_table
+from .gpu import load_gpu
 
 NS = 1e9
 KV_CONSUME = ("stream", "staged")
@@ -58,11 +59,6 @@ class SystemResult:
     steps: list  # system_steps rows
     assumptions: list  # report lines (Chinese)
     context: dict  # model, gpu, options, normalized meta and per-step constants for the report
-
-
-def _plain(value):
-    """Python scalar from a numpy scalar; other values unchanged."""
-    return value.item() if hasattr(value, "item") and not isinstance(value, (str, bytes)) else value
 
 
 def _number(value, name, optional=False):

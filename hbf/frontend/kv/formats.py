@@ -238,3 +238,9 @@ def parse_format(text, head_dim, q_heads=None):
     if ratio and name != "think":
         notes.append(f"ThinK 裁剪：K 保留 {k_dims}/{d} 个通道")
     return KVFormat(name, params, tensors, k_dims + d, tuple(notes))
+
+
+def register_builtins(registry):
+    for name in PRESETS:
+        extra = ("think", "fused", "pow2") if name in INT else ()
+        registry.register_format(name, None, defaults=DEFAULTS.get(name), extra_params=extra)

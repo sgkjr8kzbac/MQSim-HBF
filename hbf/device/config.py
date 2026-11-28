@@ -12,7 +12,6 @@ ROOT = PACKAGE.parent
 CONFIG_DIR = CONFIG = PACKAGE / "configs"
 PARAMETERS = CONFIG_DIR / "parameters.json"
 MODELS_JSON = CONFIG_DIR / "models.json"
-GPUS_JSON = CONFIG_DIR / "gpus.json"
 WORKLOADS_JSON = CONFIG_DIR / "workloads.json"
 MQSIM_SOURCE = PACKAGE / "mqsim"
 MQSIM_MANIFEST = PACKAGE / "mqsim.sha256"

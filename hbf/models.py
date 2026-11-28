@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-from .device.config import CONFIG_DIR as CONFIGS, GPUS_JSON as GPUS, MODELS_JSON as MODELS
+from .device.config import CONFIG_DIR as CONFIGS, MODELS_JSON as MODELS
 
 
 def _positive_int(value):
@@ -213,44 +213,6 @@ class ModelSpec:
         return self.total_params * self.weight_bits // 8
 
 
-@dataclass(frozen=True)
-class GpuSpec:
-    """Roofline parameters of one GPU. Rates are peak values; the efficiencies derate them."""
-    name: str
-    tensor_flops: float  # dense BF16 tensor-core FLOP/s
-    vector_ops: float  # non-tensor op/s used for dequantization
-    hbm_bytes_s: float
-    hbm_capacity: int  # bytes
-    compute_eff: float = .5
-    memory_eff: float = .8
-    layer_overhead_ns: float = 0
-    source: str = ""
-
-    def __post_init__(self):
-        rates = (self.tensor_flops, self.vector_ops, self.hbm_bytes_s, self.hbm_capacity)
-        if (not isinstance(self.name, str) or not self.name or not all(map(_positive_number, rates))
-                or not all(_positive_number(e) and e <= 1 for e in (self.compute_eff, self.memory_eff))
-                or type(self.layer_overhead_ns) not in (int, float) or not math.isfinite(self.layer_overhead_ns)
-                or self.layer_overhead_ns < 0 or not isinstance(self.source, str)):
-            raise ValueError(f"Invalid GPU spec {self}: need a name, positive finite rates and capacity, "
-                             "efficiencies in (0, 1] and a non-negative layer overhead")
-
-    @property
-    def flops(self):
-        """Effective tensor FLOP/s."""
-        return self.tensor_flops * self.compute_eff
-
-    @property
-    def vector(self):
-        """Effective vector op/s (dequantization)."""
-        return self.vector_ops * self.compute_eff
-
-    @property
-    def bandwidth(self):
-        """Effective HBM bytes/s."""
-        return self.hbm_bytes_s * self.memory_eff
-
-
 def presets(path):
     with open(path) as stream:
         return json.load(stream)
@@ -292,7 +254,3 @@ def _load(cls, value, path):
 
 def load_model(name_or_json):
     return _load(ModelSpec, name_or_json, MODELS)
-
-
-def load_gpu(name_or_json):
-    return _load(GpuSpec, name_or_json, GPUS)

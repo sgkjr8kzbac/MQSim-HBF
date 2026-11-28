@@ -4,10 +4,11 @@ from random import Random
 
 from .tokens import Access
 
-MODES = (
-    "dense", "uniform_pages", "uniform_tokens", "sink_recent", "same_unit", "distinct_units", "same_channel_distinct_units",
-    "hot_unit", "write_then_read", "channel_select",
+CORE_MODES = (
+    "dense", "uniform_pages", "uniform_tokens", "sink_recent", "same_unit", "distinct_units",
+    "same_channel_distinct_units", "hot_unit", "write_then_read",
 )
+MODES = CORE_MODES + ("channel_select",)
 
 
 def share(count, fraction):

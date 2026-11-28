@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 
-from ..geometry import prefill_tok_s, region_pages
+from ..geometry import region_pages, resolve_prefill_tok_s
 from .options import ACTIVE, CAUSE, EPS, FULL, IDLE, OPEN, PREFIX, PRIVATE, SESSION, CapacityError
 
 
@@ -70,7 +70,8 @@ class _OpsMixin:
         self._vllm_write(e, have, start)
         if self.opt.prefill == "colocated":
             prefill_toks = req.input + (pre_tokens if new_prefix else 0) + (req.history if sess < 0 else 0)
-            dt = self.opt.stacks * prefill_toks / prefill_tok_s(self.model, self.gpu, start)
+            dt = self.opt.stacks * prefill_toks / resolve_prefill_tok_s(
+                self.model, self.gpu, start, prefill_rate=self.opt.prefill_rate)
             self.prefill_dt += dt
             self.acc["prefill_s"] += dt
         slot = self.free_slots.pop()
@@ -223,7 +224,8 @@ class _OpsMixin:
             self.n_running += 1
             self.n["admitted"] += 1
             if self.opt.prefill == "colocated":
-                dt = self.opt.stacks * prompt / prefill_tok_s(self.model, self.gpu, prompt)
+                dt = self.opt.stacks * prompt / resolve_prefill_tok_s(
+                    self.model, self.gpu, prompt, prefill_rate=self.opt.prefill_rate)
                 self.prefill_dt += dt
                 self.acc["prefill_s"] += dt
         self._program("prefill", real)

@@ -6,7 +6,7 @@ import time
 import numpy as np
 
 from ...frontend.trace.requests import Stream
-from ..geometry import CAUSES, DAY, GIB, Device, prefill_tok_s, region_pages, sci, threshold_steps
+from ..geometry import CAUSES, DAY, GIB, Device, region_pages, sci, threshold_steps
 from ..interference import hbf_gaps, interference
 from .ops import _OpsMixin
 from .options import (ACTIVE, CAUSE, EPS, FULL, IDLE, OPEN, PREFIX, PRIVATE, SESSION,
@@ -43,8 +43,8 @@ class Simulator(_StorageMixin, _OpsMixin):
         self.gpu = gpu if gpu is not None else getattr(clock, "gpu", None)
         if o.policy in ("layer_major", "vllm_pool") and d.partition != "none":
             raise ValueError(f"{o.policy} uses the whole device (no partition)")
-        if o.prefill == "colocated" and (self.model is None or self.gpu is None):
-            raise ValueError("prefill='colocated' needs model and gpu (from Clock or arguments)")
+        if o.prefill == "colocated" and o.prefill_rate is None and (self.model is None or self.gpu is None):
+            raise ValueError("prefill='colocated' needs prefill_rate, or model and gpu (from Clock or arguments)")
         if o.refresh == "auto":
             self.refresh = "replay" if o.policy == "layer_major" else "relocate"
         else:

@@ -145,7 +145,7 @@ def test_batched_trace_must_cover_every_request(tmp_path):
 
 
 def test_reevaluation_infers_the_analysed_batch(tmp_path):
-    from hbf.system import main as system_main
+    from hbf.ext.system import main as system_main
     run = tmp_path / "r"
     main(HBF_FLAGS + ["--layers", "32", "--context", "1024", "--batch", "4", "--output", str(run)])
     result = system_main([str(run), "--model", "llama-3.1-8b", "--gpu", "h100-sxm", "--batch", "4",
@@ -267,8 +267,8 @@ def test_fused_rows_cut_pages_per_selected_block(name, per_block):
 
 
 def test_attention_flops_use_attn_dims():
-    from hbf.models import ModelSpec, load_gpu
-    from hbf.system import SystemOptions, evaluate
+    from hbf.models import ModelSpec
+    from hbf.ext.system import SystemOptions, evaluate, load_gpu
     fmt, layout, pages, _ = dense_pages("mla", 3)
     model = ModelSpec("mla-tiny", layers=1, hidden=256, q_heads=16, kv_heads=1, head_dim=128, intermediate=512,
                       vocab=1000)

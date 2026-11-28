@@ -10,13 +10,14 @@ import math
 import numpy as np
 import pytest
 
+from hbf.ext.system import Clock, load_gpu, prefill_tok_s
 from hbf.lifetime.analytic import analytic
 from hbf.lifetime.cli import METRICS, build_parser, configure, main, summarize_run
-from hbf.lifetime.clock import Clock, ConstantClock, calibrate, calibration_batches, layout_rounds
-from hbf.lifetime.geometry import GIB, Device, Geometry, erase_amp, geometry_for, prefill_tok_s, sci, threshold_steps
+from hbf.lifetime.clock import ConstantClock, calibrate, calibration_batches, layout_rounds
+from hbf.lifetime.geometry import GIB, Device, Geometry, erase_amp, geometry_for, sci, threshold_steps
 from hbf.lifetime.interference import interference
 from hbf.lifetime.sim import CAUSE, CapacityError, SimOptions, VllmTracker, simulate
-from hbf.models import load_gpu, load_model
+from hbf.models import load_model
 from hbf.frontend.trace.requests import Stream, Workload, load_workload, parse_length, presets, scripted
 # Event simulation (design-B section 4, tests 10-15) and the seeded request stream.
 from hbf.frontend.kv.tensors import TensorSpec
