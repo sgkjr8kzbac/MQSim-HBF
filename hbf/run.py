@@ -67,6 +67,8 @@ RUN_KEY_MAP = {
     "placement.check_writes": "check_writes",
     # [backend]
     "backend.analysis_only": "analysis_only",
+    "backend.hbf_write": "hbf_write",
+    "backend.write_order": "write_order",
     # [ext.system]
     "ext.system.gpu": "gpu",
     "ext.system.overlap": "overlap",

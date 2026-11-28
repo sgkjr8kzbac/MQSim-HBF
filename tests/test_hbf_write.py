@@ -289,3 +289,92 @@ def test_t_cache_with_writes_and_auto_erases(binary, tmp_path):
     assert stats["Total_GC_Executions"] == 0
     assert stats["erase_commands"] >= 1
     assert block_counts(out / "block_counts.csv") == python_block_counts(cfg, batches)
+
+
+def test_placement_runs_on_mqsim_with_write_history(tmp_path):
+    """R5 frontend: placed batch (packed/dedicated) emits prefill+flush trace and runs on MQSim."""
+    from hbf.cli import main
+    from hbf.frontend.addrtrace import read_trace
+
+    for alloc in ("packed", "dedicated"):
+        out = tmp_path / f"placed-{alloc}"
+        main(["run", "--topology", "2x2", "--planes", "4", "--plane-rule", "independent",
+              "--blocks-per-plane", "16", "--pages-per-block", "16",
+              "--layers", "1", "--heads", "2", "--head-dim", "128",
+              "--batch", "2", "--contexts", "256,128", "--generated", "32",
+              "--alloc", alloc, "--mode", "dense", "--steps", "1",
+              "--output", str(out)])
+        trace = read_trace(out)
+        assert trace.meta["resident"] == []
+        write_chunks = [c for c in trace.chunks if c.step == -1]
+        assert len(write_chunks) == 1
+        classes = set(write_chunks[0].cls.tolist())
+        assert "prefill" in classes and "flush" in classes
+        assert (out / "block_counts.csv").exists()
+        assert (out / "steps.csv").exists()
+        assert (out / "analysis_steps.csv").exists()
+
+    # Illegal write history (vllm_pool) must be rejected when running MQSim.
+    with pytest.raises(SystemExit):
+        main(["run", "--topology", "2x2", "--planes", "4", "--plane-rule", "independent",
+              "--blocks-per-plane", "16", "--pages-per-block", "16",
+              "--layers", "1", "--heads", "2", "--head-dim", "128",
+              "--batch", "2", "--contexts", "256,128", "--generated", "32",
+              "--alloc", "vllm_pool", "--output", str(tmp_path / "illegal-vllm")])
+
+
+def test_frontend_refresh_insertion_rd_and_retention_on_mqsim(binary, tmp_path):
+    """R5 frontend: read-disturb (in-place replay) and retention (relocate) refresh traces validate & run on MQSim."""
+    import numpy as np
+    from hbf.backends.mqsim.schedule import batches_from_trace
+    from hbf.frontend.addrtrace import AddressTrace, LayerChunk, make_meta, validate
+    from hbf.frontend.refresh import insert_refreshes
+
+    cfg = load("16x64", channels=1, chips=1, dies=1, planes=2, blocks_per_plane=8, pages_per_block=4,
+               aggregate_gb_s=64, plane_rule="independent", coalesce_ns=None, read_plane_ns=None)
+    # Build a small trace: prefill block 0 on both planes (2 pages per plane = 4 LPAs: 0,1,2,3),
+    # then read those 4 pages for 4 steps -> 2 reads per block per step -> 4 reads after 2 steps.
+    prefill_lpas = np.array([0, 1, 2, 3], dtype=np.int64)
+    chunks = [LayerChunk(
+        step=-1, layer=-1, subbatch=np.zeros(4, dtype=np.int64), request=np.zeros(4, dtype=np.int64),
+        op=np.full(4, "W", dtype="U1"), lpa=prefill_lpas,
+        useful_bytes=np.full(4, cfg.page_bytes, dtype=np.int64),
+        burst_bytes=np.full(4, cfg.page_bytes, dtype=np.int64),
+        burst_runs=np.ones(4, dtype=np.int64), cls=np.full(4, "prefill", dtype="U8"),
+    )]
+    for step in range(4):
+        chunks.append(LayerChunk(
+            step=step, layer=0, subbatch=np.zeros(4, dtype=np.int64), request=np.zeros(4, dtype=np.int64),
+            op=np.full(4, "R", dtype="U1"), lpa=prefill_lpas,
+            useful_bytes=np.full(4, cfg.page_bytes, dtype=np.int64),
+            burst_bytes=np.full(4, cfg.page_bytes, dtype=np.int64),
+            burst_runs=np.ones(4, dtype=np.int64), cls=np.full(4, "kv", dtype="U8"),
+        ))
+    base = AddressTrace(meta=make_meta(cfg, resident=()), chunks=chunks)
+    validate(cfg, base)
+
+    # 1. Read-disturb in-place replay (threshold=4 reads/block -> triggers at step 1 and step 3).
+    rd_trace, rd_summary = insert_refreshes(cfg, base, rd_threshold=4, relocate=False)
+    assert rd_summary["rd_refreshes"] == 4  # 2 blocks x 2 triggers
+    assert rd_summary["refresh_reads"] == 8 and rd_summary["relocate_writes"] == 8 and rd_summary["releases"] == 8
+    rd_batches = batches_from_trace(cfg, rd_trace.chunks)
+    out_rd = tmp_path / "refresh-rd"
+    _, _, _, stats_rd = simulate(cfg, rd_batches, out_rd, binary, hbf_write=True)
+    assert stats_rd["Total_GC_Executions"] == 0
+    assert block_counts(out_rd / "block_counts.csv") == python_block_counts(cfg, rd_batches)
+    # Each of the 2 blocks was erased twice (at step 1 and step 3).
+    assert sum(v[2] for v in block_counts(out_rd / "block_counts.csv").values()) == 4
+
+    # 2. Retention relocate (retention_ns=20_000_000, step_ns=10_000_000 -> triggers at step 1 and step 3).
+    ret_trace, ret_summary = insert_refreshes(cfg, base, retention_ns=20_000_000, step_ns=10_000_000, relocate=True)
+    assert ret_summary["retention_refreshes"] == 4
+    ret_batches = batches_from_trace(cfg, ret_trace.chunks)
+    out_ret = tmp_path / "refresh-ret"
+    _, _, _, stats_ret = simulate(cfg, ret_batches, out_ret, binary, hbf_write=True)
+    assert stats_ret["Total_GC_Executions"] == 0
+    assert block_counts(out_ret / "block_counts.csv") == python_block_counts(cfg, ret_batches)
+    # Relocate wrote fresh blocks 1 and 2 on both planes -> 0 erases, 6 distinct blocks touched!
+    counts_ret = block_counts(out_ret / "block_counts.csv")
+    assert sum(v[2] for v in counts_ret.values()) == 0
+    assert len(counts_ret) == 6
+

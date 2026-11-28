@@ -315,6 +315,7 @@ class Snapshot:
     table: np.ndarray
     full_pages: dict  # (request, tensor) -> live full pages per (layer, head) at the snapshot
     history: list = field(default_factory=list)
+    history_kinds: list = field(default_factory=list)
     kinds: dict = field(default_factory=lambda: {"prefill": 0, "padding": 0, "decode": 0})
     block_ranges: dict = field(default_factory=dict)  # (request, tensor) -> (lo_block, hi_block) live at snapshot
     dead: list = field(default_factory=list)
@@ -329,6 +330,7 @@ class Snapshot:
     def write(self, lpas, kind):
         lpas = np.asarray(lpas, dtype=np.int64)
         self.history.append(lpas)
+        self.history_kinds.append(kind)
         self.kinds[kind] += len(lpas)
 
     def written(self):
@@ -976,6 +978,7 @@ class Segments(Placer):
         self.snapshot.kinds["prefill"] += int(filled.sum())
         self.snapshot.kinds["padding"] += int((~filled).sum())
         self.snapshot.history.append(lpa)
+        self.snapshot.history_kinds.append("prefill")
         return layer, head, t, block, lpa[slots]
 
     def _write_prefix(self, r, g):

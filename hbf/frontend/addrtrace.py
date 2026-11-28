@@ -218,18 +218,20 @@ def validate(cfg, trace: AddressTrace):
         validator.feed(chunk)
 
 
-def iter_trace(cfg, layout, accesses, *, prefill=False, expected_steps=(),
+def iter_trace(cfg, layout, accesses, *, prefill=False, emit_placement_writes=False, expected_steps=(),
                protocol=None, layout_name=None, config_meta=None):
     """Build ``(meta, chunk_iterator)`` streaming by ``(step, layer)`` from logical accesses.
 
     * Read-only runs without prefill set ``resident = [(layout.base, layout.base + layout.span)]``.
-    * Runs with prefill or explicit write accesses set ``resident = []`` and emit ``op='W'``
-      records (before any ``op='R'`` records within the same ``(step, layer)``).
+    * Runs with prefill, placement write history (``emit_placement_writes``), or explicit write
+      accesses set ``resident = []`` and emit ``op='W'`` records (before any ``op='R'`` records
+      within the same ``(step, layer)``).
     * Every ``(step, layer)`` in ``expected_steps x range(layout.shape.layers)`` (plus any step
       seen in ``accesses``) yields a ``LayerChunk``, even when it has zero HBF pages.
     """
     accesses = list(accesses)
-    has_writes = prefill or any(a.op == "W" for a in accesses)
+    use_placement_writes = bool(emit_placement_writes and hasattr(layout, "snapshot"))
+    has_writes = prefill or use_placement_writes or any(a.op == "W" for a in accesses)
     resident = () if has_writes else ((layout.base, layout.base + layout.span),)
     meta = make_meta(
         cfg,
@@ -243,8 +245,45 @@ def iter_trace(cfg, layout, accesses, *, prefill=False, expected_steps=(),
 
     def _chunks():
         limit = cfg.batch_pages
-        # 1. Prefill writes at step -1, layer -1 (if requested).
-        if prefill:
+        # 1a. Placement snapshot write history (prefill/padding + decode flush + aged-out releases).
+        if use_placement_writes:
+            snap = layout.snapshot
+            w_lpas_parts, w_cls_parts = [], []
+            for arr, kind in zip(snap.history, snap.history_kinds):
+                if len(arr):
+                    w_lpas_parts.append(arr)
+                    tag = "flush" if kind == "decode" else "prefill"
+                    w_cls_parts.append(np.full(len(arr), tag, dtype="U8"))
+            if w_lpas_parts:
+                w_lpas = np.concatenate(w_lpas_parts)
+                w_cls = np.concatenate(w_cls_parts)
+                n_w = len(w_lpas)
+                w_sb = np.arange(n_w, dtype=np.int64) // limit
+                w_op = np.full(n_w, "W", dtype="U1")
+                dead = snap.dead_lpas()
+                if len(dead):
+                    next_sb = int(w_sb[-1]) + 1
+                    n_d = len(dead)
+                    lpas = np.concatenate([w_lpas, dead])
+                    sb = np.concatenate([w_sb, next_sb + np.arange(n_d, dtype=np.int64) // limit])
+                    op = np.concatenate([w_op, np.full(n_d, "D", dtype="U1")])
+                    cls_arr = np.concatenate([w_cls, np.full(n_d, "kv", dtype="U8")])
+                else:
+                    lpas, sb, op, cls_arr = w_lpas, w_sb, w_op, w_cls
+                n = len(lpas)
+                yield LayerChunk(
+                    step=-1, layer=-1,
+                    subbatch=sb,
+                    request=np.zeros(n, dtype=np.int64),
+                    op=op,
+                    lpa=lpas,
+                    useful_bytes=np.full(n, cfg.page_bytes, dtype=np.int64),
+                    burst_bytes=np.full(n, cfg.page_bytes, dtype=np.int64),
+                    burst_runs=np.ones(n, dtype=np.int64),
+                    cls=cls_arr,
+                )
+        # 1b. Prefill writes at step -1, layer -1 (if requested).
+        elif prefill:
             if any(a.op == "W" for a in accesses):
                 raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
             p_batches = prefill_batches(cfg, layout)

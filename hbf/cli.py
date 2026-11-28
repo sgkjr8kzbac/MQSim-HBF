@@ -147,7 +147,7 @@ def subbatch_count(layer_rows, plane_groups):
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=None,
              protocol=None, system=None, kv_format=None, requests=None, check_writes=False, kv_spec=None,
-             skip_trace_files=False):
+             skip_trace_files=False, hbf_write=False, write_order=None):
     """Schedule the accesses, write the mechanism analysis (with read-time estimates), and run
     MQSim unless binary is None.
 
@@ -199,11 +199,20 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     if has_density and any(access.op == "W" for access in accesses):
         raise ValueError("Tensor density < 1 does not support write accesses")
     write_check = None
-    if isinstance(requests, BatchSpec) and check_writes:
+    if isinstance(requests, BatchSpec) and (check_writes or (placed and binary is not None)):
         snapshot = layout.snapshot if placed else place_batch(
             cfg, Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context),
             requests, layout.tensors, layout.tokens_per_page)
-        write_check = check_write_order(cfg, snapshot) | {"kinds": snapshot.kinds}
+        checked = check_write_order(cfg, snapshot) | {"kinds": snapshot.kinds}
+        if placed and binary is not None:
+            if not checked["legal"]:
+                raise ValueError(f"Placement '{requests.allocation}' has an OCP section 5.4.1 illegal write history "
+                                 "and cannot run on MQSim; use --alloc packed or --alloc dedicated")
+            if getattr(layout, "_prefix_stride", 0) > 0:
+                raise ValueError("MQSim requires --prefix-reads coalesced (virtual per_request copies are not "
+                                 "written to flash)")
+        if check_writes:
+            write_check = checked
     if input_csv is not None and isinstance(requests, tuple) and requests[0] > 1:
         seen = {access.kv_head // requests[1] for access in accesses}
         if len(seen) < requests[0]:
@@ -254,14 +263,16 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                    "protocol": None if protocol is None else asdict(protocol),
                                    "argv": sys.argv} | ({} if kv_spec is None else {"kv_spec": kvspec_hook.spec_meta(kv_spec)}))
     # Step 1 (frontend): convert logical accesses to a validated address trace.
+    emit_placement_writes = bool(placed and binary is not None)
+    use_hbf_write = bool(hbf_write or write_order is not None or emit_placement_writes)
     expected_steps = range(generation["steps"]) if input_csv is None else ()
     trace_meta, chunk_stream = iter_trace(
-        cfg, layout, accesses, prefill=prefill_layout, expected_steps=expected_steps,
-        protocol=protocol, layout_name=layout_name,
+        cfg, layout, accesses, prefill=prefill_layout, emit_placement_writes=emit_placement_writes,
+        expected_steps=expected_steps, protocol=protocol, layout_name=layout_name,
         config_meta={"mode": mode, **generation} if input_csv is None else {"input_csv": str(input_csv)},
     )
     validator = TraceValidator(cfg, trace_meta["resident"])
-    needs_schedule = binary is not None or prefill_layout or any(access.op == "W" for access in accesses)
+    needs_schedule = binary is not None or prefill_layout or emit_placement_writes or any(access.op == "W" for access in accesses)
 
     if skip_trace_files and not needs_schedule:
         def _validated_stream():
@@ -325,7 +336,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         report += [f"KV 分组 `{kv_spec.name}` 的假设：", ""] + [f"- {note}" for note in kv_spec.notes] + [""]
     result = None
     if binary is not None:
-        result = simulate(cfg, batches, directory, binary, physical=physical)
+        result = simulate(cfg, batches, directory, binary, physical=physical,
+                          hbf_write=use_hbf_write, write_order=write_order)
         _, _, steps, stats = result
         report += ["## MQSim", "",
                    f"MQSim 用时 {stats['wall_seconds']:.3f} s，峰值 RSS {stats['peak_rss_kib']} KiB。", "",
@@ -455,7 +467,12 @@ def build_run_parser(prog="python -m hbf run"):
                         help="whether the pages a layer reads are known before its query (static: dense, "
                              "sink_recent) or not (dynamic: uniform_* selections, imported traces); prefetch "
                              "needs static")
-    batch = parser.add_argument_group("request placement (phase B; analysis only)")
+    parser.add_argument("--hbf-write", action="store_true",
+                        help="enable MQSim HBF write patches (T-HBFW1..T-HBFW4: static write, page-0 auto-erase, "
+                             "GC disabled, per-block counts)")
+    parser.add_argument("--write-order", choices=("read_first", "fifo"),
+                        help="HBF write/read chip service order under T-HBFW2 (read_first default, or fifo)")
+    batch = parser.add_argument_group("request placement (multi-request KV placement)")
     batch.add_argument("--alloc", choices=("layer_major", "dedicated", "packed", "vllm_pool"), default="layer_major",
                        help="how each request's KV is placed: layer_major (phase A's emulation), dedicated "
                             "segments, a packed write frontier, or vLLM-style block pools; see hbf/batch.py")
@@ -648,15 +665,16 @@ def configure(args):
         else:
             kv_spec = kvspec_hook.from_model(model, kv_format or "bf16")
     if spec is not None:
-        if not args.analysis_only or args.access_csv is not None or args.prefill:
+        if args.access_csv is not None or args.prefill:
             raise ValueError("Request placement (--alloc, --contexts, --generated, --frontiers, --prefix-tokens, "
-                             "--check-writes) is analysis only, with generated accesses and without --prefill")
+                             "--check-writes) uses generated accesses and cannot be combined with --access-csv or --prefill")
         requests = replace(spec, kv_spec=kv_spec) if kv_spec is not None else spec
     return {"cfg": cfg, "shape": shape, "layout_name": args.layout, "mode": args.mode, "generation": generation,
             "input_csv": args.access_csv, "physical": args.physical, "tensors": tensors,
             "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": True if args.prefill else None,
             "protocol": protocol, "system": system, "kv_format": kv_format,
-            "requests": requests, "check_writes": args.check_writes, "kv_spec": kv_spec}
+            "requests": requests, "check_writes": args.check_writes, "kv_spec": kv_spec,
+            "hbf_write": args.hbf_write, "write_order": args.write_order}
 
 
 def _parse_config_and_flags(parser, argv, to_argv_fn):
