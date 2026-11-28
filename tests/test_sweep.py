@@ -25,14 +25,16 @@ def number(text):
 def test_product_zip_seeds_expansion():
     grid = load_grid({"base": {"batch": 8, "context": 1024},
                       "vary": {"batch": [1, 2], "format": ["bf16", "kivi2"]},
-                      "zip": [{"aggregate_gb_s": 384, "ucie_grade": 1}, {"aggregate_gb_s": 1536, "ucie_grade": 2}],
+                      "zip": [{"topology": "ocp-8ch", "aggregate_gb_s": 384, "ucie_grade": 1},
+                              {"topology": "ocp", "aggregate_gb_s": 1536, "ucie_grade": 2}],
                       "seeds": [11, 12, 13]})
     runs = expand(grid)
     assert len(runs) == 2 * 2 * 2 * 3
     params, varied = runs[0]
-    assert varied == {"batch": 1, "format": "bf16", "aggregate_gb_s": 384, "ucie_grade": 1, "seed": 11}
-    assert params == {"batch": 1, "context": 1024, "format": "bf16", "aggregate_gb_s": 384, "ucie_grade": 1,
-                      "seed": 11}
+    assert varied == {"batch": 1, "format": "bf16", "topology": "ocp-8ch", "aggregate_gb_s": 384,
+                      "ucie_grade": 1, "seed": 11}
+    assert params == {"batch": 1, "context": 1024, "format": "bf16", "topology": "ocp-8ch",
+                      "aggregate_gb_s": 384, "ucie_grade": 1, "seed": 11}
     # Seeds vary fastest, then zip entries, then the product (last vary key fastest).
     assert [runs[i][1]["seed"] for i in range(3)] == [11, 12, 13]
     assert runs[3][1]["aggregate_gb_s"] == 1536

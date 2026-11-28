@@ -124,6 +124,17 @@ HOST_ORDERS = ("fcfs", "trigger")
 GROUP_SENSES = ("arrived", "whole")
 # System read throughput per UCIe module and direction, OCP sections 5.1.2.1-5.1.2.3 (GB/s).
 UCIE_GRADES = {1: 48, 2: 94, 3: 188}  # grade 1 allows at most 8 modules (0.384 TB/s), 2 and 3 up to 16
+UCIE_MAX_HOST_CHANNELS = {1: 8, 2: 16, 3: 16}
+
+
+def check_protocol(cfg, protocol):
+    """Validate host protocol options against the device topology (OCP section 5.1.2.1-5.1.2.3)."""
+    if protocol is None or protocol.ucie_grade is None:
+        return
+    limit = UCIE_MAX_HOST_CHANNELS[protocol.ucie_grade]
+    if cfg.host_channels > limit:
+        raise ValueError(f"UCIe speed grade {protocol.ucie_grade} supports at most {limit} host channels "
+                         f"(OCP section 5.1.2.1); topology has {cfg.host_channels}")
 
 
 @dataclass(frozen=True)
@@ -210,6 +221,7 @@ def protocol_rounds(cfg, reads, group, offsets, protocol):
     ceil(units / k) for the units a credit admits (pages, or whole offsets with ``whole``), where k
     is one more than the number of the cheapest units whose credits sum to less than MOCS.
     """
+    check_protocol(cfg, protocol)
     whole = group > 1 and protocol.group_sense == "whole"
     queues = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     commands = 0
@@ -270,6 +282,8 @@ def analyze(cfg, batches, groups=(1,), mode="static", protocol=None):
         check_group(cfg, group)
     if mode not in PLACEMENTS:
         raise ValueError(f"placement must be one of {PLACEMENTS}")
+    if protocol is not None:
+        check_protocol(cfg, protocol)
     offsets = placement(cfg, batches) if mode == "mqsim" else None
     parts = defaultdict(list)
     for batch in batches:
@@ -353,6 +367,7 @@ def _protocol_part(cfg, pages, placed, group, protocol, part):
     """``protocol_rounds`` of one sub-batch: closed form for independent planes with equal credits
     per host channel (greedy longest-queue-first reaches max(longest bank queue, ceil(n / k))),
     otherwise the reference scheduler on rebuilt requests."""
+    check_protocol(cfg, protocol)
     np = _numpy()
     from .controller import Request
     useful, burst, runs = pages.useful[part], pages.burst[part], pages.runs[part]
@@ -409,6 +424,7 @@ def analyze_pages(cfg, pages, groups=(1,), protocol=None, timing=False):
         check_group(cfg, group)
     if protocol is not None:
         check_host_channels(cfg)
+        check_protocol(cfg, protocol)
     dies, per_die = plane_geometry(cfg)
     total_planes = dies * per_die
     limit = cfg.batch_pages

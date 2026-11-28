@@ -49,13 +49,15 @@ def test_channel_bound_and_breakdown_add_up():
 
 def test_breakdown_with_credit_limits():
     cfg = load("ocp", **HBF_COMMANDS)
+    cfg_8ch = load("ocp-8ch", **HBF_COMMANDS)
     shape = Shape(2, 8, 128, 8192)
-    for protocol in (Protocol(256), Protocol(256, ucie_grade=1), Protocol(256, host_order="trigger")):
-        layers, steps = rows(cfg, shape, "uniform_tokens", protocol=protocol, fraction=.05, seed=4)
+    for target, protocol in ((cfg, Protocol(256)), (cfg_8ch, Protocol(256, ucie_grade=1)),
+                             (cfg, Protocol(256, ucie_grade=2)), (cfg, Protocol(256, host_order="trigger"))):
+        layers, steps = rows(target, shape, "uniform_tokens", protocol=protocol, fraction=.05, seed=4)
         for row in layers:
             parts = ("t_balanced_ns", "t_imbalance_ns", "t_protocol_ns", "t_channel_ns", "t_overhead_ns")
             assert sum(row[key] for key in parts) == row["est_ns"] >= row["bound_ns"]
-            assert row["t_protocol_ns"] == (row["protocol_rounds"] - row["rounds"]) * cfg.read_ns or row["subbatches"] > 1
+            assert row["t_protocol_ns"] == (row["protocol_rounds"] - row["rounds"]) * target.read_ns or row["subbatches"] > 1
         assert steps[0]["est_ns"] == sum(row["est_ns"] for row in layers)
     (row, _), _ = rows(cfg, shape, "dense", protocol=Protocol(256))
     assert row["bottleneck"] == "credit" and row["protocol_rounds"] > row["rounds"]

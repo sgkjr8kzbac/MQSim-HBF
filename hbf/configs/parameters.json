@@ -35,6 +35,14 @@
       "planes": 16,
       "address_map": "ocp",
       "plane_rule": "independent"
+    },
+    "ocp-8ch": {
+      "channels": 16,
+      "chips": 2,
+      "planes": 16,
+      "address_map": "ocp",
+      "plane_rule": "independent",
+      "aggregate_gb_s": 512
     }
   },
   "calibration": {

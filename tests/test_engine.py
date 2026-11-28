@@ -13,7 +13,7 @@ from hbf.pages import iter_layer_pages, place
 TWO_BIT = (TensorSpec("K", 2, 128), TensorSpec("V", 2, 128))
 KIVI_LIKE = (TensorSpec("K", 2, 128), TensorSpec("K_scale", 16, 8), TensorSpec("V", 2, 128), TensorSpec("V_scale", 16, 8))
 ODD = (TensorSpec("K", 3, 128), TensorSpec("V", 16, 100))
-TOPOLOGIES = {"ocp": {}, "16x64": {}, "256x4": {}, "4x1": {"planes": 16, "plane_rule": "independent"}}
+TOPOLOGIES = {"ocp": {}, "ocp-8ch": {}, "16x64": {}, "256x4": {}, "4x1": {"planes": 16, "plane_rule": "independent"}}
 MODES = ("dense", "uniform_pages", "uniform_tokens", "sink_recent", "hot_unit", "write_then_read")
 
 
@@ -51,18 +51,19 @@ def test_layer_pages_equal_scheduled_requests(topology, layout_name, tensors):
 
 
 PROTOCOLS = (None, Protocol(256), Protocol(256, host_order="trigger"), Protocol(256, read_unit="wanted"),
-             Protocol(1024, read_burst=True, read_unit="wanted"), Protocol(ucie_grade=1),
+             Protocol(1024, read_burst=True, read_unit="wanted"), Protocol(ucie_grade=2),
              Protocol(256, group_sense="whole"), Protocol(1))
 
 
 @pytest.mark.parametrize("topology,mode,batch_pages", list(itertools.product(
     TOPOLOGIES, ("dense", "uniform_pages", "uniform_tokens", "sink_recent"), (8192, 300))))
 def test_numpy_engine_rows_equal_reference(topology, mode, batch_pages):
-    groups = (1, 4, 16) if topology in ("ocp", "4x1") else (1, 4)
+    groups = (1, 4, 16) if topology in ("ocp", "ocp-8ch", "4x1") else (1, 4)
     for layout_name, tensors in (("layer_contiguous", None), ("vllm_interleaved", None),
                                  ("striped_staggered", KIVI_LIKE), ("striped_contiguous", TWO_BIT)):
         cfg, layout, accesses = workload(topology, layout_name, mode, tensors, batch_pages)
-        for protocol in PROTOCOLS:
+        protocols = PROTOCOLS + ((Protocol(ucie_grade=1),) if cfg.host_channels <= 8 else ())
+        for protocol in protocols:
             expected = analyze(cfg, schedule(cfg, layout, accesses), groups, protocol=protocol)
             actual = analyze_accesses(cfg, layout, accesses, groups, protocol=protocol, engine="numpy")
             for want, got in zip(expected, actual):

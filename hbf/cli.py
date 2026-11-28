@@ -9,7 +9,7 @@ from uuid import uuid4
 from .access import (LAYOUTS, MODES, Shape, default_tensors, generate, parse_density, parse_tensors, read_access,
                      tensors_meta, write_access)
 from .analysis import (ENGINES, GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group,
-                       plane_geometry, summarize)
+                       check_protocol, plane_geometry, summarize)
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule_run, unwritten_reads
 from .simulator import build, dump, simulate, write_table
@@ -88,7 +88,9 @@ def write_check_report(cfg, spec, check):
 
 
 def topology_name(cfg):
-    return "ocp" if cfg.address_map == "ocp" else f"{cfg.channels}x{cfg.chips}"
+    if cfg.address_map == "ocp":
+        return "ocp" if cfg.host_channels == 16 else f"ocp-{cfg.host_channels}ch"
+    return f"{cfg.channels}x{cfg.chips}"
 
 
 def analysis_report(layer_rows, step_rows):
@@ -348,8 +350,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", default="64x16",
-                        help="ocp (the spec's Figure 4 example), 16x64, 64x16, 256x4 or any "
-                             "<channels>x<chips per channel>")
+                        help="ocp (16 host channels, Figure 4), ocp-8ch (8 host channels, grade 1), "
+                             "16x64, 64x16, 256x4 or any <channels>x<chips per channel>")
     parser.add_argument("--layout", choices=LAYOUTS, default="layer_contiguous")
     parser.add_argument("--mode", choices=MODES, default="dense")
     parser.add_argument("--layers", type=int, help="default 1, or the --model's layers")
@@ -583,6 +585,7 @@ def configure(args):
             or args.ucie_grade is not None or args.group_sense != "arrived"):
         protocol = Protocol(args.mocs, args.read_burst, args.read_unit,
                             args.host_order, args.ucie_grade, args.group_sense)
+        check_protocol(cfg, protocol)
     shape = Shape(layers, heads * per_stack, head_dim, args.context)
     generation = {key: getattr(args, key) for key in (
         "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units", "select_tokens"

@@ -446,12 +446,37 @@ def test_cwdp_topologies_keep_sixteen_host_channels():
 
 def test_link_bound_follows_ucie_grade():
     """A dense round of 64 pages per host channel moves 256 KiB: 5.46 us at grade 1 (48 GB/s)."""
-    from hbf.analysis import Protocol, protocol_rounds
-    cfg = load("ocp")
-    reads = [Request(lpa) for lpa in range(1024 * 2)]  # every bank twice
-    link = {grade: protocol_rounds(cfg, reads, 1, None, Protocol(16384, ucie_grade=grade))[3] for grade in (1, 2, 3)}
+    from hbf.analysis import Protocol, analyze_accesses, _protocol_part, protocol_rounds
+    from hbf.cli import build_parser, configure, topology_name
+    from hbf.pages import iter_layer_pages, place
+    cfg8 = load("ocp-8ch")
+    assert (cfg8.channels, cfg8.chips, cfg8.planes, cfg8.units, cfg8.host_channels, cfg8.aggregate_gb_s,
+            cfg8.width) == (16, 2, 16, 512, 8, 512, 32)
+    assert topology_name(load("ocp")) == "ocp" and topology_name(cfg8) == "ocp-8ch"
+    reads8 = [Request(lpa) for lpa in range(512 * 2)]  # every bank twice, 128 pages per host channel
+    link = {grade: protocol_rounds(cfg8, reads8, 1, None, Protocol(16384, ucie_grade=grade))[3] for grade in (1, 2, 3)}
     # per host channel: 128 pages = 512 KiB; one tR carries 48/94/188 GB/s x 4,096 ns
     assert link == {1: 3, 2: 2, 3: 1}
+    # OCP section 5.1.2.1: speed grade 1 allows at most 8 host channels; 16-channel ocp must reject it.
+    cfg16 = load("ocp")
+    reads16 = [Request(lpa) for lpa in range(1024 * 2)]
+    assert {g: protocol_rounds(cfg16, reads16, 1, None, Protocol(16384, ucie_grade=g))[3] for g in (2, 3)} == {2: 2, 3: 1}
+    grade1 = Protocol(16384, ucie_grade=1)
+    with pytest.raises(ValueError, match="at most 8 host channels"):
+        protocol_rounds(cfg16, reads16, 1, None, grade1)
+    layout = LAYOUTS["layer_contiguous"](cfg16, Shape(1, 2, 128, 128))
+    accesses = list(generate(cfg16, layout, "dense"))
+    batches = schedule(cfg16, layout, accesses)
+    with pytest.raises(ValueError, match="at most 8 host channels"):
+        analyze(cfg16, batches, protocol=grade1)
+    with pytest.raises(ValueError, match="at most 8 host channels"):
+        analyze_accesses(cfg16, layout, accesses, protocol=grade1, engine="numpy")
+    layer = next(iter_layer_pages(cfg16, layout, accesses))
+    with pytest.raises(ValueError, match="at most 8 host channels"):
+        _protocol_part(cfg16, layer, place(cfg16, layer.lpa), 1, grade1, slice(None))
+    with pytest.raises(ValueError, match="at most 8 host channels"):
+        configure(build_parser().parse_args(["--topology", "ocp", "--ucie-grade", "1"]))
+    configure(build_parser().parse_args(["--topology", "ocp-8ch", "--ucie-grade", "1"]))
     with pytest.raises(ValueError, match="ucie_grade"):
         Protocol(256, ucie_grade=4)
 

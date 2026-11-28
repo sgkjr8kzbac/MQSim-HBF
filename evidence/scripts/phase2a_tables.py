@@ -42,11 +42,12 @@ def system():
 
 def layout_protocol():
     print("\n### item1-layout-protocol: llama-3.1-8b, 32K, B=4, one stack, mean of 3 seeds (ms per step)\n")
-    print("| mode | layout | MOCS | host order | UCIe grade | HBF est | TPOT HBF | utilization | bottleneck |")
-    print("|---|---|---:|---|---:|---:|---:|---:|---|")
+    print("| mode | topology | layout | MOCS | host order | UCIe grade | HBF est | TPOT HBF | utilization | bottleneck |")
+    print("|---|---|---|---:|---|---:|---:|---:|---:|---|")
     groups = collections.defaultdict(list)
     for r in load("item1-layout-protocol"):
-        groups[r["mode"], r["layout"], r.get("mocs", ""), r.get("host_order", ""), r.get("ucie_grade", "")].append(r)
+        groups[r["mode"], r.get("topology", "") or "ocp", r["layout"], r.get("mocs", ""), r.get("host_order", ""),
+               r.get("ucie_grade", "")].append(r)
     for key, rows in groups.items():
         mean = lambda col: statistics.mean(float(row[col]) for row in rows)
         common = collections.Counter(row["bottleneck"] for row in rows).most_common(1)[0][0]

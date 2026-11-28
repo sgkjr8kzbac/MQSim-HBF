@@ -5,6 +5,7 @@
   "zip": [{"layout": "striped_contiguous"}, {"layout": "layer_contiguous"}, {"layout": "vllm_interleaved"},
           {"layout": "striped_contiguous", "mocs": 256, "host_order": "fcfs", "ucie_grade": 2},
           {"layout": "striped_contiguous", "mocs": 256, "host_order": "trigger", "ucie_grade": 2},
-          {"layout": "striped_contiguous", "mocs": 256, "host_order": "trigger", "ucie_grade": 1}],
+          {"topology": "ocp-8ch", "layout": "striped_contiguous", "mocs": 256, "host_order": "trigger", "ucie_grade": 2},
+          {"topology": "ocp-8ch", "layout": "striped_contiguous", "mocs": 256, "host_order": "trigger", "ucie_grade": 1}],
   "seeds": [11, 12, 13]
 }
