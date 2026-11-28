@@ -269,7 +269,7 @@ tests/
 ## 六、R0 基线记录（云端）
 
 - 提交：本次文档提交，内容为 `bd3b91c` 加上 `tests/test_validation.py::test_tensor_specs_pipeline_and_meta` 的修正。K1 让 `meta.json` 省略未设置的可选字段，K5 又加了 `density`，这个测试的期望值一直没跟上。
-- 全量测试：见下一行（云端跑完后填写）。
+- 全量测试（云端，`ce0cc35`，即本方案提交的前一个提交，测试代码相同）：**508 项通过，3 项 xfail**，用时 15 min 10 s，[日志](../../evidence/pytest/pre-refactor.log)。3 项 xfail 与以前相同。本地 R0 跑出的数字应与此一致。
 
 ## 附录 A：`T-PERF.patch`
 
