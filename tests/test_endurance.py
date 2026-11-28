@@ -1074,3 +1074,18 @@ def test_k4_cli_kv_spec_and_tk3_models_end_to_end(tmp_path):
     parser = build_parser()
     with pytest.raises(ValueError, match="vllm_pool"):
         configure(parser.parse_args(["--hours", "2", "--alloc", "vllm_pool", "--kv-spec", "hybrid:local_tier=hbm"]))
+
+
+def test_analytic_cli_honors_align_option(tmp_path):
+    """R1.6: _analytic_rows passes config['align'] into analytic()."""
+    out_row = tmp_path / "row"
+    out_none = tmp_path / "none"
+    common = ["--analytic", "--no-calibrate", "--model", "llama-3.1-8b", "--workload", "chat",
+              "--rd-threshold", "1e6"]
+    main([*common, "--output", str(out_row)])
+    main([*common, "--align", "none", "--output", str(out_none)])
+    row_default = next(csv.DictReader((out_row / "endurance_summary.csv").open()))
+    row_none = next(csv.DictReader((out_none / "endurance_summary.csv").open()))
+    assert float(row_default["padding_gb_s"]) > 0
+    assert float(row_none["padding_gb_s"]) == 0.0
+    assert float(row_default["avg_pec_per_day"]) > float(row_none["avg_pec_per_day"])

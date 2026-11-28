@@ -2812,7 +2812,7 @@ def _analytic_rows(directory, config):
                                 hot=config["hot"], retention_s=config["retention_s"],
                                 prefix_reads=config["prefix_reads"], t_prog=config["t_prog"],
                                 t_bers=config["t_bers"], m5=config["m5"], suspend_ns=config["suspend_ns"],
-                                block_unit=config["block_unit"], stacks=config["stacks"]):
+                                block_unit=config["block_unit"], stacks=config["stacks"], align=config["align"]):
                 rows.append({"model": model.name, "format": kv_format, "mode": config["mode"],
                              "read_share": share} | row)
     return rows, calibrations
