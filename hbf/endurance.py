@@ -25,11 +25,15 @@ and ``METRICS`` mirror ``hbf.cli`` for the sweep driver.
 import argparse
 import csv
 import hashlib
+import heapq
 import itertools
 import json
 import math
+import os
 import sys
-from dataclasses import dataclass
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -37,7 +41,7 @@ from uuid import uuid4
 import numpy as np
 
 from .interference import MODES as M5_MODES, hbf_gaps, interference
-from .workload import load_workload, presets as workload_presets
+from .workload import Stream, load_workload, per_stack, presets as workload_presets
 
 GIB = 2 ** 30
 DAY = 86400.0
@@ -106,6 +110,15 @@ class Geometry:
             share = 1.0 if role_share is None else role_share.get(spec.role, 1.0)
             total += float(np.sum(-(-(hi - lo) // tpp))) * share
         return self.heads * total
+
+    def hbm_bytes(self, ctx):
+        """HBM-tier KV bytes of one request with ``ctx`` tokens (e.g. KIVI's full-precision residual)."""
+        ctx = np.asarray(ctx, dtype=np.int64)
+        total = np.zeros_like(ctx)
+        for spec in self.hbm:
+            lo, hi = self.window(spec, ctx)
+            total += (hi - lo) * spec.token_bytes
+        return self.layers * self.heads * total
 
     def partial_pages(self):
         """Pages of HBM staging per running request: one partial page per (layer, head, HBF tensor)."""
@@ -335,9 +348,9 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
     rounds at kappa 1 (ceil(pages / 1,024), or the busiest partition's), the demand ratios of
     the mode against dense at the same batch, and the per-step hot factor (max block reads over
     ppb x read share). Pages per block do not change rounds or est, so they are fixed at 256.
-    Returns the fields for ``Clock`` plus diagnostics.
+    Returns the fields for ``Clock`` plus diagnostics. Safe for concurrent processes sharing
+    ``directory`` (an exclusive lock per digest).
     """
-    import shutil
     batches = tuple(batches or calibration_batches(model, kv_format, context))
     inputs = {"model": model, "gpu": gpu, "format": kv_format, "mode": mode, "generation": generation or {},
               "context": context, "batches": list(batches), "device": list(device), "policy": policy,
@@ -348,6 +361,39 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
     if cached.is_file():
         return json.loads(cached.read_text())
     root.mkdir(parents=True, exist_ok=True)
+    # Sweep workers share the cache: one process fits a digest while the others wait on the lock and
+    # then read its result; calibration.json appears atomically (os.replace).
+    with _exclusive(root / ".lock"):
+        if cached.is_file():
+            return json.loads(cached.read_text())
+        result = _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, context, batches, device,
+                                  policy, partition, snapshot_batch)
+        temporary = root / f".calibration-{os.getpid()}.json"
+        temporary.write_text(json.dumps(result, indent=2) + "\n")
+        os.replace(temporary, cached)
+    return result
+
+
+@contextmanager
+def _exclusive(path):
+    """An exclusive advisory lock on ``path`` (fcntl.flock; a no-op where fcntl is missing)."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - not POSIX
+        yield
+        return
+    with open(path, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, context, batches, device, policy,
+                     partition, snapshot_batch):
+    """The phase A runs and fits of ``calibrate`` (called with the cache lock held)."""
+    import shutil
 
     def fresh(name):
         target = root / name
@@ -406,7 +452,6 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
               "snapshot": {"policy": snap_policy, "partition": snap_part, "batch": b,
                            "tpot_ns": snapshot["system"][0]["tpot_hbf_est_ns"] if snapshot["system"] else None},
               "inputs": inputs, "points": len(points)}
-    cached.write_text(json.dumps(result, indent=2) + "\n")
     return result
 
 
@@ -635,7 +680,9 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
                "tpot_m5_ms": (step.tpot_ns + m5_row["extra_step_ns"]) / 1e6,
                "max_step_extra_ms": m5_row["max_step_extra_ns"] / 1e6, "req_per_s": calls_per_s,
                "tokens_per_s": tokens_per_s, "pages_per_request": host_pages / calls,
-               "kv_bytes_per_token": geometry.token_bytes, "threshold_steps": threshold_steps(x, ppb, share, hot),
+               "kv_bytes_per_token": geometry.hbf_token_bytes,
+               "hbm_bytes_per_request": float(geometry.hbm_bytes(np.array([int(round(ctx))]))[0]),
+               "threshold_steps": threshold_steps(x, ppb, share, hot),
                "refreshes_per_request": refreshes, "kv_write_gb_s": kv * page / 1e9}
         row |= {f"{cause}_gb_s": rates[cause] * page / 1e9 for cause in CAUSES}
         refresh = rates["refresh_rd"] + rates["refresh_ret"] + rates["replay"]
@@ -664,6 +711,1066 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
 
 
 # --------------------------------------------------------------------------------------------
+# Event simulation (M4b)
+
+SIM_POLICIES = ("packed", "dedicated", "hbm_decode", "layer_major")
+WEAR = ("none", "dynamic", "ideal")
+REFRESH = ("auto", "relocate", "replay")
+CAUSE = {cause: index for index, cause in enumerate(CAUSES)}
+EPS = 1e-6
+OPEN, FULL = 1, 2  # segment states (0: never written)
+ACTIVE, IDLE = 1, 2  # entry states (0: unused)
+PRIVATE, PREFIX, SESSION = 0, 1, 2  # entry kinds
+
+
+class CapacityError(RuntimeError):
+    """No free segment for a write or an admission (raise --capacity-gib or lower the load)."""
+
+
+@dataclass(frozen=True)
+class SimOptions:
+    """Settings of one event simulation (CLI names in ``build_parser``)."""
+    policy: str = "packed"
+    x: float = 1e6  # read-disturb threshold in block reads
+    hot: float = 1.0  # persistent read skew (max over mean block reads)
+    share: float = 1.0  # pages sensed per stored page per decode step
+    retention_s: float = 86400.0  # 0: retention refresh off
+    prefix_reads: str = "per_request"
+    hours: float = 24.0
+    warmup_h: float = 1.0
+    quantum_s: float = 1.0
+    report_s: float = 60.0
+    rd_slack: float = 0.01  # shortest quantum as a share of the fastest segment's threshold in steps
+    wear: str = "dynamic"
+    refresh: str = "auto"  # auto: replay for layer_major, relocate otherwise
+    refresh_idle: str = "relocate"  # or evict: idle entries in a refreshed segment are dropped
+    reclaim: str = "evict"  # or compact: idle entries in a reclaim victim are copied too
+    low_watermark: int | None = None  # free segments per partition kept by reclaim (default 2 + one request)
+    align: str = "row"  # packed: a new entry starts on a row
+    slots: int | None = None  # running requests at most (layer_major: slots per wave)
+    stagger: bool = True
+    stacks: int = 1  # for the summary only (the workload is already one stack's share)
+    m5: str = "gaps"
+    t_prog: float = 100000.0
+    t_bers: float = 1000000.0
+    suspend_ns: float | None = None
+    block_unit: str = "die"
+    pe_limits: tuple = (1e4, 1e5, 1e6)
+
+    def __post_init__(self):
+        if self.policy not in SIM_POLICIES:
+            raise ValueError(f"The simulation supports the policies {', '.join(SIM_POLICIES)}; "
+                             "vllm_pool is analytic only (--analytic)")
+        if self.wear not in WEAR or self.refresh not in REFRESH:
+            raise ValueError(f"wear must be one of {', '.join(WEAR)} and refresh one of {', '.join(REFRESH)}")
+        if self.refresh_idle not in ("relocate", "evict") or self.reclaim not in ("evict", "compact"):
+            raise ValueError("refresh_idle is relocate or evict; reclaim is evict or compact")
+        if self.prefix_reads not in ("per_request", "once") or self.align not in ("row", "none"):
+            raise ValueError("prefix_reads is per_request or once; align is row or none")
+        if self.m5 not in M5_MODES + ("off",):
+            raise ValueError(f"m5 must be one of {', '.join(M5_MODES + ('off',))}")
+        if self.m5 == "suspend" and self.suspend_ns is None:
+            raise ValueError("m5 suspend needs suspend_ns")
+        if min(self.x, self.hot, self.hours, self.quantum_s, self.report_s) <= 0 or not 0 < self.share <= 1:
+            raise ValueError("x, hot, hours, quantum and report interval must be positive and share in (0, 1]")
+        if self.warmup_h < 0 or self.warmup_h >= self.hours:
+            raise ValueError("The warm-up must be non-negative and shorter than the simulated time")
+        if self.retention_s < 0 or not 0 <= self.rd_slack < 1:
+            raise ValueError("retention_s must be >= 0 and rd_slack in [0, 1)")
+        if self.low_watermark is not None and self.low_watermark < 1:
+            raise ValueError("low_watermark must be at least 1 segment")
+        if self.slots is not None and self.slots < 1:
+            raise ValueError("slots must be positive")
+        if self.policy == "layer_major" and self.refresh == "relocate":
+            raise ValueError("layer_major regions are refreshed in place (replay, spec section 5.7)")
+
+
+class Simulator:
+    """Segment-level event simulation of one HBF stack (design-B section 4); ``simulate`` runs it.
+
+    A segment is one block index across the banks of a partition (a superblock of 1,024 banks, a
+    channel block of 64 or a die block of 16). Placement is row-aligned, so an entry with n pages
+    in a segment puts n / banks pages in each of its blocks and segment-level counts are exact.
+
+    State (struct of arrays): segments (fill, live, pec, block reads since erase x hot, state,
+    owner: a dedicated entry or -2 for a wave region, erases per cause); entries (a request's own
+    KV, a shared prefix or a session history: pages, readers, active or idle, idle deadline);
+    occupancy rows (entry, segment, pages, oldest write time) in COO arrays; running requests in
+    slot arrays (context, end context, staged decode pages, entry, prefix entry, partition).
+
+    One quantum: step time T from the Clock plus the previous quantum's M5 extra; n = quantum / T
+    steps, cut at the earliest predicted read-threshold or retention crossing (not below rd_slack
+    of the fastest segment's threshold in steps); requests complete and arrive at their exact step
+    inside it. Then block reads are applied, staged decode pages are written in whole rows, and
+    idle expiry, read-disturb refresh, retention refresh and reclaim run (design-B section 4.2).
+    """
+
+    def __init__(self, geometry, clock, workload, device=None, options=None, model=None):
+        self.geo, self.clock, self.workload = geometry, clock, workload
+        self.dev = d = device or Device()
+        self.opt = o = options or SimOptions()
+        self.model = model if model is not None else getattr(clock, "model", None)
+        if o.policy == "layer_major" and d.partition != "none":
+            raise ValueError("layer_major uses the whole device (no partition)")
+        if o.refresh == "auto":
+            self.refresh = "replay" if o.policy == "layer_major" else "relocate"
+        else:
+            self.refresh = o.refresh
+        self.writes_decode = o.policy in ("packed", "dedicated")
+        self.hbm_out = o.policy in ("hbm_decode", "layer_major")
+        self.parts, self.row, self.P = d.parts, d.segment_banks, d.segment_pages
+        self.S = S = d.capacity_pages // self.P
+        if S < 2 * self.parts:
+            raise ValueError(f"The device holds {S} segments of {self.P} pages: need at least 2 per partition")
+        self.read_scale = o.share * o.hot / self.row
+        # segments
+        self.fill, self.live, self.reads = np.zeros(S), np.zeros(S), np.zeros(S)
+        self.pec = np.zeros(S, dtype=np.int64)
+        self.state = np.zeros(S, dtype=np.int8)
+        self.owner = np.full(S, -1, dtype=np.int64)
+        self.busy = np.zeros(S, dtype=bool)
+        self.part_of = np.arange(S) % self.parts
+        self.erases = np.zeros((S, len(CAUSES)), dtype=np.int64)
+        self.is_free = np.ones(S, dtype=bool)
+        self.heaps = [[self._key(s) for s in range(p, S, self.parts)] for p in range(self.parts)]
+        self.free_count = np.array([len(heap) for heap in self.heaps], dtype=np.int64)
+        self.part_live = np.zeros(self.parts)
+        self.part_pec = np.zeros(self.parts)  # sum of segment PECs per partition (tie-break for new entries)
+        self.frontier = [-1] * self.parts
+        # entries
+        self.e_cap = 0
+        self.free_entries = []
+        self._grow_entries(256)
+        self.e_rows, self.e_owned, self.e_key = {}, {}, {}
+        self.prefix_entry, self.session_entry = {}, {}
+        self.protected = set()
+        # occupancy rows
+        self.c_e = np.zeros(4096, dtype=np.int64)
+        self.c_s = np.zeros(4096, dtype=np.int64)
+        self.c_n = np.zeros(4096)
+        self.c_t = np.zeros(4096)
+        self.c_v = np.zeros(4096, dtype=bool)
+        self.c_count = self.dead_rows = 0
+        # running requests
+        w = workload
+        self.cap = cap = o.slots or (w.concurrency if w.arrival == "closed" else w.max_batch)
+        self.sl_on = np.zeros(cap, dtype=bool)
+        self.sl_req = [None] * cap
+        self.sl_entry = np.full(cap, -1, dtype=np.int64)
+        self.sl_prefix = np.full(cap, -1, dtype=np.int64)
+        self.sl_ctx = np.zeros(cap, dtype=np.int64)
+        self.sl_end = np.zeros(cap, dtype=np.int64)
+        self.sl_gen = np.zeros(cap, dtype=np.int64)
+        self.sl_part = np.zeros(cap, dtype=np.int64)
+        self.sl_staged = np.zeros(cap)
+        self.free_slots = list(range(cap - 1, -1, -1))
+        self.n_running = 0
+        self.queue = []
+        self.stream = Stream(workload, stagger=o.stagger)
+        self.region, self.region_cache = [], {}
+        # clocks and counters
+        self.t = 0.0
+        self.page_cache = {}
+        self.programs = np.zeros(len(CAUSES))
+        self.seg_erases = np.zeros(len(CAUSES), dtype=np.int64)
+        self.block_erases = 0
+        self.acc = dict.fromkeys(("steps", "tokens", "batch_s", "ctx_s", "decode_s", "tpot_s", "m5_s"), 0.0)
+        self.n = dict.fromkeys(("completed", "admitted", "refresh_rd", "refresh_ret", "compaction", "evicted_pages",
+                                "recompute_tokens", "stalls", "reclaims", "waves", "quanta"), 0.0)
+        self.guard = False
+        self.pending_reads = False
+        self.drops = 0  # bumps whenever live data dies or moves (retry point of a stalled admission)
+        self.blocked = None
+        self.m5_extra = self.max_step_extra = self.staging_peak = 0.0
+        self.m5_mark = (0.0, 0)
+        self.free_min = int(self.free_count.sum())
+        self.warm = None
+        self.timeseries = []
+        self.low_wm = o.low_watermark or min(2 + math.ceil(self._max_request_pages() / self.P - 1e-9),
+                                             max(1, S // self.parts // 2))
+        self.wall_s = 0.0
+
+    # ---- helpers ---------------------------------------------------------------------------
+    def _key(self, s):
+        return (0 if self.opt.wear == "none" else int(self.pec[s]), s)
+
+    def pages(self, tokens):
+        """Full HBF pages of ``tokens`` tokens of one request (cached)."""
+        tokens = int(tokens)
+        hit = self.page_cache.get(tokens)
+        if hit is None:
+            hit = self.page_cache[tokens] = float(self.geo.stored_pages(np.array([tokens]))[0])
+        return hit
+
+    def _max_request_pages(self):
+        w = self.workload
+
+        def top(length):
+            if length is None:
+                return 0.0
+            return float(length.get("n")) if length.kind == "fixed" else float(length._grid()[-1])
+        if w.arrival == "script":
+            tokens = max(int(item["input"]) + int(item["output"]) for item in w.script)
+        elif w.sessions:
+            tokens = top(w.history) + w.calls * (top(w.input) + top(w.output))
+        else:
+            tokens = top(w.input) + top(w.output)
+        return self.pages(int(tokens + w.prefix_tokens))
+
+    def _grow_entries(self, new):
+        fields = (("e_pages", float, 0), ("e_readers", float, 0), ("e_state", np.int8, 0),
+                  ("e_ttl", float, math.inf), ("e_kind", np.int8, 0), ("e_part", np.int64, 0),
+                  ("e_dseg", np.int64, -1), ("e_tokens", float, 0), ("e_steps", float, 0),
+                  ("e_stored", np.int64, 0))  # e_stored: context position up to which the entry is on HBF
+        old = self.e_cap
+        for name, kind, fill in fields:
+            grown = np.full(new, fill, dtype=kind)
+            if old:
+                grown[:old] = getattr(self, name)
+            setattr(self, name, grown)
+        self.free_entries.extend(range(new - 1, old - 1, -1))
+        self.e_cap = new
+
+    def _new_entry(self, kind, part, tokens):
+        if not self.free_entries:
+            self._grow_entries(2 * self.e_cap)
+        e = self.free_entries.pop()
+        self.e_pages[e] = self.e_readers[e] = self.e_steps[e] = 0.0
+        self.e_state[e], self.e_ttl[e], self.e_kind[e] = ACTIVE, math.inf, kind
+        self.e_part[e], self.e_dseg[e], self.e_tokens[e], self.e_stored[e] = part, -1, tokens, 0
+        self.e_rows[e], self.e_owned[e] = {}, []
+        return e
+
+    def _program(self, cause, n):
+        self.programs[CAUSE[cause]] += n
+
+    # ---- occupancy rows --------------------------------------------------------------------
+    def _row(self, e, s, n):
+        rows = self.e_rows[e]
+        i = rows.get(s)
+        if i is not None:  # keeps the older write time (conservative for retention)
+            self.c_n[i] += n
+            return
+        if self.c_count == len(self.c_e):
+            if self.dead_rows > self.c_count // 2:
+                self._compact_rows()
+            else:
+                for name in ("c_e", "c_s", "c_n", "c_t", "c_v"):
+                    array = getattr(self, name)
+                    grown = np.zeros(2 * len(array), dtype=array.dtype)
+                    grown[:len(array)] = array
+                    setattr(self, name, grown)
+        i = self.c_count
+        self.c_e[i], self.c_s[i], self.c_n[i], self.c_t[i], self.c_v[i] = e, s, n, self.t, True
+        self.c_count += 1
+        rows[s] = i
+
+    def _compact_rows(self):
+        self._flush_reads()
+        keep = np.flatnonzero(self.c_v[:self.c_count])
+        for name in ("c_e", "c_s", "c_n", "c_t", "c_v"):
+            array = getattr(self, name)
+            array[:len(keep)] = array[keep]
+        self.c_v[len(keep):] = False
+        self.c_count, self.dead_rows = len(keep), 0
+        for rows in self.e_rows.values():
+            rows.clear()
+        for i, (e, s) in enumerate(zip(self.c_e[:len(keep)].tolist(), self.c_s[:len(keep)].tolist())):
+            self.e_rows[e][s] = i
+
+    def _drop(self, i):
+        """Invalidate occupancy row i; returns (entry, pages)."""
+        e, s, n = int(self.c_e[i]), int(self.c_s[i]), float(self.c_n[i])
+        self.c_v[i] = False
+        self.dead_rows += 1
+        self.drops += 1
+        del self.e_rows[e][s]
+        self.e_pages[e] -= n
+        self.live[s] -= n
+        self.part_live[self.part_of[s]] -= n
+        if self.live[s] < EPS:
+            self.live[s] = 0.0
+            self._release(s)
+        return e, n
+
+    # ---- segments --------------------------------------------------------------------------
+    def _release(self, s):
+        """Mark segment s free when it is closed, unowned and holds no live data."""
+        if (self.is_free[s] or self.busy[s] or self.state[s] == OPEN or self.owner[s] != -1
+                or self.live[s] > EPS):
+            return
+        self.is_free[s] = True
+        p = self.part_of[s]
+        heapq.heappush(self.heaps[p], self._key(s))
+        self.free_count[p] += 1
+        self.drops += 1
+
+    def _take(self, part):
+        heap = self.heaps[part]
+        while heap:
+            s = heapq.heappop(heap)[1]
+            if self.is_free[s]:
+                self.is_free[s] = False
+                self.free_count[part] -= 1
+                self.free_min = min(self.free_min, int(self.free_count.sum()))
+                return s
+        return -1
+
+    def _erase(self, s, cause):
+        """Row-0 write of segment s: every block of it is auto-erased (spec section 5.4.1 item 5)."""
+        c = CAUSE[cause]
+        self.pec[s] += 1
+        self.part_pec[self.part_of[s]] += 1
+        self.erases[s, c] += 1
+        self.seg_erases[c] += 1
+        self.block_erases += self.row
+        self.reads[s] = 0.0
+
+    def _open(self, part, cause, owner=-1):
+        """Take a free segment of ``part`` and write its row 0 (an erase), reclaiming first when none is free."""
+        s = self._take(part)
+        if s < 0 and not self.guard:
+            self._reclaim(part, force=True, target=self.P)
+            if owner < 0 and self.frontier[part] >= 0:  # compaction opened a frontier: continue there
+                return self.frontier[part]
+            s = self._take(part)
+        if s < 0:
+            raise CapacityError(f"No free segment in partition {part} at t = {self.t:.1f} s "
+                                f"({self.S} segments of {self.P} pages); raise --capacity-gib or --low-watermark")
+        self._erase(s, cause)
+        self.state[s], self.owner[s], self.fill[s] = OPEN, owner, 0.0
+        if owner >= 0:
+            self.e_owned[owner].append(s)
+        else:
+            self.frontier[part] = s
+        return s
+
+    def _close(self, s):
+        self.state[s] = FULL
+        p = self.part_of[s]
+        if self.frontier[p] == s:
+            self.frontier[p] = -1
+        o = self.owner[s]
+        if o >= 0 and self.e_dseg[o] == s:
+            self.e_dseg[o] = -1
+        self._release(s)
+
+    # ---- writes ----------------------------------------------------------------------------
+    def _write(self, e, n, cause, align=False):
+        """Append n pages of entry e: the partition's frontier, or the entry's own segment (dedicated)."""
+        part = int(self.e_part[e])
+        dedicated = self.opt.policy == "dedicated"
+        while n > EPS:
+            if dedicated:
+                s = int(self.e_dseg[e])
+                if s < 0:
+                    s = self._open(part, cause, owner=e)
+                    self.e_dseg[e] = s
+            else:
+                s = self.frontier[part]
+                if s >= 0 and align and self.opt.align == "row":
+                    pad = math.ceil(self.fill[s] / self.row - 1e-9) * self.row - self.fill[s]
+                    if pad > EPS:
+                        self.fill[s] += pad
+                        self._program("padding", pad)
+                        if self.fill[s] >= self.P - EPS:
+                            self._close(s)
+                            s = -1
+                if s < 0:
+                    s = self._open(part, cause)
+                align = False
+            k = min(n, self.P - self.fill[s])
+            self.fill[s] += k
+            self.live[s] += k
+            self.part_live[self.part_of[s]] += k
+            self.e_pages[e] += k
+            self._row(e, s, k)
+            self._program(cause, k)
+            n -= k
+            if self.fill[s] >= self.P - EPS:
+                self._close(s)
+
+    def _read_once(self, e):
+        """Prefill attention over a cached entry: every page is read once (no share, no skew)."""
+        for s, i in self.e_rows[e].items():
+            self.reads[s] += self.c_n[i] / self.row
+
+    # ---- block reads -----------------------------------------------------------------------
+    def _flush_reads(self):
+        """Apply the read steps accrued since the last flush to the segments holding each entry."""
+        if not self.pending_reads:
+            return
+        n = self.c_count
+        weight = self.c_n[:n] * self.e_steps[self.c_e[:n]]
+        weight[~self.c_v[:n]] = 0.0
+        self.reads += np.bincount(self.c_s[:n], weight, self.S) * self.read_scale
+        self.e_steps[:] = 0.0
+        self.pending_reads = False
+
+    def _entry_reads(self, e):
+        k = self.e_steps[e]
+        if k:
+            for s, i in self.e_rows[e].items():
+                self.reads[s] += self.c_n[i] * k * self.read_scale
+            self.e_steps[e] = 0.0
+
+    def _rates(self):
+        """Block reads per decode step per segment for the current running set."""
+        on = np.flatnonzero(self.sl_on)
+        rate = np.zeros(self.e_cap)
+        np.add.at(rate, self.sl_entry[on], 1.0)
+        pre = self.sl_prefix[on]
+        pre = pre[pre >= 0]
+        if len(pre):
+            if self.opt.prefix_reads == "per_request":
+                np.add.at(rate, pre, 1.0)
+            else:
+                rate[np.unique(pre)] = 1.0
+        n = self.c_count
+        weight = self.c_n[:n] * rate[self.c_e[:n]]
+        weight[~self.c_v[:n]] = 0.0
+        return np.bincount(self.c_s[:n], weight, self.S) * self.read_scale
+
+    # ---- admission and completion ------------------------------------------------------------
+    def _partition(self):
+        """Partition of a new entry: least live pages; ties to the least worn (wear levelling) or lowest index."""
+        if self.parts == 1:
+            return 0
+        low = np.flatnonzero(self.part_live <= self.part_live.min() + EPS)
+        if self.opt.wear == "none":
+            return int(low[0])
+        return int(low[np.argmin(self.part_pec[low])])
+
+    def _outstanding(self, part):
+        """Pages that running requests of ``part`` will still write (remaining decode plus staged)."""
+        if not self.writes_decode:
+            return 0.0
+        on = np.flatnonzero(self.sl_on & (self.sl_part == part))
+        if not len(on):
+            return 0.0
+        geo = self.geo
+        return float((geo.stored_pages(self.sl_end[on]) - geo.stored_pages(self.sl_ctx[on])).sum()
+                     + self.sl_staged[on].sum())
+
+    def _room(self, part):
+        room = float(self.free_count[part] * self.P)
+        s = self.frontier[part]
+        if s >= 0 and self.opt.policy != "dedicated":
+            room += self.P - self.fill[s]
+        return room
+
+    def _space(self, part, need):
+        """Room for ``need`` pages plus outstanding writes and the reserve, reclaiming when short."""
+        if self.opt.policy == "dedicated":
+            need = math.ceil(need / self.P - 1e-9) * self.P
+        want = need + self._outstanding(part)
+        reserve = (self.low_wm - 1) * self.P
+        if self._room(part) - want >= reserve:
+            return True
+        self._reclaim(part, force=True, target=want + reserve)
+        return self._room(part) - want >= -EPS
+
+    def _admit(self, req):
+        """Start a request: prefix and session entries, prefill writes. False when space is short."""
+        w = self.workload
+        pre_tokens = w.prefix_tokens if req.prefix >= 0 else 0
+        start = pre_tokens + req.history + req.input
+        end = start + req.output
+        sess = self.session_entry.get(req.session, -1) if req.session >= 0 else -1
+        pre = self.prefix_entry.get(req.prefix, -1) if req.prefix >= 0 else -1
+        # A session's history is on HBF up to e_stored (under hbm_decode the last call's output is not:
+        # it is written with this call's prompt); an evicted history is recomputed and rewritten.
+        have = int(self.e_stored[sess]) if sess >= 0 else pre_tokens
+        own = self.pages(start) - self.pages(have)
+        need = own + (self.pages(pre_tokens) if req.prefix >= 0 and pre < 0 else 0.0)
+        if self.writes_decode:
+            need += self.pages(end) - self.pages(start)
+        part = int(self.e_part[sess]) if sess >= 0 else self._partition()
+        keep = [e for e in (sess, pre) if e >= 0]
+        self.protected.update(keep)  # a forced reclaim must not evict what this request reuses
+        try:
+            if not self._space(part, need):
+                return False
+        finally:
+            self.protected.difference_update(keep)
+        if req.prefix >= 0:
+            if pre >= 0:
+                self._read_once(pre)
+            else:
+                pre = self._new_entry(PREFIX, part, pre_tokens)
+                self.prefix_entry[req.prefix], self.e_key[pre] = pre, ("prefix", req.prefix)
+                self._write(pre, self.pages(pre_tokens), "prefill", align=True)
+            self.e_state[pre], self.e_ttl[pre] = ACTIVE, math.inf
+            self.e_readers[pre] += 1
+        if sess >= 0:
+            e = sess
+            self._read_once(e)
+        else:
+            e = self._new_entry(SESSION if req.session >= 0 else PRIVATE, part, 0)
+            if req.session >= 0:
+                self.session_entry[req.session], self.e_key[e] = e, ("session", req.session)
+                self.n["recompute_tokens"] += req.history  # an evicted history is recomputed
+        self.e_state[e], self.e_readers[e], self.e_ttl[e] = ACTIVE, 1.0, math.inf
+        self.e_tokens[e], self.e_stored[e] = start - pre_tokens, start
+        self._write(e, own, "prefill", align=sess < 0)
+        slot = self.free_slots.pop()
+        self.sl_on[slot], self.sl_req[slot] = True, req
+        self.sl_entry[slot], self.sl_prefix[slot], self.sl_part[slot] = e, pre, part
+        self.sl_ctx[slot], self.sl_end[slot], self.sl_gen[slot], self.sl_staged[slot] = start, end, 0, 0.0
+        self.n_running += 1
+        self.n["admitted"] += 1
+        return True
+
+    def _complete(self, slot):
+        req, e, pre = self.sl_req[slot], int(self.sl_entry[slot]), int(self.sl_prefix[slot])
+        if self.sl_staged[slot] > EPS:  # the request's last staged full pages (a partial row)
+            self._entry_reads(e)
+            self._write(e, float(self.sl_staged[slot]), "decode")
+        if self.writes_decode:
+            self.e_stored[e] = self.sl_end[slot]
+            self.e_tokens[e] = self.sl_end[slot] - (self.workload.prefix_tokens if pre >= 0 else 0)
+        self.sl_on[slot], self.sl_req[slot], self.sl_staged[slot] = False, None, 0.0
+        self.free_slots.append(slot)
+        self.n_running -= 1
+        self.n["completed"] += 1
+        w = self.workload
+        if pre >= 0:
+            self.e_readers[pre] -= 1
+            if self.e_readers[pre] <= 0:
+                if w.retain_s > 0:
+                    self._idle(pre, self.t + w.retain_s)
+                else:
+                    self._kill(pre)
+        if req.session >= 0 and not req.last:
+            self._idle(e, math.inf)
+        elif req.retain_s > 0:
+            self._idle(e, self.t + req.retain_s)
+        else:
+            self._kill(e)
+        self.stream.call_done(req, self.t)
+
+    def _idle(self, e, ttl):
+        self.e_state[e], self.e_readers[e], self.e_ttl[e] = IDLE, 0.0, ttl
+
+    def _kill(self, e, evicted=False):
+        self._entry_reads(e)
+        if evicted:
+            self.n["evicted_pages"] += self.e_pages[e]
+            self.n["recompute_tokens"] += self.e_tokens[e]
+        for i in list(self.e_rows[e].values()):
+            self._drop(i)
+        for s in self.e_owned.pop(e, ()):
+            if self.owner[s] == e:
+                self.owner[s] = -1
+                if self.state[s] == OPEN:
+                    self.state[s] = FULL
+                self._release(s)
+        key = self.e_key.pop(e, None)
+        if key is not None:
+            table = self.prefix_entry if key[0] == "prefix" else self.session_entry
+            if table.get(key[1]) == e:
+                del table[key[1]]
+        del self.e_rows[e]
+        self.e_state[e], self.e_readers[e], self.e_pages[e], self.e_dseg[e] = 0, 0.0, 0.0, -1
+        self.e_ttl[e], self.e_steps[e] = math.inf, 0.0
+        self.free_entries.append(e)
+
+    def _admit_pending(self):
+        self.queue.extend(self.stream.arrived(self.t))
+        w = self.workload
+        if self.opt.policy == "layer_major":
+            if not self.n_running:
+                if self.region:
+                    self._end_wave()
+                self._start_wave()
+            return
+        if w.arrival == "closed" and not w.sessions:
+            while self.n_running + len(self.queue) < self.cap:
+                self.queue.append(self.stream.closed_new(self.t))
+        if self.blocked == self.drops:  # nothing died or moved since the last failed admission
+            return
+        while self.queue and self.free_slots:
+            if not self._admit(self.queue[0]):
+                self.n["stalls"] += 1
+                self.blocked = self.drops
+                return
+            self.queue.pop(0)
+        self.blocked = None
+
+    # ---- layer-major waves -------------------------------------------------------------------
+    def _region_span(self, prompt):
+        """Pages a wave writes: phase A's striped layout of H x slots heads at the longest prompt."""
+        if prompt not in self.region_cache:
+            if self.model is not None:
+                span = region_pages(self.model, self.geo.tensors, self.cap, prompt, self.dev.pages_per_block)
+            else:  # no model (tests): every per-head stream padded to whole pages
+                per = sum(int(-(-(hi - lo)[0] // tpp)) for spec, tpp in zip(self.geo.hbf, self.geo.tpp)
+                          for lo, hi in [self.geo.window(spec, np.array([prompt]))])
+                span = float(self.cap * self.geo.layers * self.geo.heads * per)
+            self.region_cache[prompt] = span
+        return self.region_cache[prompt]
+
+    def _start_wave(self):
+        w = self.workload
+        reqs = self.queue[:self.cap]
+        del self.queue[:len(reqs)]
+        while len(reqs) < self.cap and w.arrival == "closed" and not w.sessions:
+            reqs.append(self.stream.closed_new(self.t))
+        if not reqs:
+            return
+        prompts = [(w.prefix_tokens if r.prefix >= 0 else 0) + r.history + r.input for r in reqs]
+        span = self._region_span(max(prompts))
+        need = math.ceil(span / self.P - 1e-9)
+        if self.free_count[0] < need:
+            self._reclaim(0, force=True, target=need * self.P)
+        if self.free_count[0] < need:
+            raise CapacityError(f"A wave region of {span:.0f} pages needs {need} segments, "
+                                f"{self.free_count[0]} are free")
+        self.region = [self._take(0) for _ in range(need)]
+        fills, left = [], span
+        for s in self.region:
+            self._erase(s, "wave")
+            self.state[s], self.owner[s] = FULL, -2
+            self.fill[s] = min(float(self.P), left)
+            fills.append(self.fill[s])
+            left -= self.fill[s]
+        real = 0.0
+        for req, prompt in zip(reqs, prompts):
+            pages = self.pages(prompt)
+            real += pages
+            e = self._new_entry(PRIVATE, 0, prompt)
+            for s, f in zip(self.region, fills):
+                k = pages * f / span
+                self.live[s] += k
+                self.part_live[0] += k
+                self.e_pages[e] += k
+                self._row(e, s, k)
+            self.e_readers[e] = 1.0
+            slot = self.free_slots.pop()
+            self.sl_on[slot], self.sl_req[slot], self.sl_entry[slot], self.sl_prefix[slot] = True, req, e, -1
+            self.sl_ctx[slot], self.sl_end[slot], self.sl_gen[slot] = prompt, prompt + req.output, 0
+            self.sl_part[slot], self.sl_staged[slot] = 0, 0.0
+            self.n_running += 1
+            self.n["admitted"] += 1
+        self._program("prefill", real)
+        self._program("padding", span - real)
+        self.n["waves"] += 1
+
+    def _end_wave(self):
+        for s in self.region:
+            self.owner[s] = -1
+            self._release(s)
+        self.region = []
+
+    # ---- refresh and reclaim -----------------------------------------------------------------
+    def _refresh(self, s, cause):
+        self.n[cause] += 1
+        if self.refresh == "replay":
+            self._replay(s)
+        else:
+            self._relocate(s, cause)
+
+    def _replay(self, s):
+        """Rewrite rows 0 .. fill - 1 of segment s in place, dead pages included (spec section 5.7)."""
+        self._flush_reads()
+        self._erase(s, "replay")
+        self._program("replay", self.fill[s])
+        n = self.c_count
+        self.c_t[:n][self.c_v[:n] & (self.c_s[:n] == s)] = self.t
+
+    def _relocate(self, s, cause):
+        """Move the live pages of segment s (refresh or compaction); idle entries may be evicted instead.
+
+        The pages go to the partition's frontier, or to the owner's own segment (dedicated). Segment s
+        is free afterwards; its erase is counted at its next row-0 write.
+        """
+        self._flush_reads()
+        self.busy[s] = True
+        o = int(self.owner[s])
+        if o >= 0:
+            self.e_owned[o].remove(s)
+            self.owner[s] = -1
+            if self.e_dseg[o] == s:
+                self.e_dseg[o] = -1
+        if self.state[s] == OPEN:
+            self._close(s)
+        evict = self.opt.reclaim == "evict" if cause == "compaction" else self.opt.refresh_idle == "evict"
+        n = self.c_count
+        moves = []
+        for i in np.flatnonzero(self.c_v[:n] & (self.c_s[:n] == s)).tolist():
+            if not self.c_v[i]:
+                continue
+            e = int(self.c_e[i])
+            if evict and self.e_state[e] == IDLE and e not in self.protected:
+                self._kill(e, evicted=True)
+                continue
+            moves.append(self._drop(i))
+        moved = {e for e, _ in moves}
+        self.protected.update(moved)
+        try:
+            for e, pages in moves:
+                self._write(e, pages, cause)
+        finally:
+            self.protected.difference_update(moved)
+        self.busy[s] = False
+        self.reads[s] = 0.0
+        self._release(s)
+
+    def _victim(self, part):
+        """Reclaim victim of ``part``: the closed segment with the fewest pages to copy (greedy)."""
+        n = self.c_count
+        e = self.c_e[:n]
+        keep = self.e_state[e] == ACTIVE
+        if self.protected:
+            keep |= np.isin(e, list(self.protected))
+        if self.opt.reclaim == "compact":
+            keep = self.e_state[e] > 0
+        keep &= self.c_v[:n]
+        copy = np.bincount(self.c_s[:n][keep], self.c_n[:n][keep], self.S)
+        owner_idle = np.zeros(self.S, dtype=bool)
+        owned = self.owner >= 0
+        if owned.any():
+            owner_idle[owned] = (self.e_state[self.owner[owned]] == IDLE) & ~np.isin(self.owner[owned],
+                                                                                      list(self.protected))
+            copy[owner_idle] = 0.0
+        cand = ((self.part_of == part) & (self.state == FULL) & ~self.busy & ~self.is_free
+                & (self.live > EPS) & ((self.owner == -1) | owner_idle))
+        index = np.flatnonzero(cand)
+        if not len(index):
+            return -1
+        least = index[copy[index] <= copy[index].min() + EPS]
+        if len(least) > 1:  # ties: the segment with the oldest data (least recently written first)
+            oldest = np.full(self.S, math.inf)
+            valid = self.c_v[:n]
+            np.minimum.at(oldest, self.c_s[:n][valid], self.c_t[:n][valid])
+            least = least[np.argsort(oldest[least], kind="stable")]
+        best = int(least[0])
+        if copy[best] >= self.P - EPS or copy[best] > self._room(part) + EPS:
+            return -1
+        return best
+
+    def _reclaim(self, part, force=False, target=None):
+        """Free segments of ``part``: while fewer than the low watermark, or (forced) until ``target`` pages fit."""
+        if self.guard:
+            return
+        self.guard = True
+        try:
+            for _ in range(self.S):
+                if force:
+                    if target is not None and self._room(part) >= target:
+                        break
+                elif self.free_count[part] >= self.low_wm:
+                    break
+                victim = self._victim(part)
+                if victim < 0:
+                    break
+                self.n["reclaims"] += 1
+                owner = int(self.owner[victim])
+                if owner >= 0:  # dedicated: an idle owner is evicted with all its segments
+                    self._kill(owner, evicted=True)
+                else:
+                    self.n["compaction"] += 1
+                    self._relocate(victim, "compaction")
+        finally:
+            self.guard = False
+
+    # ---- one quantum ---------------------------------------------------------------------------
+    def _next_retention(self):
+        if not self.opt.retention_s:
+            return math.inf
+        n = self.c_count
+        valid = self.c_v[:n]
+        return float(self.c_t[:n][valid].min()) + self.opt.retention_s if valid.any() else math.inf
+
+    def _next_ttl(self):
+        idle = self.e_state == IDLE
+        return float(self.e_ttl[idle].min()) if idle.any() else math.inf
+
+    def _clock_step(self):
+        on = np.flatnonzero(self.sl_on)
+        parts = self.sl_part[on] if self.parts > 1 else None
+        hbm = self.sl_gen[on] if self.hbm_out else None
+        return self.clock.step(self.sl_ctx[on], parts, self.row if parts is not None else None, hbm)
+
+    def _limit(self, n, T, horizon, warm):
+        """Cut the quantum at the earliest predicted threshold crossing, retention deadline, warm-up end or horizon."""
+        o, t = self.opt, self.t
+        rates = self._rates()
+        read = rates > 0
+        if read.any():
+            rate = rates[read]
+            floor = max(1, int(o.rd_slack * o.x / rate.max()))
+            first = float(((o.x - self.reads[read]) / rate).min())
+            n = min(n, max(floor, math.ceil(first - 1e-9)))
+        for deadline in (self._next_retention(), warm if self.warm is None else math.inf, horizon):
+            if deadline < math.inf:
+                n = min(n, max(1, math.ceil((deadline - t) / T - 1e-9)))
+        return n
+
+    def _advance(self, on, k, T):
+        ctx0 = self.sl_ctx[on]
+        ctx1 = ctx0 + k
+        if self.writes_decode:
+            self.sl_staged[on] += self.geo.stored_pages(ctx1) - self.geo.stored_pages(ctx0)
+        np.add.at(self.e_steps, self.sl_entry[on], k)
+        pre = self.sl_prefix[on]
+        pre = pre[pre >= 0]
+        if len(pre):
+            if self.opt.prefix_reads == "per_request":
+                np.add.at(self.e_steps, pre, k)
+            else:
+                self.e_steps[np.unique(pre)] += k
+        self.pending_reads = True
+        self.sl_ctx[on] = ctx1
+        self.sl_gen[on] += k
+        dt = k * T
+        self.acc["batch_s"] += len(on) * dt
+        self.acc["ctx_s"] += float(ctx0.sum() + ctx1.sum()) / 2 * dt
+        self.acc["tokens"] += len(on) * k
+
+    def _quantum(self, n, T):
+        """Run n decode steps of length T; requests complete and arrive at their exact step. Returns steps run."""
+        t0, done = self.t, 0
+        splits = self.opt.policy != "layer_major"
+        while done < n:
+            on = np.flatnonzero(self.sl_on)
+            if not len(on):
+                break
+            k = max(1, min(n - done, int((self.sl_end[on] - self.sl_ctx[on]).min())))
+            if splits and self.free_slots and self.blocked != self.drops:
+                arrival = self.stream.next_time()
+                if arrival < t0 + n * T:
+                    k = min(k, max(1, math.ceil((arrival - t0) / T - 1e-9) - done))
+            self._advance(on, k, T)
+            done += k
+            self.t = t0 + done * T
+            finished = on[self.sl_ctx[on] >= self.sl_end[on]]
+            for slot in finished.tolist():
+                self._complete(slot)
+            if len(finished) or (self.free_slots and self.stream.next_time() <= self.t + 1e-12):
+                self._admit_pending()
+        return done
+
+    def _flush_decode(self):
+        """Write staged decode pages in whole rows (per partition for packed, per request for dedicated)."""
+        if not self.writes_decode:
+            return
+        on = np.flatnonzero(self.sl_on & (self.sl_staged > EPS))
+        if not len(on):
+            return
+        row = self.row
+        if self.opt.policy == "dedicated":
+            for slot in on.tolist():
+                whole = math.floor(self.sl_staged[slot] / row + 1e-9) * row
+                if whole:
+                    self.sl_staged[slot] -= whole
+                    self._write(int(self.sl_entry[slot]), whole, "decode")
+            return
+        for part in np.unique(self.sl_part[on]).tolist():
+            group = on[self.sl_part[on] == part]
+            total = float(self.sl_staged[group].sum())
+            whole = math.floor(total / row + 1e-9) * row
+            if whole <= 0:
+                continue
+            share = whole / total
+            for slot in group.tolist():
+                pages = float(self.sl_staged[slot]) * share
+                self.sl_staged[slot] -= pages
+                self._write(int(self.sl_entry[slot]), pages, "decode")
+
+    def _housekeeping(self):
+        """Idle expiry, read-disturb refresh, retention refresh and background reclaim."""
+        o = self.opt
+        for e in np.flatnonzero((self.e_state == IDLE) & (self.e_ttl <= self.t + 1e-9)).tolist():
+            if self.e_state[e] == IDLE:
+                self._kill(e)
+        self._flush_reads()
+        for s in np.flatnonzero(self.reads >= o.x * (1 - 1e-9)).tolist():
+            if self.reads[s] < o.x * (1 - 1e-9):
+                continue
+            if self.live[s] > EPS:
+                self._refresh(s, "refresh_rd")
+            elif self.state[s] == OPEN and self.owner[s] == -1:
+                self._close(s)  # blocks past X take no new data
+        if o.retention_s:
+            n = self.c_count
+            due = self.c_v[:n] & (self.c_t[:n] <= self.t - o.retention_s + 1e-6)
+            for s in np.unique(self.c_s[:n][due]).tolist():
+                if self.live[s] > EPS:
+                    self._refresh(s, "refresh_ret")
+        if o.policy != "layer_major":
+            for part in range(self.parts):
+                if self.free_count[part] < self.low_wm:
+                    self._reclaim(part)
+
+    def _m5(self, step, steps):
+        programs, erases = float(self.programs.sum()), self.block_erases
+        if self.opt.m5 != "off":
+            o = self.opt
+            load = {"programs": (programs - self.m5_mark[0]) / steps, "erases": (erases - self.m5_mark[1]) / steps,
+                    "wave_banks": self.row, "gaps_ns": step.gaps_ns, "step_ns": step.tpot_ns}
+            result = interference(load, o.m5, o.t_prog, o.t_bers, o.suspend_ns, block_unit=o.block_unit)
+            self.m5_extra = result["extra_step_ns"]
+            if self.warm is not None:
+                self.max_step_extra = max(self.max_step_extra, result["max_step_extra_ns"])
+        self.m5_mark = (programs, erases)
+
+    def _staging(self):
+        on = np.flatnonzero(self.sl_on)
+        pages = float(self.sl_staged[on].sum()) + len(on) * self.geo.partial_pages()
+        held = float(self.sl_gen[on].sum()) * self.geo.hbf_token_bytes if self.hbm_out else 0.0
+        self.staging_peak = max(self.staging_peak, pages * self.dev.page_bytes + held)
+
+    def run(self):
+        """Simulate ``hours``; returns the summary row (rates over the time after the warm-up)."""
+        o = self.opt
+        wall = time.perf_counter()
+        horizon, warm = o.hours * 3600, o.warmup_h * 3600
+        next_report, step, stuck = 0.0, None, 0
+        if warm <= 0:
+            self.warm = self._snapshot()
+        self._admit_pending()
+        while self.t < horizon - 1e-9:
+            if self.warm is None and self.t >= warm - 1e-9:
+                self.warm = self._snapshot()
+            if self.t >= next_report - 1e-9:
+                self._record(step)
+                next_report = (math.floor(self.t / o.report_s + 1e-9) + 1) * o.report_s
+            if not self.n_running:
+                if self.queue and self.blocked == self.drops and self._next_ttl() == math.inf:
+                    raise CapacityError(f"The next request does not fit even after reclaim (t = {self.t:.1f} s, "
+                                        f"{self.S} segments of {self.P} pages); raise --capacity-gib")
+                events = [self.stream.next_time(), horizon, next_report, self._next_retention(), self._next_ttl()]
+                if self.warm is None:
+                    events.append(warm)
+                before = self.t
+                self.t = max(min(events), self.t)
+                self._housekeeping()
+                self.m5_mark = (float(self.programs.sum()), self.block_erases)
+                self._admit_pending()
+                stuck = stuck + 1 if self.t <= before and not self.n_running else 0
+                if stuck > 1000:
+                    raise RuntimeError(f"The simulation makes no progress at t = {self.t:.3f} s")
+                continue
+            step = self._clock_step()
+            T = (step.tpot_ns + self.m5_extra) / 1e9
+            n = self._limit(max(1, int(o.quantum_s / T + 1e-9)), T, horizon, warm)
+            steps = self._quantum(n, T)
+            self.n["quanta"] += 1
+            self._staging()
+            self._flush_reads()  # before the flush: staged pages were read from HBM, not HBF
+            self._flush_decode()
+            self._housekeeping()
+            if steps:
+                self.acc["steps"] += steps
+                self.acc["decode_s"] += steps * T
+                self.acc["tpot_s"] += steps * step.tpot_ns / 1e9
+                self.acc["m5_s"] += steps * self.m5_extra / 1e9
+                self._m5(step, steps)
+            self._admit_pending()
+        if self.warm is None:
+            self.warm = self._snapshot()
+        self._record(step)
+        self.wall_s = time.perf_counter() - wall
+        return self.summary()
+
+    # ---- outputs -------------------------------------------------------------------------------
+    def _snapshot(self):
+        return {"t": self.t, "programs": self.programs.copy(), "seg_erases": self.seg_erases.copy(),
+                "block_erases": self.block_erases, "pec": self.pec.copy(), "acc": dict(self.acc), "n": dict(self.n)}
+
+    def _record(self, step):
+        page, on = self.dev.page_bytes, np.flatnonzero(self.sl_on)
+        idle = float(self.e_pages[self.e_state == IDLE].sum())
+        row = {"t_s": self.t, "running": self.n_running, "queued": len(self.queue),
+               "sum_context": int(self.sl_ctx[on].sum()),
+               "tpot_ms": step.tpot_ns / 1e6 if step else None,
+               "tpot_m5_ms": (step.tpot_ns + self.m5_extra) / 1e6 if step else None}
+        row |= {f"{cause}_gb": self.programs[i] * page / 1e9 for i, cause in enumerate(CAUSES)}
+        row |= {f"erases_{cause}": int(self.seg_erases[i]) for i, cause in enumerate(CAUSES)}
+        row |= {"block_erases": self.block_erases, "free_segments": int(self.free_count.sum()),
+                "live_pages": float(self.live.sum()), "idle_pages": idle, "stranded_pages": 0.0,
+                "avg_pec": float(self.pec.mean()), "max_pec": int(self.pec.max()),
+                "max_reads_over_x": float(self.reads.max() / self.opt.x)}
+        self.timeseries.append(row)
+
+    def summary(self):
+        o, d, w0 = self.opt, self.dev, self.warm
+        span = max(self.t - w0["t"], 1e-9)
+        page, ppb = d.page_bytes, d.pages_per_block
+        prog = self.programs - w0["programs"]
+        host = prog[CAUSE["prefill"]] + prog[CAUSE["decode"]]
+        total = float(prog.sum())
+        erased = (self.block_erases - w0["block_erases"]) * ppb
+        days = span / DAY
+        dpec = self.pec - w0["pec"]
+        avg_day = float(dpec.mean()) / days
+        max_day = avg_day if o.wear == "ideal" else float(dpec.max()) / days
+        acc = {key: self.acc[key] - w0["acc"][key] for key in self.acc}
+        n = {key: self.n[key] - w0["n"][key] for key in self.n}
+        steps, tokens = acc["steps"], acc["tokens"]
+        mean_ctx = acc["ctx_s"] / acc["batch_s"] if acc["batch_s"] else 0.0
+        tpot = acc["tpot_s"] / steps if steps else None
+        refresh = prog[CAUSE["refresh_rd"]] + prog[CAUSE["refresh_ret"]] + prog[CAUSE["replay"]]
+        row = {"workload": self.workload.name, "policy": o.policy, "partition": d.partition, "pages_per_block": ppb,
+               "x": o.x, "stacks": o.stacks, "mean_batch": acc["batch_s"] / span, "mean_context": mean_ctx,
+               "mean_tpot_ms": tpot * 1e3 if steps else None,
+               "tpot_m5_ms": (acc["tpot_s"] + acc["m5_s"]) / steps * 1e3 if steps else None,
+               "max_step_extra_ms": self.max_step_extra / 1e6, "req_per_s": n["completed"] / span,
+               "tokens_per_s": tokens / span, "pages_per_request": host / n["completed"] if n["completed"] else None,
+               "kv_bytes_per_token": self.geo.hbf_token_bytes,
+               "hbm_bytes_per_request": float(self.geo.hbm_bytes(np.array([int(round(mean_ctx))]))[0]),
+               "threshold_steps": threshold_steps(o.x, ppb, o.share, o.hot),
+               "refreshes_per_request": prog[CAUSE["refresh_rd"]] / host if host else None,
+               "kv_write_gb_s": host * page / span / 1e9}
+        row |= {f"{cause}_gb_s": prog[i] * page / span / 1e9 for i, cause in enumerate(CAUSES)}
+        row |= {"program_gb_s": total * page / span / 1e9,
+                "program_bw_share": total * page / span / (d.banks * page / (o.t_prog / 1e9)),
+                "wa": total / host if host else None, "erase_amp": erased / total if total else None,
+                "erase_wa": erased / host if host else None, "refresh_to_kv": refresh / host if host else None,
+                "erases_per_s": erased / ppb / span, "avg_pec_per_day": avg_day, "max_pec_per_day": max_day}
+        for limit in o.pe_limits:
+            row[f"days_to_limit_avg@{sci(limit)}"] = limit / avg_day if avg_day else math.inf
+        for limit in o.pe_limits:
+            row[f"days_to_limit_max@{sci(limit)}"] = limit / max_day if max_day else math.inf
+        row["pe_per_mtok"] = avg_day / (tokens / span * DAY / 1e6) if tokens else None
+        row["break_even_x"] = None
+        row["staging_peak_mib"] = self.staging_peak / 2 ** 20
+        row["pending_units_per_channel"] = row["mean_batch"] * self.geo.partial_pages() / 16
+        row["unit_open_s"] = max(self.geo.tpp) * tpot if steps else None
+        row["replay_buffer_mib"] = self.P * page / 2 ** 20 if self.refresh == "replay" else 0.0
+        row["legal"] = True
+        row |= {"hours": o.hours, "warmup_h": o.warmup_h, "measured_h": span / 3600, "segments": self.S,
+                "segment_pages": self.P, "low_watermark": self.low_wm, "decode_steps": int(steps),
+                "completed": int(n["completed"]),
+                "refresh_events_rd": int(n["refresh_rd"]), "refresh_events_ret": int(n["refresh_ret"]),
+                "compaction_events": int(n["compaction"]), "waves": int(n["waves"]),
+                "segment_erases": int((self.seg_erases - w0["seg_erases"]).sum()),
+                "free_segments_min": self.free_min, "evicted_gb": n["evicted_pages"] * page / 1e9,
+                "recompute_tokens": n["recompute_tokens"], "stalls": int(n["stalls"]), "stranded_frac": 0.0,
+                "quanta": int(self.n["quanta"]), "wall_s": self.wall_s}
+        return row
+
+    def segment_rows(self):
+        rows = []
+        for s in range(self.S):
+            row = {"segment": s, "partition": int(self.part_of[s]), "state": int(self.state[s]),
+                   "pec": int(self.pec[s]), "live_pages": float(self.live[s]), "fill_pages": float(self.fill[s]),
+                   "reads": float(self.reads[s])}
+            row |= {f"erases_{cause}": int(self.erases[s, i]) for i, cause in enumerate(CAUSES)}
+            rows.append(row)
+        return rows
+
+
+def simulate(geometry, clock, workload, device=None, options=None, model=None):
+    """Run the event simulation of one stack; returns the Simulator with ``result`` (the summary row),
+    ``timeseries`` and ``segment_rows()``. ``workload`` is one stack's share (``workload.per_stack``)."""
+    sim = Simulator(geometry, clock, workload, device, options, model)
+    sim.result = sim.run()
+    return sim
+
+
+# --------------------------------------------------------------------------------------------
 # Command line, outputs and report
 
 METRICS = ("mean_batch", "mean_context", "mean_tpot_ms", "tpot_m5_ms", "max_step_extra_ms", "req_per_s",
@@ -671,7 +1778,9 @@ METRICS = ("mean_batch", "mean_context", "mean_tpot_ms", "tpot_m5_ms", "max_step
     f"{cause}_gb_s" for cause in CAUSES) + (
     "program_gb_s", "program_bw_share", "wa", "erase_amp", "erase_wa", "refresh_to_kv", "erases_per_s", "avg_pec_per_day",
     "max_pec_per_day", "pe_per_mtok", "break_even_x", "staging_peak_mib", "pending_units_per_channel",
-    "unit_open_s", "replay_buffer_mib", "legal")
+    "unit_open_s", "replay_buffer_mib", "legal") + (  # event simulation only (empty for --analytic)
+    "evicted_gb", "recompute_tokens", "stalls", "free_segments_min", "analytic_avg_pec_per_day",
+    "analytic_refresh_to_kv")
 SPARSE_MODES = ("dense", "uniform_tokens", "uniform_pages", "sink_recent")
 
 
@@ -688,7 +1797,7 @@ def _list(text, kind=str, name="value"):
 def build_parser():
     parser = argparse.ArgumentParser(prog="python -m hbf.endurance", description=__doc__.split("\n\n")[0])
     parser.add_argument("--analytic", action="store_true",
-                        help="closed-form steady state (the event simulation is not implemented yet)")
+                        help="closed-form steady state instead of the event simulation (which needs --hours)")
     parser.add_argument("--model", default="llama-3.1-8b", help="model preset(s), comma separated")
     parser.add_argument("--gpu", default="b200", help="GPU preset (hbf/configs/gpus.json) or JSON")
     parser.add_argument("--format", dest="kv_format", default="bf16",
@@ -698,7 +1807,8 @@ def build_parser():
     parser.add_argument("--fraction", type=float, default=.1, help="selected share (uniform_*, sink_recent)")
     parser.add_argument("--select-tokens", type=int, default=16, help="uniform_tokens block (default 16)")
     parser.add_argument("--count", type=int, default=4, help="sink_recent: sink tokens")
-    parser.add_argument("--seed", type=int, default=1, help="seed of the calibration snapshot's selection")
+    parser.add_argument("--seed", type=int, default=1,
+                        help="seed of the request stream (simulation) and of the calibration snapshot's selection")
     parser.add_argument("--alloc", choices=POLICIES, default="packed",
                         help="allocation policy: packed (default), dedicated, layer_major (static waves), "
                              "hbm_decode (generated KV stays in HBM), vllm_pool (not legal as specified)")
@@ -757,6 +1867,33 @@ def build_parser():
     calib.add_argument("--calibration-dir", type=Path, help="cache of calibration runs (default OUTPUT/calibration)")
     calib.add_argument("--calib-context", type=int,
                        help="context of the calibration runs (default: the workload's mean context, 1K-32K)")
+    sim = parser.add_argument_group("event simulation (without --analytic; design-B section 4)")
+    sim.add_argument("--hours", type=float, help="simulated hours (required without --analytic)")
+    sim.add_argument("--warmup-h", type=float, default=1.0, help="first hours excluded from the rates (default 1)")
+    sim.add_argument("--wear", choices=WEAR, default="dynamic",
+                     help="free-segment allocation: none (lowest index), dynamic (least PEC, default), "
+                          "ideal (as dynamic; max PEC reported as AVGPEC)")
+    sim.add_argument("--refresh", choices=REFRESH, default="auto",
+                     help="read-disturb and retention refresh: relocate live pages (auto for packed, dedicated, "
+                          "hbm_decode) or replay the segment in place (spec section 5.7; auto for layer_major)")
+    sim.add_argument("--refresh-idle", choices=("relocate", "evict"), default="relocate",
+                     help="idle cached entries in a refreshed segment: relocate (default) or drop them")
+    sim.add_argument("--reclaim", choices=("evict", "compact"), default="evict",
+                     help="reclaim victims: evict idle entries, copy active pages (default); compact copies all")
+    sim.add_argument("--low-watermark", type=int,
+                     help="free segments per partition kept by reclaim (default 2 + one maximal request)")
+    sim.add_argument("--report-s", type=float, default=60.0, help="timeseries interval, simulated s (default 60)")
+    sim.add_argument("--quantum-s", type=float, default=1.0, help="longest quantum in seconds (default 1)")
+    sim.add_argument("--rd-slack", type=float, default=.01,
+                     help="shortest quantum as a share of the fastest segment's threshold in steps "
+                          "(default 0.01: a refresh is at most 1%% of X late)")
+    sim.add_argument("--slots", type=int,
+                     help="running requests at most (layer_major: slots per wave; default --concurrency or "
+                          "--max-batch)")
+    sim.add_argument("--align", choices=("row", "none"), default="row",
+                     help="packed: start each new entry on a row (default)")
+    sim.add_argument("--no-stagger", action="store_true",
+                     help="start closed-loop requests together (default: staggered over one request lifetime)")
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -766,7 +1903,20 @@ def configure(args):
     from .model import load_gpu, load_model
     from .system import SystemOptions
     if not args.analytic:
-        raise ValueError("The event simulation (design-B section 4) is not implemented yet; use --analytic")
+        if args.hours is None:
+            raise ValueError("The event simulation needs --hours (simulated time); use --analytic for the "
+                             "closed-form steady state")
+        if args.alloc not in SIM_POLICIES:
+            raise ValueError(f"--alloc {args.alloc} is not simulated (only {', '.join(SIM_POLICIES)}); "
+                             "use --analytic")
+        if args.hours <= 0 or not 0 <= args.warmup_h < args.hours:
+            raise ValueError("--hours must be positive and --warmup-h in [0, --hours)")
+        if args.report_s <= 0 or args.quantum_s <= 0 or not 0 <= args.rd_slack < 1:
+            raise ValueError("--report-s and --quantum-s must be positive and --rd-slack in [0, 1)")
+        if (args.low_watermark is not None and args.low_watermark < 1) or (args.slots is not None and args.slots < 1):
+            raise ValueError("--low-watermark and --slots must be positive")
+        if args.alloc == "layer_major" and args.refresh == "relocate":
+            raise ValueError("layer_major regions are refreshed in place: use --refresh replay or auto")
     params = json.loads((Path(__file__).resolve().parent / "configs" / "parameters.json").read_text())
     models = [load_model(name) for name in _list(args.model, name="model")]
     formats = _list(args.kv_format, name="format")
@@ -810,7 +1960,11 @@ def configure(args):
             "t_prog": args.program_ns or params["program_ns"], "t_bers": args.erase_ns or params["erase_ns"],
             "options": SystemOptions(overlap=args.overlap, kv_consume=args.kv_consume), "m5": args.m5,
             "suspend_ns": args.suspend_ns, "block_unit": args.block_unit, "calibrate": not args.no_calibrate,
-            "calibration_dir": args.calibration_dir, "calib_context": args.calib_context}
+            "calibration_dir": args.calibration_dir, "calib_context": args.calib_context,
+            "analytic": args.analytic, "hours": args.hours, "warmup_h": args.warmup_h, "wear": args.wear,
+            "refresh": args.refresh, "refresh_idle": args.refresh_idle, "reclaim": args.reclaim,
+            "low_watermark": args.low_watermark, "report_s": args.report_s, "quantum_s": args.quantum_s,
+            "rd_slack": args.rd_slack, "slots": args.slots, "align": args.align, "stagger": not args.no_stagger}
 
 
 def _calib_context(workload, given):
@@ -850,19 +2004,95 @@ def make_clock(config, model, kv_format, workload, directory):
 
 
 def run(directory, **config):
-    """Write meta.json, calibration.json, endurance_summary.csv and report.md into ``directory``; returns rows."""
+    """Write meta.json, calibration.json, endurance_summary.csv and report.md into ``directory``; returns rows.
+
+    With ``analytic`` false (no ``--analytic``) every (model, format, workload, ppb, X) is simulated
+    (``simulate``) and endurance_timeseries.csv and endurance_segments.csv are written too.
+    """
     from .system import write_table
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
+    analytic_mode = config.get("analytic", True)
+    if not analytic_mode:
+        rows, calibrations = _simulation_run(directory, config)
+    else:
+        rows, calibrations = _analytic_rows(directory, config)
+    write_table(directory / "endurance_summary.csv", rows)
+    meta = {key: value for key, value in config.items()
+            if key not in ("models", "gpu", "workloads", "options", "calibration_dir")}
+    meta |= {"models": [model.name for model in config["models"]], "gpu": config["gpu_name"],
+             "workloads": [{"name": w.name, "description": w.describe(), "source": w.source}
+                           for w in config["workloads"]],
+             "options": {"overlap": config["options"].overlap, "kv_consume": config["options"].kv_consume},
+             "tool": "endurance", "analytic": analytic_mode, "argv": sys.argv}
+    (directory / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str) + "\n")
+    if calibrations:
+        (directory / "calibration.json").write_text(json.dumps(calibrations, indent=2) + "\n")
+    lines = report_lines(rows, config, calibrations) if analytic_mode else sim_report_lines(rows, config, calibrations)
+    (directory / "report.md").write_text("\n".join(lines) + "\n")
+    return rows
+
+
+def _read_share(config, clock, calib):
+    """Pages read per stored page per step: --read-share, the calibration's, or the sparse fraction."""
+    share = config["read_share"] or (calib["read_share"] if calib else 1.0)
+    if config["mode"] != "dense" and calib is None and config["read_share"] is None:
+        share = config["generation"].get("fraction", 1.0)
+        clock.ratios = {"pages": share}
+    return share
+
+
+def _simulation_run(directory, config):
+    """Simulate every combination; writes the timeseries and segment CSVs, returns (summary rows, calibrations)."""
+    from .system import write_table
+    rows, calibrations, series, segments = [], [], [], []
+    for model, kv_format, workload in itertools.product(config["models"], config["formats"], config["workloads"]):
+        clock, geometry, calib = make_clock(config, model, kv_format, workload, directory)
+        if calib is not None:
+            calibrations.append({"model": model.name, "format": kv_format, "workload": workload.name} | calib)
+        share = _read_share(config, clock, calib)
+        share_of_stack = per_stack(workload, config["stacks"])
+        for ppb, x in itertools.product(config["pages_per_block"], config["x_values"]):
+            device = Device(pages_per_block=ppb, capacity_gib=config["capacity_gib"], partition=config["partition"])
+            options = SimOptions(
+                policy=config["policy"], x=x, hot=config["hot"], share=share, retention_s=config["retention_s"],
+                prefix_reads=config["prefix_reads"], hours=config["hours"], warmup_h=config["warmup_h"],
+                quantum_s=config["quantum_s"], report_s=config["report_s"], rd_slack=config["rd_slack"],
+                wear=config["wear"], refresh=config["refresh"], refresh_idle=config["refresh_idle"],
+                reclaim=config["reclaim"], low_watermark=config["low_watermark"], align=config["align"],
+                slots=config["slots"], stagger=config["stagger"], stacks=config["stacks"], m5=config["m5"],
+                t_prog=config["t_prog"], t_bers=config["t_bers"], suspend_ns=config["suspend_ns"],
+                block_unit=config["block_unit"], pe_limits=tuple(config["pe_limits"]))
+            sim = simulate(geometry, clock, share_of_stack, device, options, model=model)
+            try:  # the closed form at the same settings, for comparison
+                ref = analytic(geometry, clock, workload, device, policy=config["policy"], x_values=(x,),
+                               pe_limits=config["pe_limits"], share=share, hot=config["hot"],
+                               retention_s=config["retention_s"], prefix_reads=config["prefix_reads"],
+                               t_prog=config["t_prog"], t_bers=config["t_bers"], m5=config["m5"],
+                               suspend_ns=config["suspend_ns"], block_unit=config["block_unit"],
+                               stacks=config["stacks"], align=config["align"])[0]
+            except (ValueError, ZeroDivisionError):
+                ref = {}
+            key = {"model": model.name, "format": kv_format, "mode": config["mode"], "read_share": share}
+            rows.append(key | sim.result | {name: ref.get(name[len("analytic_"):]) for name in
+                                            ("analytic_avg_pec_per_day", "analytic_refresh_to_kv",
+                                             "analytic_kv_write_gb_s", "analytic_req_per_s")})
+            tag = {"model": model.name, "format": kv_format, "workload": workload.name, "pages_per_block": ppb, "x": x}
+            series += [tag | row for row in sim.timeseries]
+            segments += [tag | row for row in sim.segment_rows()]
+    write_table(directory / "endurance_timeseries.csv", series)
+    write_table(directory / "endurance_segments.csv", segments)
+    return rows, calibrations
+
+
+def _analytic_rows(directory, config):
+    """Closed-form rows of every combination (``analytic``); returns (rows, calibrations)."""
     rows, calibrations = [], []
     for model, kv_format, workload in itertools.product(config["models"], config["formats"], config["workloads"]):
         clock, geometry, calib = make_clock(config, model, kv_format, workload, directory)
         if calib is not None:
             calibrations.append({"model": model.name, "format": kv_format, "workload": workload.name} | calib)
-        share = config["read_share"] or (calib["read_share"] if calib else 1.0)
-        if config["mode"] != "dense" and calib is None and config["read_share"] is None:
-            share = config["generation"].get("fraction", 1.0)
-            clock.ratios = {"pages": share}
+        share = _read_share(config, clock, calib)
         for ppb in config["pages_per_block"]:
             device = Device(pages_per_block=ppb, capacity_gib=config["capacity_gib"], partition=config["partition"])
             for row in analytic(geometry, clock, workload, device, policy=config["policy"],
@@ -873,19 +2103,7 @@ def run(directory, **config):
                                 block_unit=config["block_unit"], stacks=config["stacks"]):
                 rows.append({"model": model.name, "format": kv_format, "mode": config["mode"],
                              "read_share": share} | row)
-    write_table(directory / "endurance_summary.csv", rows)
-    meta = {key: value for key, value in config.items()
-            if key not in ("models", "gpu", "workloads", "options", "calibration_dir")}
-    meta |= {"models": [model.name for model in config["models"]], "gpu": config["gpu_name"],
-             "workloads": [{"name": w.name, "description": w.describe(), "source": w.source}
-                           for w in config["workloads"]],
-             "options": {"overlap": config["options"].overlap, "kv_consume": config["options"].kv_consume},
-             "tool": "endurance", "analytic": True, "argv": sys.argv}
-    (directory / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str) + "\n")
-    if calibrations:
-        (directory / "calibration.json").write_text(json.dumps(calibrations, indent=2) + "\n")
-    (directory / "report.md").write_text("\n".join(report_lines(rows, config, calibrations)) + "\n")
-    return rows
+    return rows, calibrations
 
 
 def summarize_run(directory, head_dim=None):
@@ -956,19 +2174,7 @@ def report_lines(rows, config, calibrations=()):
                   f"（例如第一行 {first['program_bw_share']:.4f}）、HBM 暂存峰值 {first['staging_peak_mib']:.1f} MiB、"
                   f"逐页涓流写时每主机通道同时未完成的 4 KiB 单元 {first['pending_units_per_channel']:.0f} 个"
                   f"（每个要开 {first['unit_open_s']:.2f} s；规范第 5.4.1 节第 7 条举例的产品上限是每通道 64 或 128 个）。"]
-    if calibrations:
-        lines += ["", "## 时钟校准", "",
-                  "时钟按 phase A 的每层估算 est = layer_ns + round_ns × 轮数（对 MQSim 校准过的估算），"
-                  "两点（稠密 layer-major，批大小使每层约 32 与 128 轮）拟合 layer_ns、round_ns（截距为负时固定为 4,000 ns 只拟合斜率）；策略快照（`--alloc`）给出均衡系数 κ"
-                  "（实测轮数 / 理想轮数）和稀疏读取相对稠密的需求比例。", "",
-                  "| 模型 | 格式 | 负载 | 拟合批 | layer_ns | round_ns | 快照批 | κ | 读比例 | 单步热度 | 快照 phase A TPOT ms |",
-                  "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
-        for c in calibrations:
-            tpot = c["snapshot"]["tpot_ns"]
-            lines.append(f"| {c['model']} | {c['format']} | {c['workload']} | {c['batches']} | {c['layer_ns']:.0f} | "
-                         f"{c['round_ns']:.1f} | {c['snapshot']['batch']} | {c['balance']:.4f} | {c['read_share']:.4f} | "
-                         f"{c['hot_step']:.2f} | "
-                         f"{_fmt(tpot / 1e6 if tpot else None, 3)} |")
+    lines += _calibration_lines(calibrations)
     lines += ["", "## 结论要点", "",
               "- 稠密读取时，一个装满的块每步被读 ppb 次，所以读扰阈值 = X / ppb 步，与 TPOT 和压缩格式无关"
               "（X = 1e5 / 1e6 / 1e7、ppb = 256 时为 390.6 / 3,906 / 39,063 步）。只有活得比这更久的数据（长输出、"
@@ -982,8 +2188,140 @@ def report_lines(rows, config, calibrations=()):
     return lines
 
 
+def _calibration_lines(calibrations):
+    if not calibrations:
+        return []
+    lines = ["", "## 时钟校准", "",
+             "时钟按 phase A 的每层估算 est = layer_ns + round_ns × 轮数（对 MQSim 校准过的估算），"
+             "两点（稠密 layer-major，批大小使每层约 32 与 128 轮）拟合 layer_ns、round_ns（截距为负时固定为 4,000 ns 只拟合斜率）；策略快照（`--alloc`）给出均衡系数 κ"
+             "（实测轮数 / 理想轮数）和稀疏读取相对稠密的需求比例。", "",
+             "| 模型 | 格式 | 负载 | 拟合批 | layer_ns | round_ns | 快照批 | κ | 读比例 | 单步热度 | 快照 phase A TPOT ms |",
+             "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for c in calibrations:
+        tpot = c["snapshot"]["tpot_ns"]
+        lines.append(f"| {c['model']} | {c['format']} | {c['workload']} | {c['batches']} | {c['layer_ns']:.0f} | "
+                     f"{c['round_ns']:.1f} | {c['snapshot']['batch']} | {c['balance']:.4f} | {c['read_share']:.4f} | "
+                     f"{c['hot_step']:.2f} | "
+                     f"{_fmt(tpot / 1e6 if tpot else None, 3)} |")
+    return lines
+
+
+SIM_NAMES = {"packed": "紧凑追加（packed）", "dedicated": "每请求独占段（dedicated）",
+             "layer_major": "静态批次波（layer_major）", "hbm_decode": "生成的 KV 留在 HBM（hbm_decode）"}
+
+
+def sim_report_lines(rows, config, calibrations=()):
+    """Chinese report section 寿命评估 of an event simulation, with every assumption and its source tag."""
+    limits = config["pe_limits"]
+    lines = ["# 寿命评估（事件模拟）", "",
+             f"分配方式：{SIM_NAMES[config['policy']]}，分区 `{config['partition']}`；读取方式 `{config['mode']}`；"
+             f"每个 stack 容量 {config['capacity_gib']:g} GiB，{config['stacks']} 个 stack 分担请求（模拟其中一个）；"
+             f"tPROG {config['t_prog'] / 1e3:g} µs，tBERS {config['t_bers'] / 1e3:g} µs；"
+             f"保持刷新间隔 {config['retention_s'] / 3600:g} h（0 表示关闭），持续读偏斜 h = {config['hot']:g}；"
+             f"模拟 {config['hours']:g} h，前 {config['warmup_h']:g} h 预热不计入速率；"
+             f"磨损分配 `{config['wear']}`，刷新 `{config['refresh']}`，空闲条目刷新时 `{config['refresh_idle']}`，"
+             f"回收 `{config['reclaim']}`，写入干扰 `{config['m5']}`（以 {config['block_unit']} 为阻塞单位）。", ""]
+    for w in config["workloads"]:
+        lines.append(f"- 负载 {w.describe()}。来源：{w.source}")
+    lines += ["", "下表每行是一次模拟（一个 stack，预热之后的速率）。P/E 每天取各段 PEC 的增量：平均即 AVGPEC，"
+              "最大即 MAXPEC（第 5.9.2.17–18 节）；“到 N 的天数”= N_PE / 每天 P/E。写放大 = 编程页 / 主机 KV 页；"
+              "擦除放大 = 擦除的页 / 主机 KV 页。TPOT′ 含写入干扰（M5，滞后一个量子反馈到步时）。"
+              "“解析”两列是同一设置下 `--analytic` 的值，用来对照。", "",
+              "| 模型 | 格式 | 负载 | ppb | X | 批 | TPOT ms | TPOT′ ms | 最大单步拖慢 ms | KV 写 GB/s | 读扰刷新 GB/s "
+              "| 保持刷新 GB/s | 搬移 GB/s | 重放 GB/s | 编程 GB/s | 刷新/KV | 写放大 | 擦除放大 | P/E 每天（平均） "
+              "| P/E 每天（最大） | " + " | ".join(f"到 {sci(limit)} 天（最大）" for limit in limits)
+              + " | 驱逐 GB | 解析 P/E 每天 | 解析 刷新/KV |",
+              "|" + "---|" * 3 + "---:|" * (20 + len(limits))]
+    for row in rows:
+        cells = [row["model"], row["format"], row["workload"], str(row["pages_per_block"]), sci(row["x"]),
+                 _fmt(row["mean_batch"]), _fmt(row["mean_tpot_ms"]), _fmt(row["tpot_m5_ms"]),
+                 _fmt(row["max_step_extra_ms"]), _fmt(row["kv_write_gb_s"], 3), _fmt(row["refresh_rd_gb_s"], 3),
+                 _fmt(row["refresh_ret_gb_s"], 3), _fmt(row["compaction_gb_s"], 3), _fmt(row["replay_gb_s"], 3),
+                 _fmt(row["program_gb_s"], 3), _fmt(row["refresh_to_kv"]), _fmt(row["wa"]), _fmt(row["erase_wa"]),
+                 _fmt(row["avg_pec_per_day"], 1), _fmt(row["max_pec_per_day"], 1)]
+        cells += [_fmt(row[f"days_to_limit_max@{sci(limit)}"], 1) for limit in limits]
+        cells += [_fmt(row["evicted_gb"], 1), _fmt(row["analytic_avg_pec_per_day"], 1),
+                  _fmt(row["analytic_refresh_to_kv"])]
+        lines.append("| " + " | ".join(cells) + " |")
+    first = rows[0] if rows else None
+    if first:
+        lines += ["", f"每次模拟 {first['segments']} 个段（每段 {first['segment_pages']} 页），回收低水位 "
+                  f"{first['low_watermark']} 段；第一行用了 {first['quanta']} 个量子、{first['wall_s']:.1f} s。"
+                  "时间序列（每 --report-s 一行：运行与排队请求、TPOT、各原因累计写入与擦除、空闲段、有效页、平均与最大 PEC、"
+                  "最大读次数 / X）在 endurance_timeseries.csv，每段的 PEC、各原因擦除次数和有效页在 endurance_segments.csv。"
+                  f"HBM 暂存峰值 {first['staging_peak_mib']:.1f} MiB。"]
+    lines += ["", "## 与解析模型的差别", "",
+              "- 解析模型把生成的页当作从第一步起就在、每页按请求的全部解码步数计读次数；模拟按页的实际写入时间计，"
+              "所以长输出（reasoning）的读扰刷新低于解析值。",
+              "- 模拟按块计读：被搬移的数据落在正在填充的前沿段里，块中页少、每步读次数少，到 X 的时间更长；"
+              "数据在到 X 前死去时它积累的读次数作废。整段由一个条目占满时两者一致（见 tests/test_endurance.py）。",
+              "- 模拟里写入干扰会拖慢步时、降低请求速率；批大小和上下文随时间波动，TPOT 随批增大，"
+              "所以按请求平均的步时高于平均批下的 TPOT（会话负载约低 10–15 % 的请求速率）。",
+              "- 只在空闲段之间做磨损均衡：容量被空闲缓存占满时只有少数空闲段在轮转，最大 PEC 可以远高于平均值。"]
+    lines += _calibration_lines(calibrations)
+    lines += ["", "## 假设", ""]
+    lines += [f"- {item}" for item in assumptions(config)]
+    return lines
+
+
 def assumptions(config):
-    """Assumption list of the endurance model, each with its source tag (params.md tags in brackets)."""
+    """Assumption list of the endurance model, each with its source tag (params.md tags in brackets).
+
+    The closed form's list is unchanged; for an event simulation (``analytic`` false) the items that
+    describe the closed form's shortcuts are replaced and the simulation's own items are appended.
+    """
+    items = _analytic_assumptions()
+    if config.get("analytic", True):
+        return items
+    replace_items = {
+        "一个请求的所有页": "读扰按块计：一个段（分区内所有 bank 的同一块号）里的条目每步各读一次自己的页，块读次数 = "
+                    "Σ 条目页数 × 读比例 × h / 段的 bank 数；块读次数达到 X 时刷新整段。命中共享前缀或会话历史时，"
+                    "缓存的每页在 prefill 读一次（不乘读比例和 h，与解析模型一致）。",
+        "每天 P/E = 编程页数": "每天 P/E 取预热后各段 PEC 的增量除以天数：平均即理想磨损均衡下的 AVGPEC，"
+                         "最大即 MAXPEC（第 5.9.2.17–18 节）；wear ideal 时最大按平均报告。",
+        "packed：每个新条目": "packed：每个新条目（请求、前缀或会话）的 prompt 从前沿的下一行起点开始（--align row，填充按实际计）；"
+                         "解码页先在 HBM 暂存，每个量子结束时按分区攒成整行写入；请求结束时剩下的整页一起写入"
+                         "（与解析模型的每请求页数一致），只有每 (层, head, 张量) 最后不满的一页留在 HBM 丢弃。",
+        "闭环：每个 stack": "闭环：每个 stack 保持 round(concurrency / stacks) 个请求（会话负载为会话数）；"
+                       "请求在准确的解码步完成并立即补上，prefill 分离，KV 写入完成后开始解码。启动时前 B 个请求的输出依次缩短"
+                       "（第 i 个解码 out − round(i·out/B) 个 token），会话从第 ⌊i·calls/B⌋ 次调用开始，使完成时间错开；"
+                       "预热时间不计入速率（假设）。TPOT 每个量子按当时运行请求的上下文计算。",
+        "写入干扰（M5）": "写入干扰（M5）：默认 gaps 模式（主机把编程、擦除放进 HBF 空闲间隙，符合第 11.5 节“刷新与读不同时发往同一 die”），"
+                     "以 die 为阻塞单位；OCP v0.7.0 没有挂起（suspend）。每个量子按该量子的编程页数和块擦除数（每步平均）计算一次，"
+                     "加到下一个量子的步时上（滞后一个量子），所以会降低请求速率；最大单步拖慢取预热后各量子的最大值。",
+        "速率按每个 stack 计": "速率按每个 stack 计；N 个 stack 时只模拟一个 stack（并发 round(C/N) 或到达率 λ/N），GPU 计算批为 b × N。",
+        "vllm_pool：": None,
+    }
+    out = []
+    for item in items:
+        prefix = next((key for key in replace_items if item.startswith(key)), None)
+        if prefix is None:
+            out.append(item)
+        elif replace_items[prefix] is not None:
+            out.append(replace_items[prefix])
+    out += [
+        "段级状态（设计 B 第 4.1 节）：段 = 分区内所有 bank 的同一块号（ppb 256 时超级块 1 GiB、通道块 64 MiB、die 块 16 MiB）；"
+        "按行对齐放置时一个条目在段内每个块里的页数相同，所以按段计数是精确的（假设：主机按行写入）。",
+        f"量子：每个量子至多 {config.get('quantum_s', 1.0):g} s，在最早的预计读扰阈值或保持到期处截断，但不短于最快的段阈值步数的 "
+        f"{config.get('rd_slack', .01):g}（刷新最多晚这么多的 X，计数偏差不超过这个比例）；量子内步时不变，"
+        "请求在准确的步完成和到达。暂存在 HBM 的页不计 HBF 读次数，量子内新写入的页从下一个量子开始计读。",
+        "读扰与保持刷新：relocate（日志式分配的默认）把段内有效页写到前沿（dedicated 写到条目自己的新段），旧段在下次写第 0 行时才擦除；"
+        "replay（layer_major 默认，第 5.7 节）原地重写第 0 行到最后写入的行，包括无效页和填充页（不得跳跃），需要一段的 HBM 副本。"
+        "--refresh-idle evict 时段内的空闲缓存条目直接丢弃（以后重算）。",
+        "回收：某分区空闲段少于低水位（默认 2 段 + 一个最大请求的段数）时，选需要搬移的页最少的段（贪心；相同时选数据最老的），"
+        "先驱逐其中的空闲条目（整条丢弃，记为重算 token），再把活跃页搬到前沿（compaction）；--reclaim compact 时空闲条目也搬移。"
+        "准入时为请求预留全部预计页数（prefill + 解码）和低水位减一段；做不到时先强制回收，仍放不下就排队。",
+        "磨损分配：none 取编号最小的空闲段，dynamic 取 PEC 最小的空闲段，ideal 同 dynamic。只在空闲段之间均衡，"
+        "不搬移冷数据（没有静态磨损均衡），所以容量被空闲缓存占满时最大 PEC 会远高于平均。"
+        "新条目放在有效页最少的分区，相同时选磨损最少的分区（wear none 时选编号最小的）。",
+        "hbm_decode 的会话：上一次调用生成的 KV 不写入 HBF，由下一次调用的 prompt 一起写入（偏保守）。"
+        "被驱逐的会话历史在下一次调用时整段重算并重写。",
+        "vllm_pool 只有解析模式（--analytic）；事件模拟不支持。",
+    ]
+    return out
+
+
+def _analytic_assumptions():
     items = [
         "写入顺序：NAND 块内地址连续、不得跳跃，写页 0（WL-0、STR-0）时自动擦除该块（OCP v0.7.0 第 5.4.1 节第 4、5、9 条）。"
         "第 4 条的“主机通道分配的全局地址范围内不得跳跃”按每个 NAND 块理解（与第 9 条和第 11.5.2.6 节一致）；"
@@ -1037,7 +2375,7 @@ def main(argv=None):
     try:
         config = configure(args)
         run(directory, **config)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, CapacityError) as error:
         parser.error(str(error))
     print(Path(directory).resolve())
 

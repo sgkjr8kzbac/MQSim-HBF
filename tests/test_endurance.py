@@ -15,6 +15,11 @@ from hbf.endurance import (METRICS, Clock, ConstantClock, Device, analytic, buil
                            summarize_run, threshold_steps)
 from hbf.model import load_gpu, load_model
 from hbf.workload import Workload, load_workload, parse_length, presets
+# Event simulation (design-B section 4, tests 10-15) and the seeded request stream.
+from hbf.access import TensorSpec
+from hbf.endurance import CAUSE, GIB, CapacityError, Geometry, SimOptions, simulate
+from hbf.interference import interference
+from hbf.workload import Stream, scripted
 
 B200 = load_gpu("b200")
 LLAMA8 = load_model("llama-3.1-8b")
@@ -266,3 +271,293 @@ def test_cli_validation():
     with pytest.raises(ValueError):
         configure(parser.parse_args(["--analytic", "--format", "nosuch"]))
     assert sci(1e5) == "1e5" and sci(3e3) == "3e3" and sci(256) == "256"
+
+
+# ---- request stream (hbf/workload.py) ------------------------------------------------------------
+
+def test_stream_closed_loop_is_seeded_and_staggered():
+    w = load_workload("chat", concurrency=4, seed=7)
+    a, b = Stream(w), Stream(w)
+    first = [(r.input, r.output) for r in (a.closed_new(0.0) for _ in range(20))]
+    assert first == [(r.input, r.output) for r in (b.closed_new(0.0) for _ in range(20))]
+    other = Stream(load_workload("chat", concurrency=4, seed=8))
+    assert first != [(r.input, r.output) for r in (other.closed_new(0.0) for _ in range(20))]
+    # The i-th of the first B requests decodes out - round(i out / B) tokens (staggered start).
+    fixed = Stream(load_workload("long32k", concurrency=8))
+    assert [fixed.closed_new(0.0).output for _ in range(10)] == [338, 296, 254, 211, 169, 127, 84, 42, 338, 338]
+    plain = Stream(load_workload("long32k", concurrency=8), stagger=False)
+    assert {plain.closed_new(0.0).output for _ in range(8)} == {338}
+    assert Stream(Workload(arrival="poisson", rate=1.0)).closed_new(0.0) is None
+
+
+def test_stream_poisson_rate_and_prefix_choice():
+    w = Workload(arrival="poisson", rate=10.0, prefix_groups=4, prefix_tokens=64, prefix_share=.5, seed=3)
+    stream = Stream(w)
+    requests = stream.arrived(2000.0)
+    assert len(requests) == pytest.approx(20000, rel=.02) and stream.next_time() > 2000
+    assert np.diff([r.arrival for r in requests]).mean() == pytest.approx(.1, rel=.02)
+    groups = np.array([r.prefix for r in requests])
+    assert (groups >= 0).mean() == pytest.approx(.5, abs=.02)
+    # Zipf 1 over 4 groups: the first takes 1 / (1 + 1/2 + 1/3 + 1/4) = 12/25 of the hits.
+    assert (groups[groups >= 0] == 0).mean() == pytest.approx(12 / 25, abs=.02)
+
+
+def test_stream_sessions_and_script():
+    w = Workload(input="fixed:10", output="fixed:5", calls=3, history="fixed:100", think_s=2.0, concurrency=2)
+    stream = Stream(w)
+    first = stream.arrived(0.0)
+    # Session 1 starts at call floor(1 x 3 / 2) = 1, with call 0's 100 + 10 + 5 tokens written at once.
+    assert [(r.session, r.call, r.input, r.history, r.last) for r in first] == [
+        (0, 0, 110, 0, False), (1, 1, 125, 0, False)]
+    stream.call_done(first[0], 7.0)
+    assert stream.next_time() == 9.0
+    call = stream.arrived(9.0)[0]
+    assert (call.session, call.call, call.history, call.input, call.last) == (0, 1, 115, 10, False)
+    stream.call_done(first[1], 8.0)
+    last = stream.arrived(10.0)[0]
+    assert (last.session, last.call, last.history, last.last) == (1, 2, 130, True)
+    stream.call_done(last, 12.0)  # closed loop: a new session replaces the finished one at once
+    new = stream.arrived(12.0)[0]
+    assert (new.session, new.call, new.input, new.history) == (2, 0, 110, 0)
+    script = Stream(scripted([{"arrival": 2.0, "input": 3, "output": 1}, {"arrival": 1.0, "input": 5, "output": 2}]))
+    assert [r.input for r in script.arrived(5.0)] == [5, 3]
+    with pytest.raises(ValueError):
+        scripted([])
+
+
+# ---- event simulation (design-B section 4, tests 10-15) -------------------------------------------
+
+ONE_PAGE = Geometry(1, 1, (TensorSpec("kv", 8, 4096),))  # one layer and head; a token fills a 4 KiB page
+TEN_MS = ConstantClock(10e6)
+
+
+def tiny(segments, banks=4, ppb=4, partition="none"):
+    """A toy stack of ``segments`` segments of banks x ppb pages."""
+    return Device(banks=banks, pages_per_block=ppb, capacity_gib=segments * banks * ppb * 4096 / GIB,
+                  partition=partition)
+
+
+def sim_opts(**kwargs):
+    return SimOptions(**({"m5": "off", "warmup_h": 0.0, "hours": .01, "retention_s": 0.0, "report_s": 3600.0}
+                         | kwargs))
+
+
+def programs(sim, cause):
+    return sim.programs[CAUSE[cause]]
+
+
+def test_10_read_disturb_refresh_tiny_device():
+    """Banks 4, ppb 4, 8 segments of 16 pages; a 16-page request puts 4 pages in each block, so a dense
+    step reads every block 4 times and X = 40 is reached every 10 steps. 35 steps give 3 refreshes of
+    16 pages, 4 segment openings (the prefill and 3 relocations) and 16 block erases."""
+    w = scripted([{"arrival": 0, "input": 16, "output": 35}])
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(8), sim_opts(policy="hbm_decode", x=40))
+    r = sim.result
+    assert r["threshold_steps"] == 10 and r["decode_steps"] == 35 and r["completed"] == 1
+    assert r["refresh_events_rd"] == 3 and programs(sim, "refresh_rd") == 48 and r["refresh_to_kv"] == 3
+    assert r["segment_erases"] == 4 and sim.block_erases == 16
+    # In-place replay instead (spec section 5.7): the same segment is erased and rewritten 3 times.
+    replay = simulate(ONE_PAGE, TEN_MS, w, tiny(8), sim_opts(policy="hbm_decode", x=40, refresh="replay"))
+    assert replay.result["refresh_events_rd"] == 3 and programs(replay, "replay") == 48
+    assert replay.result["segment_erases"] == 4 and replay.pec.max() == 4
+
+
+def test_11_retention_rewrites_idle_entry():
+    """An entry kept 50 h after its request is rewritten at 24 h and 48 h (T_ret = 24 h)."""
+    w = scripted([{"arrival": 0, "input": 16, "output": 1, "retain_s": 50 * 3600}])
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(8), sim_opts(policy="hbm_decode", x=1e9, hours=60,
+                                                           retention_s=24 * 3600))
+    assert sim.result["refresh_events_ret"] == 2 and programs(sim, "refresh_ret") == 32
+    assert sim.result["segment_erases"] == 3 and sim.live.sum() == 0  # dead after 50 h
+
+
+def test_12_packed_without_pressure():
+    """No capacity pressure: WA = 1 and segment erases = ceil(written pages / segment pages)."""
+    w = scripted([{"arrival": .05 * i, "input": 16, "output": 3} for i in range(10)])
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(64), sim_opts(policy="hbm_decode", x=1e9))
+    assert sim.result["wa"] == 1 and sim.result["segment_erases"] == math.ceil(160 / 16)
+    # With decode writes: 12 prompt + 20 generated pages per request, row-aligned (rows of 4 pages).
+    w = scripted([{"arrival": .5 * i, "input": 12, "output": 20} for i in range(10)])
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(64), sim_opts(policy="packed", x=1e9))
+    assert programs(sim, "prefill") == 120 and programs(sim, "decode") == 200 and programs(sim, "padding") == 0
+    assert sim.result["wa"] == 1 and sim.result["segment_erases"] == math.ceil(320 / 16)
+
+
+def test_13_compaction_two_segments():
+    """A = 12 and B = 4 pages fill segment 0; A dies; C = 16 needs space, so the victim segment 0 (live B)
+    is compacted first: 4 pages copied, WA = (12 + 4 + 16 + 4) / 32 = 1.125."""
+    w = scripted([{"arrival": 0, "input": 12, "output": 1}, {"arrival": 0, "input": 4, "output": 100},
+                  {"arrival": .1, "input": 16, "output": 1}])
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(2), sim_opts(policy="hbm_decode", x=1e9, low_watermark=2))
+    assert programs(sim, "compaction") == 4 and sim.result["wa"] == pytest.approx(1.125)
+    assert sim.result["compaction_events"] == 1 and sim.pec.tolist() == [2, 1]
+
+
+def test_14_dedicated_superblocks():
+    """10 requests of 1,024 + 338 tokens (8B BF16) each own a superblock: 10 erases and erase_wa =
+    262,144 / 43,520 = 6.02 (design-B's 5.95 counts the partial last page, 44,032 pages; it stays in HBM)."""
+    geometry, _ = geometry_for(LLAMA8, "bf16")
+    w = scripted([{"arrival": 10.0 * i, "input": 1024, "output": 338} for i in range(10)])
+    sim = simulate(geometry, TEN_MS, w, Device(), sim_opts(policy="dedicated", x=1e9, hours=.05))
+    r = sim.result
+    assert r["segment_erases"] == 10 and r["erase_wa"] == pytest.approx(SUPERBLOCK / 43_520)
+    assert r["pages_per_request"] == 43_520 and r["wa"] == 1
+    # Channel partition: 64 MiB segments, 3 per request (erase_wa 1.13), one fresh channel per request.
+    channel = simulate(geometry, TEN_MS, w, Device(partition="channel"),
+                       sim_opts(policy="dedicated", x=1e9, hours=.05))
+    assert channel.result["segment_erases"] == 30
+    assert channel.result["erase_wa"] == pytest.approx(3 * 16384 / 43_520)
+    assert len({int(s) % 16 for s in np.flatnonzero(channel.pec)}) == 10
+
+
+@pytest.mark.parametrize("wear,expected", [("none", [100, 0, 0, 0]), ("dynamic", [25, 25, 25, 25])])
+def test_15_wear_allocation(wear, expected):
+    """4 segments, 100 sequential one-segment requests: the lowest free index reuses segment 0 (max PEC
+    100); least-PEC allocation spreads the erases (25 each)."""
+    w = scripted([{"arrival": float(i), "input": 16, "output": 1} for i in range(100)])
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(4), sim_opts(policy="hbm_decode", x=1e9, hours=.03, wear=wear))
+    assert sim.pec.tolist() == expected and sim.result["segment_erases"] == 100
+
+
+def test_layer_major_wave_replays_padding():
+    """A static wave of 2 slots is laid out at its longest prompt (8 tokens): 16 pages, 4 of them padding.
+    Its blocks see 12 live pages / 4 banks = 3 reads per step, so X = 15 replays the whole region in place
+    every 5 steps, padding included (no skipping, spec section 5.7): 12 steps give 2 replays of 16 pages."""
+    w = scripted([{"arrival": 0, "input": 8, "output": 12}, {"arrival": 0, "input": 4, "output": 12}])
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(8), sim_opts(policy="layer_major", x=15, slots=2))
+    r = sim.result
+    assert r["waves"] == 1 and programs(sim, "prefill") == 12 and programs(sim, "padding") == 4
+    assert r["refresh_events_rd"] == 2 and programs(sim, "replay") == 32
+    assert sim.seg_erases[CAUSE["wave"]] == 1 and sim.seg_erases[CAUSE["replay"]] == 2
+    assert r["replay_buffer_mib"] == 16 * 4096 / 2 ** 20
+
+
+def test_shared_prefix_sessions_and_eviction():
+    # A shared prefix is written once; the second request reads it once at prefill (8 pages / 4 banks = 2
+    # reads per block), then each step reads the prefix per request (2 x 8) plus both own 4-page entries.
+    w = scripted([{"arrival": 0, "input": 4, "output": 2, "prefix": 0}] * 2, prefix_groups=1, prefix_tokens=8)
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(8), sim_opts(policy="hbm_decode", x=1e9))
+    assert programs(sim, "prefill") == 16 and sim.reads.max() == 2 + 2 * (16 + 8) / 4
+    once = simulate(ONE_PAGE, TEN_MS, w, tiny(8), sim_opts(policy="hbm_decode", x=1e9, prefix_reads="once"))
+    assert once.reads.max() == 2 + 2 * (8 + 8) / 4
+    # A session: call 0 writes history + input (12 pages) and its 4 generated pages; call 1 (0.5 s later)
+    # appends only its 4 new input pages and reads the 16-page history once at prefill.
+    s = Workload(input="fixed:4", output="fixed:4", calls=2, history="fixed:8", think_s=.5, concurrency=1)
+    sim = simulate(ONE_PAGE, TEN_MS, s, tiny(16), sim_opts(policy="packed", x=1e9, hours=.57 / 3600))
+    assert programs(sim, "prefill") == 16 and programs(sim, "decode") == 4 and sim.result["recompute_tokens"] == 0
+    # Idle entries (kept 100 s) fill a 4-segment device; with a low watermark of 1 the oldest is evicted
+    # whenever the last free segment is taken: requests 3..7 evict entries 0..4 (5 x 16 pages).
+    w = scripted([{"arrival": float(i), "input": 16, "output": 1, "retain_s": 100.0} for i in range(8)])
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(4), sim_opts(policy="hbm_decode", x=1e9, hours=7.5 / 3600,
+                                                           low_watermark=1))
+    assert sim.result["evicted_gb"] == pytest.approx(80 * 4096 / 1e9) and sim.result["recompute_tokens"] == 80
+    with pytest.raises(CapacityError):
+        simulate(ONE_PAGE, TEN_MS, scripted([{"arrival": 0, "input": 80, "output": 1}]), tiny(4), sim_opts())
+
+
+def test_simulation_matches_analytic_in_steady_state():
+    """Closed loop B = 8, 8B BF16, packed allocation, 512 GiB (no pressure), retention and M5 off.
+
+    (a) 32K + 338 tokens with decode writes, no refresh (338 < X / ppb = 3,906 steps): request rate, KV
+    write and P/E per day within 1 % of analytic() (measured: 0.02 %).
+    (b) Decode KV in HBM (hbm_decode), 32K prompts = 4 whole superblocks, X = 3e4 (117.2 steps):
+    floor(512 x 256 / 3e4) = 4 refreshes per request in both models; P/E per day within 1 %."""
+    geometry, _ = geometry_for(LLAMA8, "bf16")
+    cases = ((Workload(input="fixed:32768", output="fixed:338", concurrency=8), 38.57e6, "packed", 1e6),
+             (Workload(input="fixed:32768", output="fixed:512", concurrency=8), 100e6, "hbm_decode", 3e4))
+    for w, tpot, policy, x in cases:
+        clock = ConstantClock(tpot)
+        sim = simulate(geometry, clock, w, Device(), SimOptions(policy=policy, x=x, hours=1.25, warmup_h=.25,
+                                                                 m5="off", retention_s=0))
+        ref = analytic(geometry, clock, w, Device(), policy=policy, x_values=(x,), retention_s=0, m5="off")[0]
+        r = sim.result
+        for key in ("req_per_s", "kv_write_gb_s", "avg_pec_per_day", "wa"):
+            assert r[key] == pytest.approx(ref[key], rel=1e-2), key
+        assert ref["refresh_to_kv"] == (0 if policy == "packed" else 4)
+        assert r["refresh_to_kv"] == pytest.approx(ref["refresh_to_kv"], rel=1e-2)  # window edges: 3.996
+        assert r["mean_batch"] == pytest.approx(8) and r["mean_context"] == pytest.approx(ref["mean_context"], rel=1e-3)
+
+
+def test_simulation_refresh_with_decode_writes_is_below_analytic():
+    """Packed with decode writes and refresh: 32K + 2,048 tokens, X = 1e5 (390.6 steps).
+
+    analytic() gives floor(2,048 x 256 / 1e5) = 5 refreshes of every page, counting generated pages as if
+    present from the first step. The simulation writes them as they are produced and refreshes relocated
+    data when its (partly filled) destination segment reaches X, so it lands between 4 and 5 (4.49 measured
+    over 2.5 h, see docs/design/phase2b-sim-plan.md)."""
+    geometry, _ = geometry_for(LLAMA8, "bf16")
+    w = Workload(input="fixed:32768", output="fixed:2048", concurrency=8)
+    clock = ConstantClock(40e6)
+    sim = simulate(geometry, clock, w, Device(), SimOptions(x=1e5, hours=1.5, warmup_h=.5, m5="off", retention_s=0))
+    ref = analytic(geometry, clock, w, Device(), x_values=(1e5,), retention_s=0, m5="off")[0]
+    assert ref["refresh_to_kv"] == 5 and 4 < sim.result["refresh_to_kv"] < 5
+    assert sim.result["kv_write_gb_s"] == pytest.approx(ref["kv_write_gb_s"], rel=1e-2)
+    assert .8 * ref["avg_pec_per_day"] < sim.result["avg_pec_per_day"] < ref["avg_pec_per_day"]
+
+
+def test_cli_simulation(tmp_path):
+    out = tmp_path / "sim"
+    main(["--no-calibrate", "--workload", "long32k", "--concurrency", "2", "--capacity-gib", "64", "--hours", ".05",
+          "--warmup-h", ".01", "--report-s", "30", "--rd-threshold", "1e5", "--output", str(out)])
+    with (out / "endurance_summary.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1 and rows[0]["policy"] == "packed" and float(rows[0]["mean_batch"]) == pytest.approx(2)
+    assert float(rows[0]["analytic_avg_pec_per_day"]) > 0 and rows[0]["segments"] == "64"
+    with (out / "endurance_timeseries.csv").open(newline="") as stream:
+        series = list(csv.DictReader(stream))
+    assert len(series) == 7 and {"t_s", "running", "tpot_m5_ms", "refresh_rd_gb", "free_segments"} <= set(series[0])
+    with (out / "endurance_segments.csv").open(newline="") as stream:
+        assert len(list(csv.DictReader(stream))) == 64
+    summary = summarize_run(out)
+    assert set(summary) == set(METRICS) and summary["mean_batch"] == pytest.approx(2) and summary["stalls"] == 0
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["tool"] == "endurance" and meta["analytic"] is False and meta["hours"] == .05
+    report = (out / "report.md").read_text()
+    assert "# 寿命评估（事件模拟）" in report and "## 假设" in report and "第 5.7 节" in report
+    assert "## 与解析模型的差别" in report
+
+
+def test_cli_simulation_validation():
+    parser = build_parser()
+    with pytest.raises(ValueError, match="--hours"):
+        configure(parser.parse_args(["--no-calibrate"]))
+    with pytest.raises(ValueError, match="vllm_pool"):
+        configure(parser.parse_args(["--hours", "2", "--alloc", "vllm_pool"]))
+    with pytest.raises(ValueError, match="replay"):
+        configure(parser.parse_args(["--hours", "2", "--alloc", "layer_major", "--refresh", "relocate"]))
+    with pytest.raises(ValueError, match="warmup"):
+        configure(parser.parse_args(["--hours", "1"]))  # the default warm-up is 1 h
+    config = configure(parser.parse_args(["--hours", "2", "--wear", "none", "--no-stagger"]))
+    assert config["analytic"] is False and config["wear"] == "none" and config["stagger"] is False
+    assert {"models", "formats", "workloads", "pages_per_block", "x_values"} <= set(config)
+
+
+def test_m5_hook_per_quantum(monkeypatch):
+    """interference() is called once per quantum with that quantum's programs and block erases per step;
+    over the run the loads times the steps add up to every program and erase (no idle time here). Its
+    extra delays the next quantum: TPOT' > TPOT, gaps hides part of fifo's delay, off adds nothing."""
+    from hbf import endurance
+    geometry, _ = geometry_for(LLAMA8, "bf16")
+    w = Workload(input="fixed:32768", output="fixed:338", concurrency=8)
+    clock = ConstantClock(38.57e6, layers=32)
+    extra = {}
+    for mode in ("fifo", "gaps", "off"):
+        sim = endurance.Simulator(geometry, clock, w, Device(), SimOptions(hours=.25, warmup_h=.05, m5=mode,
+                                                                            retention_s=0))
+        calls = []
+
+        def spy(load, *args, **kwargs):
+            calls.append((load["programs"], load["erases"], sim.acc["steps"]))
+            return interference(load, *args, **kwargs)
+        monkeypatch.setattr(endurance, "interference", spy)
+        r = sim.run()
+        extra[mode] = (r["tpot_m5_ms"] - r["mean_tpot_ms"]) * 1e6
+        if mode == "off":
+            assert not calls and extra[mode] == 0
+            continue
+        steps = np.diff([0.0] + [call[2] for call in calls])
+        assert len(calls) == sim.n["quanta"]
+        assert np.dot([call[0] for call in calls], steps) == pytest.approx(sim.m5_mark[0], rel=1e-9)
+        assert np.dot([call[1] for call in calls], steps) == pytest.approx(sim.m5_mark[1], rel=1e-9)
+        assert r["max_step_extra_ms"] * 1e6 >= extra[mode] > 0
+    assert extra["gaps"] < extra["fifo"]
