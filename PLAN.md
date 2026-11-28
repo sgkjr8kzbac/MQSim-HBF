@@ -2,7 +2,7 @@
 
 本文件记录研究目标、阶段安排、各模块状态和可以认领的任务，供人和 agent 协作时使用。实验结果写在 [REPORT.md](REPORT.md)，用法写在 [README.md](README.md)。设计讨论的原始记录在 [docs/design/](docs/design/)，参数来源在 [docs/research/params.md](docs/research/params.md)。
 
-最后更新：第 2 阶段 B（一）的实验已在本地跑完并写入 REPORT；事件模拟（T-B1d）大部分完成，已合并到两个分支。第 3 阶段在分支 `claude/hbf-kv-terms` 上开发，T-K1、T-K2 已完成。接手说明见 [docs/handoff.md](docs/handoff.md)。测试和实验在本地运行，见 [docs/local-runs.md](docs/local-runs.md)。
+最后更新：本地已完成第 3 阶段 T-K3–T-K7（提交 `bd3b91c`）。**现在进入整理与重构（第 4 阶段），方案见 [docs/design/restructure.md](docs/design/restructure.md)；它完成前不再增加新的研究功能，下面第三节中未完成的功能任务一律暂停。** 测试和实验在本地运行，见 [docs/local-runs.md](docs/local-runs.md)。
 
 ---
 
@@ -30,6 +30,7 @@
 | 2B | 写路径与寿命：请求放置与写顺序检查（M2）、写入与刷新对读的干扰（M5）、寿命模型（M4）；第 3、4 项实验与第 5 项写路径 | 🔄 进行中 |
 | 2C | 真实访问轨迹：真实模型导出（M6）与方法适配器 | ⏳ 未开始（需要 GPU） |
 | 3 | 按 KV 大小公式逐项压缩：页格式（MLA、DSA、量化参数同页）、按层/按头分组（混合注意力、跨层共享、DuoAttention、PyramidKV）、模型预设、token 淘汰与写入流、部分通道读、前缀共享；分支 `claude/hbf-kv-terms` | 🔄 K1、K2 完成；接手说明见 [docs/handoff.md](docs/handoff.md) |
+| 4 | 整理与重构：正确性修复、规范行为作默认、按"前端 → 地址轨迹 → MQSim/轮数后端"分包、扩展分离、MQSim 的 HBF 写入补丁、寿命按 MQSim 窗口外推、请求级数据集（R0–R8） | 🔄 当前，见 [restructure.md](docs/design/restructure.md) |
 
 ### 第 2 阶段 B 的进度
 
@@ -126,10 +127,10 @@ KV 大小 = 2（K、V）× 层数 × KV 头数 × head_dim × token 数 × 每�
 - 仓库文件里不要写 AI 模型的名称或版本号。
 - 不要提交临时文件和大的运行目录。实验结果只保存汇总 CSV，放在 `evidence/` 下。
 
-**不改变默认行为**
-- 新功能一律默认关闭。默认输出必须和改动前逐字节一致，由 `tests/test_golden.py` 守护。
-- 只有在有意改变默认结果时才用 `HBF_REGEN_GOLDEN=1` 重新生成黄金文件，并在提交说明里写明原因。
-- numpy 引擎和纯 Python 参考实现必须逐行一致，由 `tests/test_engine.py` 守护。
+**默认行为**（第 4 阶段起替换原来的"新功能一律默认关闭"）
+- 规范行为一律是默认值，不再为旧行为加开关。旧结果靠 tag `baseline-pre-refactor` 复现。
+- 每个提交要么是纯搬移（固定种子的输出逐字节相同），要么是有意改变行为（写清原因，必要时用 `HBF_REGEN_GOLDEN=1` 重新生成黄金文件），两种不混在一个提交里。
+- MQSim 是模拟器本体：轮数模型的公式改动或新的计时方式，要附一组 MQSim 对照。详见 [restructure.md](docs/design/restructure.md) 第五节。
 
 **测试**
 - 开发中只跑相关的测试文件，例如 `python -m pytest -q tests/test_batch.py`。
