@@ -6,8 +6,8 @@
 
 | 分支 | 内容 | 状态 |
 |---|---|---|
-| `claude/hbf-kv-study` | 第 2 阶段：读路径（A）、放置与写入干扰、寿命模型（B）。REPORT 已写到"第 2 阶段 B（一）" | 事件模拟（T-B1d）由子代理开发，合并到这个分支；它的计划与剩余步骤在 `docs/design/phase2b-sim-plan.md` |
-| `claude/hbf-kv-terms` | 第 3 阶段：按 KV 大小公式逐项压缩。从 `claude/hbf-kv-study` 的 7c75e05 切出 | T-K1、T-K2 已完成；T-B1d 合并后要把 `claude/hbf-kv-study` 合并进来 |
+| `claude/hbf-kv-study` | 第 2 阶段：读路径（A）、放置与写入干扰、寿命模型（B）。REPORT 已写到"第 2 阶段 B（一）" | 事件模拟（T-B1d）大部分完成并已合并（`01c1029`）；未做的 vllm_pool 和 die 分区提速见 `docs/design/phase2b-sim-plan.md` 的 Next steps |
+| `claude/hbf-kv-terms` | 第 3 阶段：按 KV 大小公式逐项压缩。从 `claude/hbf-kv-study` 的 7c75e05 切出 | T-K1、T-K2 已完成；已合并 `claude/hbf-kv-study`（含事件模拟），在这个分支上继续开发即可 |
 
 ## 第 3 阶段已完成
 
@@ -17,7 +17,7 @@
 
 ## 接下来按顺序做
 
-1. **合并事件模拟**：如果子代理的提交已经在 `claude/hbf-kv-study` 上，按 `docs/design/phase2b-sim-plan.md` 的"Next steps"完成剩余部分；然后把 `claude/hbf-kv-study` 合并进 `claude/hbf-kv-terms`。
+1. **事件模拟的剩余部分**：按 `docs/design/phase2b-sim-plan.md` 的"Next steps for the local agent"做（先修 die 分区高并发时 `_reclaim`/`_victim` 每个量子空转的问题，再补 vllm_pool 和测试 16）。扫描网格驱动模拟时必须给 `"hours"`。
 2. **寿命模型适配新格式**（K1 遗留）：`hbf/endurance.py` 的 `Geometry.demand` 仍按 `spec.dims` 计算元素数，改成 `spec.attended_dims`（注意力元素）和 `spec.logical`（HBF 元素、反量化）；`kv_bytes_per_token` 一列改为只计 HBF 字节（KIVI 现在多算了 HBM 残差）。改之前 MLA 和 fused 格式不能用于 `hbf.endurance`。
 3. **审查**（T-B6 + K1 + K2）：按严重程度列问题、附复现方法，再逐条修。
 4. **T-K3 模型预设**（`hbf/model.py`、`hbf/system.py`、`hbf/configs/models.json`）：MLA（DeepSeek-V2-Lite）、混合注意力（Gemma-3-27B、GPT-OSS-20B/120B）、SSM 混合（Qwen3-Next），MoE 只计线性层时间；参数对照官方 `config.json`，出处写进 `docs/research/params.md`；`kvspec.from_model(model, fmt)` 由模型的 `layer_pattern` 生成分组。验收值见设计文档 §3 K3。

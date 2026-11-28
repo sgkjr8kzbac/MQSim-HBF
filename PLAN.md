@@ -2,7 +2,7 @@
 
 本文件记录研究目标、阶段安排、各模块状态和可以认领的任务，供人和 agent 协作时使用。实验结果写在 [REPORT.md](REPORT.md)，用法写在 [README.md](README.md)。设计讨论的原始记录在 [docs/design/](docs/design/)，参数来源在 [docs/research/params.md](docs/research/params.md)。
 
-最后更新：第 2 阶段 B（一）的实验已在本地跑完并写入 REPORT；事件模拟（T-B1d）由子代理开发中（分支 `claude/hbf-kv-study`）。第 3 阶段的设计已定，在分支 `claude/hbf-kv-terms` 上开发。测试和实验在本地运行，见 [docs/local-runs.md](docs/local-runs.md)。
+最后更新：第 2 阶段 B（一）的实验已在本地跑完并写入 REPORT；事件模拟（T-B1d）大部分完成，已合并到两个分支。第 3 阶段在分支 `claude/hbf-kv-terms` 上开发，T-K1、T-K2 已完成。接手说明见 [docs/handoff.md](docs/handoff.md)。测试和实验在本地运行，见 [docs/local-runs.md](docs/local-runs.md)。
 
 ---
 
