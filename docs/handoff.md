@@ -11,7 +11,7 @@
 
 ## 接下来
 
-按 restructure.md 第四节的 R0–R8 顺序做。每个里程碑完成后交给云端 agent 审查，再开始下一个。
+按 restructure.md 第四节的 R0–R8 顺序做。每个里程碑单独提交并推送；做完 R1、R3 后停下来等审查，R4、R7 开工前先问用户。
 
 - **R0**：跑全量测试，打 tag `baseline-pre-refactor`。
 - **R1**：正确性修复，包括 `T-PERF` 补丁，全文在方案附录 A。
