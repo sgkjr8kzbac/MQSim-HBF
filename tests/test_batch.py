@@ -273,7 +273,7 @@ def test_partitioned_striped_intra_uses_partition_banks():
 def test_k7_hybrid_swa_class_frontiers_and_stranded_pages():
     # K7 acceptance test: hybrid LLLLLG (5 local with window=1024 on HBF + 1 global), 8 heads, BF16,
     # 1 request, prompt=32,768 + 4,096 generated -> dead local pages = 5 * 8 * 2 * (4096 // 16) = 20,480.
-    from hbf.kvspec import parse_kvspec
+    from hbf.ext.kv_terms.kvspec import parse_kvspec
     kv_spec = parse_kvspec("hybrid:pattern=LLLLLG,window=1024,local_tier=hbf", 6, 8, 32768 + 4096)
     shape = Shape(6, 8, 128, 1)
 
@@ -387,7 +387,7 @@ def test_k7_shared_prefix_aliasing_and_reads():
 
 def test_k7_sliding_age_ladder_and_grouped_presets():
     from hbf.frontend.kv.tensors import TensorSpec
-    from hbf.kvspec import parse_kvspec
+    from hbf.ext.kv_terms.kvspec import parse_kvspec
 
     # Age-based re-quantization ladder without kv_spec: int4 (-4096, -128) is short-lived, int2 (0, -4096) long-lived.
     cfg = load("ocp", pages_per_block=2)
@@ -438,7 +438,7 @@ def test_k7_sliding_age_ladder_and_grouped_presets():
 
 
 def test_k7_batch_spec_defaults_and_validation():
-    from hbf.kvspec import parse_kvspec
+    from hbf.ext.kv_terms.kvspec import parse_kvspec
     assert batch("layer_major", [(2048, 0)] * 2).default
     assert not batch("layer_major", [(2048, 0)] * 2, prefix_tokens=512).default
     assert not batch("packed", [(2048, 0)], frontiers="class").default

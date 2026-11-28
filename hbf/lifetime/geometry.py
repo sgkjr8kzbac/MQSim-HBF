@@ -176,15 +176,9 @@ def geometry_for(model, kv_format=None, page_bytes=4096, *, kv_spec=None, contex
         from ..frontend.kv.formats import parse_format
         fmt = parse_format(kv_format or "bf16", model.head_dim, model.q_heads // model.kv_heads)
         return Geometry(model.layers, model.kv_heads, fmt.tensors, page_bytes), fmt
-    from ..kvspec import KVSpec, from_model, parse_kvspec, resolve_format
-    fmt = resolve_format(model, kv_format or "bf16")
-    if kv_spec is None:
-        spec = from_model(model, fmt, local_tier=local_tier)
-    elif isinstance(kv_spec, KVSpec):
-        spec = kv_spec
-    else:
-        spec = parse_kvspec(kv_spec, model.layers, model.kv_heads, context)
-    return spec.geometry(model.layers, model.kv_heads, fmt.tensors, page_bytes), fmt
+    from ..registry import REGISTRY
+    hook = REGISTRY.get_hook("kvspec", required=True)
+    return hook.geometry_for(model, kv_format, page_bytes, kv_spec=kv_spec, context=context, local_tier=local_tier)
 
 
 

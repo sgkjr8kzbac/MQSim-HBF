@@ -334,7 +334,7 @@ def test_k3_end_to_end_evaluate_all_new_presets():
     from hbf.frontend.kv.tensors import Shape, default_tensors
     from hbf.backends.rounds.analysis import analyze_accesses
     from hbf.device.config import load
-    from hbf.kvspec import GroupedLayout, from_model, generate_grouped
+    from hbf.ext.kv_terms.kvspec import GroupedLayout, from_model, generate_grouped
 
     cfg = load("ocp")
     b200 = load_gpu("b200")

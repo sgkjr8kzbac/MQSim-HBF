@@ -160,14 +160,10 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         "hot_fraction": .5, "hot_units": 1, "select_tokens": 16,
     } | (generation or {})
     if kv_format is not None and input_csv is None:
-        if (mode in ("uniform_tokens", "uniform_pages", "sink_recent", "channel_select")
-                and kv_format.full_tensors and "full_tensors" not in generation):
-            generation["full_tensors"] = list(kv_format.full_tensors)
-        if mode == "channel_select" and kv_format.channel_groups:
-            if "channel_groups" not in generation:
-                generation["channel_groups"] = list(kv_format.channel_groups)
-            if "channels" not in generation and kv_format.channel_select_channels is not None:
-                generation["channels"] = kv_format.channel_select_channels
+        from .registry import REGISTRY
+        k5 = REGISTRY.get_hook("selection_k5")
+        if k5 is not None:
+            k5.enrich_generation(kv_format, mode, generation)
     from .frontend.kv.placement import BatchSpec, PageTableLayout, check_write_order, generate_batch, place_batch
     placed = isinstance(requests, BatchSpec) and not requests.default
     has_selection_realism = (generation.get("select_static") or generation.get("reuse", 0)
@@ -181,20 +177,21 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     if (kv_spec is not None or placed or check_writes) and has_density:
         raise ValueError("Tensor density < 1 is not yet supported with --kv-spec (or a hybrid/SSM model), "
                          "request placement or --check-writes")
+    kvspec_hook = None
     if kv_spec is not None:
-        from .kvspec import spec_meta
+        from .registry import REGISTRY
+        kvspec_hook = REGISTRY.get_hook("kvspec", required=True)
     if placed:
         per_request = Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context)
         batch_req = replace(requests, kv_spec=kv_spec) if kv_spec is not None and requests.kv_spec is None else requests
         layout = PageTableLayout(cfg, per_request, batch_req, tensors=tensors)
         accesses = list(generate_batch(cfg, layout, mode, **{key: generation[key] for key in (
             "steps", "seed", "fraction", "count", "select_tokens")}))
-    elif kv_spec is not None:  # layer and head groups (hbf/kvspec.py)
-        from .kvspec import GroupedLayout, generate_grouped
-        layout = GroupedLayout(cfg, shape, kv_spec, tensors or default_tensors(shape),
-                               requests=requests[0] if isinstance(requests, tuple) else 1,
-                               intra="striped" if layout_name == "striped_contiguous" else "contiguous")
-        accesses = list(generate_grouped(cfg, layout, mode, **{key: generation[key] for key in (
+    elif kv_spec is not None:  # layer and head groups (hbf.ext.kv_terms)
+        layout = kvspec_hook.GroupedLayout(cfg, shape, kv_spec, tensors or default_tensors(shape),
+                                           requests=requests[0] if isinstance(requests, tuple) else 1,
+                                           intra="striped" if layout_name == "striped_contiguous" else "contiguous")
+        accesses = list(kvspec_hook.generate_grouped(cfg, layout, mode, **{key: generation[key] for key in (
             "steps", "seed", "fraction", "count", "select_tokens")}))
     else:
         layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
@@ -255,7 +252,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                    f"every LPA in [{layout.base}, {layout.base + layout.span}) in order",
                                    "placement": "static",
                                    "protocol": None if protocol is None else asdict(protocol),
-                                   "argv": sys.argv} | ({} if kv_spec is None else {"kv_spec": spec_meta(kv_spec)}))
+                                   "argv": sys.argv} | ({} if kv_spec is None else {"kv_spec": kvspec_hook.spec_meta(kv_spec)}))
     # Step 1 (frontend): convert logical accesses to a validated address trace.
     expected_steps = range(generation["steps"]) if input_csv is None else ()
     trace_meta, chunk_stream = iter_trace(
@@ -354,7 +351,7 @@ def build_run_parser(prog="python -m hbf run"):
                         help="ocp (16 host channels, Figure 4; default), ocp-8ch (8 host channels, grade 1), "
                              "16x64, 64x16, 256x4 or any <channels>x<chips per channel>")
     parser.add_argument("--layout", choices=LAYOUTS, default="layer_contiguous")
-    parser.add_argument("--mode", choices=MODES, default="dense")
+    parser.add_argument("--mode", default="dense")
     parser.add_argument("--layers", type=int, help="default 1, or the --model's layers")
     parser.add_argument("--heads", type=int, help="KV heads per request (default 8, or the --model's)")
     parser.add_argument("--head-dim", type=int, help="default 128, or the --model's")
@@ -538,16 +535,25 @@ def configure(args):
     head_dim = given(args.head_dim, model and model.head_dim, 128)
     if args.kv_format is not None and args.tensors is not None:
         raise ValueError("--format and --tensors are mutually exclusive")
+    from .registry import REGISTRY, ensure_loaded
+    ensure_loaded()
+    if args.mode not in REGISTRY.modes:
+        raise REGISTRY.missing_error("mode", args.mode)
     kv_format = None
     if model is not None and args.tensors is None and (args.kv_format is not None or model.attention == "mla"):
-        from .kvspec import resolve_format
-        kv_format = resolve_format(model, args.kv_format)
+        kvspec_hook = REGISTRY.get_hook("kvspec", required=(model.attention == "mla"))
+        if kvspec_hook is not None:
+            kv_format = kvspec_hook.resolve_format(model, args.kv_format)
+        else:
+            from .frontend.kv.formats import parse_format
+            kv_format = parse_format(args.kv_format, head_dim, model.q_heads // model.kv_heads)
     elif args.kv_format is not None:
         from .frontend.kv.formats import parse_format
         kv_format = parse_format(args.kv_format, head_dim)
     tensors = kv_format.tensors if kv_format else parse_tensors(args.tensors)
     density = parse_density(args.density)
     if density != 1:
+        REGISTRY.get_hook("selection_k5", required=True)
         base_tensors = tensors if tensors is not None else default_tensors(Shape(layers, heads, head_dim, args.context))
         tensors = tuple(replace(spec, density=density) if spec.tier == "hbf" else spec for spec in base_tensors)
     if not 0 <= args.reuse <= 1:
@@ -588,14 +594,13 @@ def configure(args):
     if query_groups != 1:
         generation["query_groups"] = query_groups
     full_tensors = [name.strip() for name in args.full_tensors.split(",") if name.strip()] if args.full_tensors else []
-    if (not full_tensors and kv_format is not None and kv_format.full_tensors
-            and args.mode in ("uniform_tokens", "uniform_pages", "sink_recent", "channel_select")):
-        full_tensors = list(kv_format.full_tensors)
     if full_tensors:
         generation["full_tensors"] = full_tensors
-    if args.mode == "channel_select" and kv_format is not None and kv_format.channel_groups:
-        generation["channel_groups"] = list(kv_format.channel_groups)
-        generation["channels"] = kv_format.channel_select_channels
+    k5_hook = REGISTRY.get_hook("selection_k5")
+    if k5_hook is not None:
+        k5_hook.enrich_generation(kv_format, args.mode, generation)
+    elif args.select_static or args.reuse or query_groups != 1 or full_tensors:
+        REGISTRY.get_hook("selection_k5", required=True)
     if model is None and (args.gpu is not None or args.overlap != "serial" or args.kv_consume != "stream"
                           or args.selection != "auto"):
         raise ValueError("--gpu, --overlap, --kv-consume and --selection need --model")
@@ -631,17 +636,17 @@ def configure(args):
         shape = Shape(shape.layers, shape.kv_heads, shape.head_dim, context)
     kv_spec = None
     if args.kv_spec is not None or (model is not None and model.layer_pattern):
-        from .kvspec import GROUP_MODES, from_model, parse_kvspec
-        if (args.access_csv is not None or args.mode not in GROUP_MODES
+        kvspec_hook = REGISTRY.get_hook("kvspec", required=True)
+        if (args.access_csv is not None or args.mode not in kvspec_hook.GROUP_MODES
                 or args.layout not in ("layer_contiguous", "striped_contiguous")):
             raise ValueError("--kv-spec (or a hybrid/SSM model) works with generated modes dense, uniform_tokens and "
                              "sink_recent, the layer_contiguous or striped_contiguous layout, and without --access-csv")
         if args.kv_spec is not None:
-            kv_spec = parse_kvspec(args.kv_spec, layers, heads, shape.context)
+            kv_spec = kvspec_hook.parse_kvspec(args.kv_spec, layers, heads, shape.context)
         elif args.tensors is not None:
-            kv_spec = from_model(model, tensors=tensors)
+            kv_spec = kvspec_hook.from_model(model, tensors=tensors)
         else:
-            kv_spec = from_model(model, kv_format or "bf16")
+            kv_spec = kvspec_hook.from_model(model, kv_format or "bf16")
     if spec is not None:
         if not args.analysis_only or args.access_csv is not None or args.prefill:
             raise ValueError("Request placement (--alloc, --contexts, --generated, --frontiers, --prefix-tokens, "

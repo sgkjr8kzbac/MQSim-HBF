@@ -973,7 +973,7 @@ def test_k4_cla_read_disturb_increases_by_share_factor():
     assert a_hbm["refreshes_per_request"] == 1 and a_hbm["hbm_bytes_per_request"] > 0
 
     # Event simulation confirms 2x faster read-disturb on a tiny CLA-2 HBF entry vs CLA-2 HBM.
-    from hbf.kvspec import KVGroup, KVSpec
+    from hbf.ext.kv_terms.kvspec import KVGroup, KVSpec
     t = (TensorSpec("kv", 8, 4096),)
     spec_hbf = KVSpec("cla", {"share": 2, "reuse": "hbf"}, (KVGroup("kv", (0, 1), alias=((1, 0),), reuse="hbf"),))
     spec_hbm = KVSpec("cla", {"share": 2, "reuse": "hbm"}, (KVGroup("kv", (0, 1), alias=((1, 0),), reuse="hbm"),))

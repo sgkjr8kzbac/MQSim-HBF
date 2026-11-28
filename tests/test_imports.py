@@ -85,3 +85,16 @@ def test_backends_do_not_cross_import():
                 if forbidden in parts:
                     raise AssertionError(f"{path} cross-imports {'.' * level}{module}")
 
+
+def test_core_never_imports_ext():
+    """R4: core modules outside hbf/ext/ must never statically import hbf.ext."""
+    for path in sorted(HBF_DIR.rglob("*.py")):
+        rel = path.relative_to(HBF_DIR)
+        if rel.parts[0] in ("ext", "mqsim") or "__pycache__" in rel.parts:
+            continue
+        for module, level in _imported_targets(path):
+            parts = module.split(".") if module else []
+            if "ext" in parts:
+                raise AssertionError(f"Core module {path} imports extension {'.' * level}{module}")
+
+

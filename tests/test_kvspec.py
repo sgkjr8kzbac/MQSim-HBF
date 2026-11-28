@@ -11,7 +11,7 @@ from hbf.frontend.trace.tokens import Access
 from hbf.backends.rounds.analysis import analyze_accesses
 from hbf.cli import main
 from hbf.device.config import load
-from hbf.kvspec import GroupedLayout, KVGroup, KVSpec, from_model, generate_grouped, parse_kvspec
+from hbf.ext.kv_terms.kvspec import GroupedLayout, KVGroup, KVSpec, from_model, generate_grouped, parse_kvspec
 from hbf.frontend.pages import iter_layer_pages
 
 HBF_FLAGS = ["run", "--analysis-only", "--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read"]
@@ -306,7 +306,7 @@ def test_from_model_ssm_emits_state_and_attention_groups():
 def test_cli_mla_format_and_hybrid_tensors_integration(tmp_path):
     from fractions import Fraction
     from hbf.frontend.kv.tensors import TensorSpec
-    from hbf.kvspec import resolve_format
+    from hbf.ext.kv_terms.kvspec import resolve_format
     from hbf.models import load_model
 
     # MLA --model with --format fp8 / bf16 resolves through resolve_format; incompatible formats raise.
@@ -361,7 +361,7 @@ def test_k4_sliding_window_token_flow_and_geometry():
     after +1,000 generated, decode writes 1,000 and 1,000 die; stored stays 3,968."""
     import numpy as np
     from hbf.frontend.kv.tensors import TensorSpec
-    from hbf.kvspec import flow
+    from hbf.ext.kv_terms.kvspec import flow
 
     tensor = TensorSpec("kv", 8, 4096, window=(-4096, -128))  # 1 token per 4 KiB page
     f = flow(tensor, prompt=32768, generated=1000)
@@ -389,7 +389,7 @@ def test_k4_kivi4_to_kivi2_age_based_ladder():
     """Design section 3 K4: kivi4 (-4096, -128) -> kivi2 (0, -4096) writes 160 + 96 = 256 B per
     decode token per head against 96 B for direct kivi2 (2.67x), and the kivi4 pages die."""
     from hbf.frontend.kv.formats import parse_format
-    from hbf.kvspec import flow
+    from hbf.ext.kv_terms.kvspec import flow
 
     k4 = parse_format("kivi4", 128)
     k2 = parse_format("kivi2", 128)
@@ -427,7 +427,7 @@ def test_k4_eviction_policies_and_h2o_live_page_fraction():
     """Design section 3 K4: H2O live-page fraction 1 - 0.75^16 = 0.98998; compaction threshold
     theta drives rewrite traffic; prefill/flush eviction compact before writing."""
     from hbf.frontend.kv.tensors import TensorSpec
-    from hbf.kvspec import flow, live_page_fraction, parse_evict
+    from hbf.ext.kv_terms.kvspec import flow, live_page_fraction, parse_evict
 
     # H2O keep=25%, BF16 tpp=16, cluster=1 -> 1 - 0.75^16 = 0.989977... (~0.98998).
     lp = live_page_fraction(0.25, 16, cluster=1)

@@ -1,32 +1,15 @@
-"""Named KV storage formats (``--format NAME[:key=value,...]``) expanded into tensor specs.
+"""Core KV storage formats (``--format NAME[:key=value,...]``) expanded into tensor specs.
 
-Every preset describes what one KV head stores per token; the numbers that are not fixed by the
-cited method are assumptions and are listed in ``KVFormat.notes``.
+Core built-in presets registered into ``hbf.registry``:
+- ``bf16``: K, V 16 x d
+- ``fp8``: K, V 8 x d (static per-tensor scale)
+- ``int4`` / ``int2`` (``group``, ``think``, ``fused``, ``pow2``): group quantization
+- ``kivi4`` / ``kivi2`` (``group``, ``residual``, ``think``, ``fused``, ``pow2``): KIVI (ICML 2024)
+- ``think`` (``ratio``): ThinK (ICLR 2025)
+- ``quest`` (``page``): Quest (ICML 2024)
 
-| preset | tensors (bits x dims, window, tier) | source |
-|---|---|---|
-| ``bf16`` | K, V 16 x d | default |
-| ``fp8`` | K, V 8 x d (per-tensor scale, not stored) | vLLM FP8 KV cache |
-| ``int4``/``int2`` (``group``) | K, V b x d; K_qp, V_qp 16 x 2d/g (scale and zero per g channels) | group quantization |
-| ``kivi4``/``kivi2`` (``group``, ``residual``) | K, V b x d and K_qp, V_qp 16 x 2d/G on [0, -R]; K_res, V_res 16 x d on [-R, end] in HBM | KIVI (ICML 2024): G = 32, R = 128 |
-| ``think`` (``ratio``) | K 16 x (1-r)d, V 16 x d | ThinK (ICLR 2025) |
-| ``quest`` (``page``) | K, V 16 x d; K_sum 16 x 2d/p (min and max keys per p-token page), role meta | Quest (ICML 2024): p = 16 |
-| ``mla`` (``lora``, ``rope``, ``split``, ``indexer``, ``indexer_hbm``, ``index_heads``, ``index_dims``, ``q_heads``) | C 16 x (lora + rope), attended as 2 lora + rope; ``split=1``: C 16 x lora and R 16 x rope; ``indexer=1``: K_idx 8 x (index_dims + 4) (FP8 keys and an FP32 scale), role meta | DeepSeek-V2 (MLA): lora 512, rope 64; DeepSeek-V3.2 (DSA): 64 index heads of 128 dims |
-| ``mla_fp8`` (same) | C 8 x (lora + 4 lora/128 + 2 rope) bytes: FP8 latent, FP32 scale per 128, BF16 rope | FlashMLA FP8 KV cache, 656 B per token |
-| ``loki`` (``rank``) | K_lo 16 x rank (full-context scoring prefix), K_hi 16 x (d - rank), V 16 x d | Loki: static PCA channel prefix, rank = 32 |
-| ``sparq`` (``channels``, ``groups``, ``dual``) | K_g0..K_g{g-1} 16 x (d/g), V 16 x d; ``dual=1`` adds token-major K 16 x d (+50% HBF bytes) and marks K_g* role aux | SparQ: top-r channels by |q|, r = 32, g = 8 |
-
-One KV "head" per layer holds MLA's latent, so MLA runs use ``--heads 1`` (or an MLA model preset);
-``q_heads`` (from ``--model`` or the parameter) sets the indexer's attention FLOPs per query head.
-``fused=1`` on the int and KIVI presets packs K, V and both scale tensors into one row per token
-(tensor KV, ``bits=8``, ``dims`` = bytes), so a selected block reads one page set instead of four;
-``pow2=1`` pads the row to a power of two so that power-of-two selection blocks align to page
-boundaries instead of straddling two pages.
-
-``think=r`` also applies to the int and KIVI presets (K keeps (1-r)d channels). KIVI's per-channel
-K scales are one row per G tokens; they are amortized as per-token rows of 2d/G elements, as are
-Quest's per-page summaries. Dequantization costs ``dequant_ops`` GPU vector operations per stored
-element read: 1 for FP8 and 3 (unpack, scale, shift) for integer formats, both assumptions.
+Optional formats (``mla``, ``mla_fp8``, ``loki``, ``sparq``) register into the exact same
+``hbf.registry.REGISTRY.formats`` table from ``hbf.ext.kv_terms``.
 """
 from dataclasses import dataclass, field
 
@@ -34,13 +17,15 @@ from .tensors import TensorSpec
 
 INT_DEQUANT_OPS = 3  # assumption: unpack, multiply by scale, add zero point
 FP8_DEQUANT_OPS = 1  # assumption: one conversion per element
-PRESETS = ("bf16", "fp8", "int4", "int2", "kivi4", "kivi2", "think", "quest", "mla", "mla_fp8", "loki", "sparq")
-MLA = {"lora": 512, "rope": 64, "split": 0, "indexer": 0, "indexer_hbm": 0, "index_heads": 64, "index_dims": 128,
-       "q_heads": 0}
-DEFAULTS = {"int4": {"group": 128}, "int2": {"group": 128}, "kivi4": {"group": 32, "residual": 128},
-            "kivi2": {"group": 32, "residual": 128}, "think": {"ratio": .5}, "quest": {"page": 16},
-            "mla": MLA, "mla_fp8": MLA,
-            "loki": {"rank": 32}, "sparq": {"channels": 32, "groups": 8, "dual": 0}}
+CORE_PRESETS = ("bf16", "fp8", "int4", "int2", "kivi4", "kivi2", "think", "quest")
+CORE_DEFAULTS = {
+    "int4": {"group": 128},
+    "int2": {"group": 128},
+    "kivi4": {"group": 32, "residual": 128},
+    "kivi2": {"group": 32, "residual": 128},
+    "think": {"ratio": .5},
+    "quest": {"page": 16},
+}
 INT = ("int4", "int2", "kivi4", "kivi2")
 
 
@@ -51,9 +36,19 @@ class KVFormat:
     tensors: tuple
     attn_dims: int  # d_k + d_v: elements per token one query head multiplies in QK^T and PV
     notes: tuple = field(default_factory=tuple)
-    full_tensors: tuple = field(default_factory=tuple)  # tensors read whole in scoring / sparse modes (e.g. Loki K_lo)
-    channel_groups: tuple = field(default_factory=tuple)  # dynamic channel-group tensor names (e.g. SparQ K_g0..)
-    channel_select_channels: int | None = None  # top-r channels drawn per (step, layer, head) for SparQ
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def full_tensors(self):
+        return tuple(self.extra.get("full_tensors", ()))
+
+    @property
+    def channel_groups(self):
+        return tuple(self.extra.get("channel_groups", ()))
+
+    @property
+    def channel_select_channels(self):
+        return self.extra.get("channel_select_channels")
 
 
 def parse_params(text):
@@ -72,56 +67,6 @@ def parse_params(text):
     return params
 
 
-def _flag(params, key):
-    value = params[key]
-    if type(value) is not int or value not in (0, 1):
-        raise ValueError(f"{key} must be 0 or 1")
-    return bool(value)
-
-
-def mla_format(name, params, q_heads=None):
-    """MLA's per-token latent (DeepSeek-V2) as one or two tensors, optionally with a DSA indexer."""
-    lora, rope, heads, dims = (params[key] for key in ("lora", "rope", "index_heads", "index_dims"))
-    if any(type(value) is not int or value <= 0 for value in (lora, rope, heads, dims)):
-        raise ValueError("lora, rope, index_heads and index_dims must be positive integers")
-    if type(params["q_heads"]) is not int or params["q_heads"] < 0:
-        raise ValueError("q_heads must be a positive integer")
-    split, indexer, indexer_hbm = (_flag(params, key) for key in ("split", "indexer", "indexer_hbm"))
-    if indexer and indexer_hbm:
-        raise ValueError("indexer and indexer_hbm are mutually exclusive")
-    fp8 = name == "mla_fp8"
-    if fp8 and lora % 128:
-        raise ValueError("mla_fp8 needs lora to be a multiple of 128 (one FP32 scale per 128 elements)")
-    notes = [f"MLA：每层一个潜向量，lora {lora} + rope {rope} 维；吸收式解码每个查询头每 token 计算 "
-             f"QK {lora + rope} + PV {lora} = {2 * lora + rope} 个元素"]
-    if fp8:  # FP8 latent + FP32 scale per 128 elements + BF16 rope, as one byte row
-        latent = lora + 4 * lora // 128
-        notes.append(f"FP8 潜向量：{lora} B + {4 * lora // 128} B scale，rope {2 * rope} B 保持 BF16；反量化只计潜向量")
-        if split:
-            tensors = [TensorSpec("C", 8, latent, attn_dims=2 * lora, logical_dims=lora, dequant_ops=FP8_DEQUANT_OPS),
-                       TensorSpec("R", 16, rope, attn_dims=rope)]
-        else:
-            tensors = [TensorSpec("C", 8, latent + 2 * rope, attn_dims=2 * lora + rope, logical_dims=lora + rope,
-                                  dequant_ops=FP8_DEQUANT_OPS * lora / (lora + rope))]
-    elif split:
-        tensors = [TensorSpec("C", 16, lora, attn_dims=2 * lora), TensorSpec("R", 16, rope, attn_dims=rope)]
-    else:
-        tensors = [TensorSpec("C", 16, lora + rope, attn_dims=2 * lora + rope)]
-    if split:
-        notes.append("潜向量与 rope 分成两个张量，各自整页存放；稀疏读时一个 token 要读两页")
-    if indexer or indexer_hbm:
-        q_heads = params["q_heads"] or q_heads
-        if type(q_heads) is not int or q_heads <= 0:
-            raise ValueError("The DSA indexer needs a positive integer q_heads (from --model or the q_heads parameter)")
-        if heads * dims % q_heads:
-            raise ValueError(f"index_heads x index_dims ({heads * dims}) must be a multiple of q_heads ({q_heads})")
-        tensors.append(TensorSpec("K_idx", 8, dims + 4, tier="hbm" if indexer_hbm else "hbf", role="meta",
-                                  attn_dims=heads * dims // q_heads, logical_dims=dims))
-        notes.append(f"DSA 索引器：每 token {dims} 维 FP8 键 + 4 B scale，每步整体读取（{'HBM' if indexer_hbm else 'HBF'}）；"
-                     f"打分计算按 {heads} 个索引头 × {dims} 维计入（假设 FP8 与 BF16 同速）")
-    return tuple(tensors), 2 * lora + rope, notes
-
-
 def fuse(tensors, k_dims, d, pow2):
     """K, K_qp, V and V_qp packed into one byte row per token (tensor KV); the HBM residual stays apart."""
     body = [spec for spec in tensors if spec.tier == "hbf"]
@@ -134,23 +79,7 @@ def fuse(tensors, k_dims, d, pow2):
     return (fused,) + tuple(spec for spec in tensors if spec.tier != "hbf"), note
 
 
-def parse_format(text, head_dim, q_heads=None):
-    """``kivi2:group=32,residual=128`` -> KVFormat for ``head_dim`` channels per head.
-
-    ``q_heads`` (query heads per stored KV head, i.e. the model's q_heads / kv_heads; all query
-    heads for MLA) only matters for the MLA indexer, whose FLOPs the system model multiplies by it.
-    """
-    name, _, rest = text.partition(":")
-    if name not in PRESETS:
-        raise ValueError(f"Unknown KV format {name!r}; presets: {', '.join(PRESETS)}")
-    given = parse_params(rest)
-    allowed = set(DEFAULTS.get(name, {})) | ({"think", "fused", "pow2"} if name in INT else set())
-    if set(given) - allowed:
-        raise ValueError(f"Format {name} takes {sorted(allowed) or 'no parameters'}, not {sorted(set(given) - allowed)}")
-    params = DEFAULTS.get(name, {}) | given
-    if name in ("mla", "mla_fp8"):
-        tensors, attn_dims, notes = mla_format(name, params, q_heads)
-        return KVFormat(name, params, tensors, attn_dims, tuple(notes))
+def _build_core_format(name, params, head_dim, q_heads=None):
     d = head_dim
     ratio = params.get("ratio", params.get("think", 0))
     if not 0 <= ratio < 1:
@@ -196,38 +125,6 @@ def parse_format(text, head_dim, q_heads=None):
     elif name == "think":
         tensors = (TensorSpec("K", 16, k_dims), TensorSpec("V", 16, d))
         notes.append(f"ThinK：K 只保留 {k_dims}/{d} 个通道")
-    elif name == "loki":
-        rank = params["rank"]
-        if type(rank) is not int or not 0 < rank < d:
-            raise ValueError(f"rank must be an integer in (0, {d})")
-        tensors = (TensorSpec("K_lo", 16, rank), TensorSpec("K_hi", 16, d - rank), TensorSpec("V", 16, d))
-        notes.append(f"Loki：K 按静态 PCA 前缀拆成 K_lo（{rank} 维，每步全上下文读取打分）与 "
-                     f"K_hi（{d - rank} 维，只读选中 token）；PCA 投影不计入")
-        return KVFormat(name, params, tensors, 2 * d, tuple(notes), full_tensors=("K_lo",))
-    elif name == "sparq":
-        channels, groups = params["channels"], params["groups"]
-        if type(groups) is not int or not 1 <= groups <= d or d % groups:
-            raise ValueError(f"groups must be a positive divisor of head_dim ({d})")
-        if type(channels) is not int or not 1 <= channels <= d:
-            raise ValueError(f"channels must be an integer in [1, {d}]")
-        dual = _flag(params, "dual")
-        group_dims = d // groups
-        group_names = tuple(f"K_g{i}" for i in range(groups))
-        if dual:
-            # Dual layout keeps channel-grouped K_g* (aux, for scoring) alongside token-major K (data, for exact phase).
-            # Marking K_g* as aux prevents double-counting K in attended_elements and hbf_elements while charging +50%
-            # total HBF KV bytes per token (2d + 2d + 2d = 6d vs 4d).
-            tensors = tuple(TensorSpec(gname, 16, group_dims, role="aux") for gname in group_names) + (
-                TensorSpec("K", 16, d), TensorSpec("V", 16, d))
-            notes.append(f"SparQ：K 按通道拆成 {groups} 个分组张量 K_g0..K_g{groups - 1}（每组 {group_dims} 维）供全上下文打分，"
-                         f"每步按 |q| 选 {channels}/{d} 通道；dual=1 另存一份 token-major K 供精确阶段稀疏读"
-                         "（总 KV 字节 1.5 倍，K 写两份）；打分计算不重复计入")
-        else:
-            tensors = tuple(TensorSpec(gname, 16, group_dims) for gname in group_names) + (TensorSpec("V", 16, d),)
-            notes.append(f"SparQ：K 按通道拆成 {groups} 个分组张量 K_g0..K_g{groups - 1}（每组 {group_dims} 维），"
-                         f"每步按 |q| 选 {channels}/{d} 通道全上下文打分，精确阶段读剩余分组与 V 的选中 token")
-        return KVFormat(name, params, tensors, 2 * d, tuple(notes),
-                        channel_groups=group_names, channel_select_channels=channels)
     else:  # quest
         page = params["page"]
         if type(page) is not int or page <= 0 or (2 * d) % page:
@@ -241,6 +138,23 @@ def parse_format(text, head_dim, q_heads=None):
 
 
 def register_builtins(registry):
-    for name in PRESETS:
+    for name in CORE_PRESETS:
         extra = ("think", "fused", "pow2") if name in INT else ()
-        registry.register_format(name, None, defaults=DEFAULTS.get(name), extra_params=extra)
+        registry.register_format(name, _build_core_format, defaults=CORE_DEFAULTS.get(name), extra_params=extra)
+
+
+def parse_format(text, head_dim, q_heads=None):
+    """``kivi2:group=32,residual=128`` -> KVFormat for ``head_dim`` channels per head.
+
+    Looks up ``name`` in ``hbf.registry.REGISTRY.formats`` (covering both core built-in formats
+    and any loaded ``hbf.ext.*`` formats).
+    """
+    from ...registry import REGISTRY
+    name, _, rest = text.partition(":")
+    builder, (defaults, extra_allowed) = REGISTRY.get_format(name)
+    given = parse_params(rest)
+    allowed = set(defaults) | set(extra_allowed)
+    if set(given) - allowed:
+        raise ValueError(f"Format {name} takes {sorted(allowed) or 'no parameters'}, not {sorted(set(given) - allowed)}")
+    params = defaults | given
+    return builder(name, params, head_dim, q_heads)

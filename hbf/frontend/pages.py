@@ -228,13 +228,9 @@ def layer_pages(cfg, layout, step, layer, rows, cached=None):
     head, g, lo, hi = rows.T
     has_density = any(spec.density != 1 for spec in specs)
     if has_density:
-        w_lo = np.asarray([layout.windows[spec.name][0] for spec in specs], dtype=np.int64)[g]
-        num = np.asarray([spec.density.numerator for spec in specs], dtype=np.int64)[g]
-        den = np.asarray([spec.density.denominator for spec in specs], dtype=np.int64)[g]
-        # Combining density < 1 with select_tokens=1 aliases 1/density logical tokens per compacted token.
-        c_lo = ((lo - w_lo) * num) // den
-        c_hi = ((hi - 1 - w_lo) * num) // den + 1
-        eff_lo, eff_hi = w_lo + c_lo, w_lo + c_hi
+        from ..registry import REGISTRY
+        k5 = REGISTRY.get_hook("selection_k5", required=True)
+        eff_lo, eff_hi, c_lo, c_hi = k5.map_density_coords(layout, specs, g, lo, hi)
     else:
         eff_lo, eff_hi = lo, hi
     data = np.asarray([spec.role == "data" for spec in specs])[g]
@@ -246,6 +242,8 @@ def layer_pages(cfg, layout, step, layer, rows, cached=None):
     is_cached = None if cached is None else np.asarray(cached, dtype=bool)
     hbf_cached = None if is_cached is None else (is_cached & ~hbm[g])
     if hbf_cached is not None and hbf_cached.any():
+        from ..registry import REGISTRY
+        REGISTRY.get_hook("selection_k5", required=True)
         hbf_read = ~hbm[g] & ~is_cached
         hbf_tokens = per_tensor_tokens(head[hbf_read], g[hbf_read], eff_lo[hbf_read], eff_hi[hbf_read],
                                        layout.shape.context, len(specs))

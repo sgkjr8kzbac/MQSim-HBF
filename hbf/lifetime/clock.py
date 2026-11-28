@@ -221,32 +221,39 @@ def phase_a(directory, model, gpu, kv_format, batch, context, *, mode="dense", g
     from ..backends.rounds.analysis import analyze_trace
     from ..device.config import load
     from ..frontend.addrtrace import iter_trace
+    from ..frontend.kv.formats import parse_format
     from ..frontend.kv.layouts import LAYOUTS
     from ..frontend.kv.placement import BatchRequest, BatchSpec, PageTableLayout, generate_batch
     from ..frontend.kv.tensors import Shape, default_tensors
     from ..frontend.trace.synthetic import generate
-    from ..kvspec import GroupedLayout, from_model, generate_grouped, parse_kvspec, resolve_format
     from ..models import load_model
+    from ..registry import REGISTRY
 
     topology, overrides = _parse_device_overrides(device)
     cfg = load(topology, **overrides)
     model_spec = load_model(model)
-    fmt = resolve_format(model_spec, kv_format or "bf16")
+    needs_kvspec = bool(kv_spec is not None or model_spec.layer_pattern or model_spec.attention != "gqa")
+    kvspec_hook = REGISTRY.get_hook("kvspec", required=needs_kvspec)
+    if kvspec_hook is not None:
+        fmt = kvspec_hook.resolve_format(model_spec, kv_format or "bf16")
+    else:
+        fmt = parse_format(kv_format or "bf16", model_spec.head_dim, model_spec.q_heads // model_spec.kv_heads)
     tensors = fmt.tensors
     shape = Shape(model_spec.layers, model_spec.kv_heads * batch, model_spec.head_dim, context)
 
     kv_spec_obj = None
     if kv_spec is not None:
-        kv_spec_obj = parse_kvspec(kv_spec, model_spec.layers, model_spec.kv_heads, context)
+        kv_spec_obj = kvspec_hook.parse_kvspec(kv_spec, model_spec.layers, model_spec.kv_heads, context)
     elif model_spec.layer_pattern:
-        kv_spec_obj = from_model(model_spec, fmt)
+        kv_spec_obj = kvspec_hook.from_model(model_spec, fmt)
 
     gen = {
         "steps": 1, "seed": 1, "fraction": 0.1, "count": 4, "unit": 0,
         "hot_fraction": 0.5, "hot_units": 1, "select_tokens": 16,
     } | dict(generation or {})
-    if mode in ("uniform_tokens", "uniform_pages", "sink_recent", "channel_select") and fmt.full_tensors:
-        gen.setdefault("full_tensors", list(fmt.full_tensors))
+    k5_hook = REGISTRY.get_hook("selection_k5")
+    if k5_hook is not None:
+        k5_hook.enrich_generation(fmt, mode, gen)
 
     if alloc != "layer_major" and kv_spec_obj is None:
         spec = BatchSpec(tuple(BatchRequest(context, 0) for _ in range(batch)),
@@ -256,9 +263,9 @@ def phase_a(directory, model, gpu, kv_format, batch, context, *, mode="dense", g
         accesses = list(generate_batch(cfg, layout, mode, **{key: gen[key] for key in (
             "steps", "seed", "fraction", "count", "select_tokens")}))
     elif kv_spec_obj is not None:
-        layout = GroupedLayout(cfg, shape, kv_spec_obj, tensors or default_tensors(shape),
-                               requests=batch, intra="striped")
-        accesses = list(generate_grouped(cfg, layout, mode, **{key: gen[key] for key in (
+        layout = kvspec_hook.GroupedLayout(cfg, shape, kv_spec_obj, tensors or default_tensors(shape),
+                                           requests=batch, intra="striped")
+        accesses = list(kvspec_hook.generate_grouped(cfg, layout, mode, **{key: gen[key] for key in (
             "steps", "seed", "fraction", "count", "select_tokens")}))
     else:
         layout = LAYOUTS["striped_contiguous"](cfg, shape, tensors=tensors)
