@@ -796,6 +796,30 @@ MQSim 的每层时延约为（分析轮数 + 0.8 至 2.3 轮）× tR，多出的
 3. **不协调的擦除代价很大。**擦除随机落在各 die 上时，tBERS 1 ms 下增加 3–52%，10 ms 下增加 100–1,750%。kivi2 每步最短，擦除阻塞所占比例最大。规范把刷新交给主机（§11.5），主机必须把擦除集中安排在读的空隙里，或者按 die 轮流进行。
 4. 写入只占编程带宽的 5–6%（寿命模型的 `program_bw_share`），问题不在写带宽，而在写入和擦除阻塞了读。
 
+#### MQSim 写入补丁（`T-HBFW1`–`T-HBFW4`）实测核对
+
+R5 在 MQSim 中实现了静态地址映射（`T-HBFW1`）、页 0 自动擦除与 `HBF_WRITE_ORDER=read_first|fifo` 调度（`T-HBFW2`）、关闭 GC（`T-HBFW3`）及每块计数导出（`T-HBFW4`）。对同一份多层的读轨迹，分别跑只读、带写（`fifo`）和带写（`read_first`），统计每层读完成时间相对只读的增量，并与 `hbf/lifetime/interference.py` 的 `fifo`、`gaps` 模式对比（9 个点，前 7 个为 4 die × 16 bank 的 OCP 切片，P8 为完整 64 die / 1,024 bank 的 `ocp` 拓扑；除 P9 外合并窗口取 `coalesce_ns = 5 µs` 以容纳整波 16-plane 写数据 DMA；复现脚本 [scripts/r5_write_interference.py](scripts/r5_write_interference.py)，完整数据 [evidence/r5-write-interference.csv](evidence/r5-write-interference.csv)）：
+
+| 测点 | 配置摘要（tPROG / tBERS / gap，写波 / 擦波，波宽） | MQSim `fifo` (µs) | 解析 `fifo` (µs) | MQSim `read_first` (µs) | 解析 `gaps` (µs) |
+|---|---|---:|---:|---:|---:|
+| P1 写落入间隙 | 100 / 1,000 / 200 µs，1 写 0 擦，整栈 64 bank | 0.0 | 100.0 | 0.0 | 0.0 |
+| P2 写溢出间隙 | 100 / 1,000 / 40 µs，1 写 0 擦，整栈 64 bank | 86.5 | 100.0 | 86.5 | 60.0 |
+| P3 紧邻双波突发 | 100 / 1,000 / 10 µs，2 写 0 擦集中于层 0，64 bank | 230.4 | 200.0 | 102.6 | 180.0 |
+| P4 校准 350 µs | 350 / 3,500 / 100 µs，2 写 0 擦分散，64 bank | 553.0 | 700.0 | 553.0 | 500.0 |
+| P5 擦+写落入间隙 | 100 / 1,000 / 1,200 µs，1 写 1 擦，64 bank | 0.0 | 1,100.0 | 0.0 | 0.0 |
+| P6 擦+写溢出间隙 | 100 / 1,000 / 400 µs，1 写 1 擦，64 bank | 737.2 | 1,100.0 | 629.0 | 600.0 |
+| P7 单 die 部分写 | 100 / 1,000 / 10 µs，1 写 0 擦，单 die 16 bank | 102.6 | 25.0 | 102.6 | 22.5 |
+| P8 完整 64-die OCP | 100 / 1,000 / 50 µs，2 写 0 擦分散，1,024 bank | 153.0 | 200.0 | 153.0 | 100.0 |
+| P9 窗口 1 ns 对照 | 同 P2，仅改 `coalesce_ns = 1 ns` | 172.2 | 100.0 | 77.8 | 60.0 |
+
+MQSim 与 `interference.py` 的核对结论与差异来源：
+
+1. **间隙吸收与调度顺序定性完全一致。**P1、P5 中写/擦完全落入空闲间隙，MQSim `fifo` 与 `read_first` 增量均为 **0 ns**，与 `gaps` 一致；P6（擦除溢出 400 µs 间隙）中 `fifo` 等完擦除再等编程（+737.2 µs），`read_first` 在擦除完成后让读抢占排队的编程（+629.0 µs），两者的差值恰好是一次编程周期（~108 µs）。P8（完整 1,024 bank）与 P2/P4（64 bank 切片）每波的绝对偏差完全相同，说明结果随 die 数线性不变。
+2. **差异一：多 plane 编程/擦除命令与通道串行开销（固定 +26.5 µs / 写波、+29.0 µs / 擦波）。**`interference.py` 只计 `tPROG` / `tBERS` 本身；MQSim 中 `T-CMD` 只缩短了读命令的每 plane 步长（`ReadCommandTime`），`ProgramCommandTime[16]` 与 `EraseCommandTime[16]` 仍沿用上游 ONFI 逐 plane 累加（含 `t_DBSY`），且每条核心通道挂 2 个 die（`chips=2`），两个 die 的命令+数据输入在通道上串行，造成 P2（60 + 26.5 = 86.5 µs）、P4（2×(250 + 26.5) = 553.0 µs）、P8（2×(50 + 26.5) = 153.0 µs）的固定正偏差。
+3. **差异二：队列内读抢占与多波突发（P3）。**当两波写集中在同一层前且间隙仅 10 µs 时，`fifo` 按到达顺序等待两波完成（230.4 µs，对应解析 `fifo` 200 µs + 命令开销）；`read_first` 只被正在执行的第 1 波阻塞，第 2 波被读抢占延后（102.6 µs），低于按两层间隙打包估算的 `gaps`（180 µs）。
+4. **差异三：部分 die 写入的"最慢 die"与均值口径（P7）。**只写 4 个 die 中的 1 个（16 bank）时，`interference.py` 的 `extra_step_ns` 按 die 均值折算 `K = 1/4`（22.5–25.0 µs），而该层要读全部 4 个 die，实际被忙碌的那个 die 整整拖慢 1 个 `tPROG`（102.6 µs，对应 `interference.py` 另行给出的最坏单步口径 `max_step_extra_ns` = 90.0 µs + 命令开销）。这说明单波只占部分 die 时，应看 `max_step_extra_ns` 而非按 die 摊平的均值。
+5. **差异四：写合并窗口（P9）。**`ocp` 拓扑默认的 `coalesce_ns = 1 ns` 是针对读命令（64 B SQE，1 ns 内全到达）设定的；写入需要经过主机总线搬运 4 KiB 页数据，页间到达间隔超过 1 ns 时会把单个 16-plane 编程波拆成同一 die 上多次串行编程，使 `fifo` 干扰翻倍（86.5 → 172.2 µs）。写入场景下需要足够大的写合并窗口或控制器显式打包整波写命令。
+
 ### 第 3 项：KV 直接存放在 HBF 上的寿命
 
 单 stack，512 GiB，并发 8，`packed`，每块 256 页，[evidence/phase2b/endurance-analytic.csv](evidence/phase2b/endurance-analytic.csv)：
