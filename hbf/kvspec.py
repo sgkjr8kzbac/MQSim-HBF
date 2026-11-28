@@ -159,16 +159,19 @@ def parse_kvspec(text, layers, heads, context):
                      + ("其余层重读所属层的 HBF 页" if p["reuse"] == "hbf" else "其余层读暂存在 HBM 的副本"))
     elif name == "duo":
         retrieval = p["retrieval"]
-        if not isinstance(retrieval, (int, float)) or not 0 <= retrieval <= 1:
+        if isinstance(retrieval, bool) or not isinstance(retrieval, (int, float)) or not 0 <= retrieval <= 1:
             raise ValueError("retrieval must be in [0, 1]")
         sink, recent = _count(p["sink"], "sink", 0), _count(p["recent"], "recent")
         tier = _tier(p["streaming_tier"], "streaming_tier")
         keep = round(retrieval * heads)
         groups = [KVGroup("retrieval", every, heads=(0, keep))] if keep else []
         if keep < heads:
-            if sink:
-                groups.append(KVGroup("sink", every, heads=(keep, heads), window=(0, sink), tier=tier))
-            groups.append(KVGroup("recent", every, heads=(keep, heads), window=(-recent, None), tier=tier))
+            if sink and sink + recent >= context:
+                groups.append(KVGroup("streaming", every, heads=(keep, heads), tier=tier))
+            else:
+                if sink:
+                    groups.append(KVGroup("sink", every, heads=(keep, heads), window=(0, sink), tier=tier))
+                groups.append(KVGroup("recent", every, heads=(keep, heads), window=(-recent, None), tier=tier))
         notes.append(f"检索头 {keep}/{heads} 保留全部 token；流式头只保留前 {sink} 个和最近 {recent} 个，"
                      f"放在 {'HBM' if tier else 'HBF'}")
     else:  # pyramid
@@ -194,15 +197,47 @@ EMPTY = "empty"
 
 
 def combine(own, group, context):
-    """A tensor's window inside a group window (absolute when both are given); EMPTY if nothing is left."""
+    """A tensor's window inside a group window (clamped to [0, context)); EMPTY if nothing is left."""
     if group is None:
         return own
     if own is None:
         lo, hi = _absolute(group, context)
-        return group if lo < hi else EMPTY
+        return (lo, hi) if lo < hi else EMPTY
     (a, b), (c, d) = _absolute(own, context), _absolute(group, context)
     lo, hi = max(a, c), min(b, d)
     return (lo, hi) if lo < hi else EMPTY
+
+
+def _peak_live_owners(alias):
+    """Peak number of simultaneously live aliased owners during layer-by-layer execution."""
+    spans = {}
+    for consumer, owner in alias:
+        lo, hi = spans.get(owner, (owner, owner))
+        spans[owner] = (min(lo, consumer), max(hi, consumer))
+    return max((sum(lo <= point <= hi for lo, hi in spans.values()) for point, _ in spans.values()), default=0)
+
+
+def _striped_gap(units, counts):
+    """Inter-region gap for striped placement of one layer without bank collisions."""
+    if sum(counts) <= units:
+        return 0
+    base = max(units // len(counts), 1)
+    target = min(len(counts), units)
+
+    def distinct(gap):
+        pos, seen = 0, set()
+        for n, count in enumerate(counts):
+            pos += gap if n else 0
+            seen.add(pos % units)
+            pos += count
+        return len(seen)
+
+    if distinct(base) == target:
+        return base
+    for candidate in (0, base + 1, max(base - 1, 1)):
+        if distinct(candidate) == target:
+            return candidate
+    return max((0, base, base + 1), key=distinct)
 
 
 class GroupedLayout(Layout):
@@ -250,7 +285,7 @@ class GroupedLayout(Layout):
                 copy = replace(spec_, name=f"{spec_.name}_copy", tier="hbm")
                 flat.append(copy)
                 reads[copy.name] = (tuple(owner), (), heads, {})
-                self.copy_owners[copy.name] = len(set(owner.values()))
+                self.copy_owners[copy.name] = _peak_live_owners(group.alias)
         names = [s.name for s in flat]
         if not flat or len(set(names)) != len(names):
             raise ValueError("A KV spec needs uniquely named tensors")
@@ -280,7 +315,7 @@ class GroupedLayout(Layout):
                        for head in reads[s.name][2]]
             if not entries:
                 continue
-            gap = max(cfg.units // len(entries), 1) if intra == "striped" else 0
+            gap = _striped_gap(cfg.units, [self.block_counts[t] for t, _ in entries]) if intra == "striped" else 0
             if intra == "striped":
                 cursor += -(base + cursor) % cfg.units
             for n, (t, head) in enumerate(entries):
@@ -317,17 +352,21 @@ class GroupedLayout(Layout):
         return layer, head, t, offset - start
 
     def request_bytes(self, cfg):
-        """Stored KV per request: owner HBF pages, plus HBM-tier tensors on their stored layers and one
-        HBM copy per aliased owner (``reuse="hbm"``)."""
+        """Stored KV per request: owner HBF pages plus permanent HBM-tier tensors (all-HBM baseline),
+        and HBM footprint under HBF (permanent HBM-tier tensors plus peak live staging copies for
+        ``reuse="hbm"``)."""
         hbf = self.pages * cfg.page_bytes
-        hbm = 0
+        hbm_stored = hbm_copies = 0
         for s in self.hbm_tensors:
-            layers, stored, heads, _ = self.read_map[s.name]
+            _, stored, heads, _ = self.read_map[s.name]
             lo, hi = self.windows[s.name]
-            count = self.copy_owners.get(s.name, len(stored))
-            hbm += count * len(heads) * (hi - lo) * s.token_bytes
-        return {"kv_bytes_per_request": round((hbf + hbm) / self.requests),
-                "hbm_tier_bytes_per_request": round(hbm / self.requests)}
+            size = len(heads) * (hi - lo) * s.token_bytes
+            if s.name in self.copy_owners:
+                hbm_copies += self.copy_owners[s.name] * size
+            else:
+                hbm_stored += len(stored) * size
+        return {"kv_bytes_per_request": round((hbf + hbm_stored) / self.requests),
+                "hbm_tier_bytes_per_request": round((hbm_stored + hbm_copies) / self.requests)}
 
 
 def generate_grouped(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, select_tokens=16, **_):

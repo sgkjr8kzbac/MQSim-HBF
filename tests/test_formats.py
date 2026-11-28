@@ -286,3 +286,30 @@ def test_new_tensor_fields_are_optional_in_meta():
     with pytest.raises(ValueError):
         TensorSpec("K", 16, 128, logical_dims=0)
     assert parse_tensors('[{"name": "C", "bits": 16, "dims": 576, "attn_dims": 1088}]')[0].attended_dims == 1088
+
+
+def test_mla_rejects_both_indexers_and_invalid_q_heads():
+    # M3: indexer and indexer_hbm cannot both be set; q_heads must be a positive int.
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        parse_format("mla:indexer=1,indexer_hbm=1,q_heads=16", 128)
+    for text in ("mla:indexer=1,q_heads=-1", "mla:indexer=1,q_heads=1.5", "mla:q_heads=-2", "mla:q_heads=1.5"):
+        with pytest.raises(ValueError, match="q_heads"):
+            parse_format(text, 128, q_heads=16)
+    with pytest.raises(ValueError, match="q_heads"):
+        parse_format("mla:indexer=1", 128, q_heads=1.5)
+
+
+@pytest.mark.parametrize("name,q_heads", [("mla_fp8", None), ("mla:indexer=1", 128),
+                                          ("kivi2:fused=1", None), ("kivi2:fused=1,pow2=1", None)])
+@pytest.mark.parametrize("mode", ["dense", "uniform_tokens", "sink_recent"])
+def test_engines_agree_on_non_64b_aligned_formats(name, q_heads, mode):
+    # L6: numpy and reference engines agree on non-64B-aligned rows (656 B, 132 B, 96 B).
+    from hbf.analysis import Protocol
+    cfg = load("ocp")
+    fmt = parse_format(name, 128, q_heads=q_heads)
+    layout = LAYOUTS["striped_contiguous"](cfg, Shape(2, 2, 128, 2048), tensors=fmt.tensors)
+    accesses = list(generate(cfg, layout, mode, steps=1, fraction=.07, seed=3, count=40))
+    for protocol in (None, Protocol(256, read_unit="wanted"), Protocol(256, read_burst=True, read_unit="wanted")):
+        expected = analyze(cfg, schedule(cfg, layout, accesses), (1, 16), protocol=protocol)
+        actual = analyze_accesses(cfg, layout, accesses, (1, 16), protocol=protocol, engine="numpy")
+        assert actual == expected

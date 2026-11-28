@@ -150,7 +150,7 @@ def _extra(mode, gaps, k, m, t_prog, t_bers, suspend_ns, step_ns, units):
         mean_gap = idle / layers
         ops = k + m
         if mean_gap <= 0:
-            suspended = float(layers)
+            suspended = min(1.0, ops) * layers
         elif ops >= 1:
             suspended = float(min(layers, math.ceil(busy / mean_gap - 1e-9)))
         else:
@@ -233,7 +233,7 @@ def hbf_gaps(h, pre, attn, post, overlap="serial", staged=False, tail_ns=0.0):
             slack = attn[before] if staged else max(0.0, attn[before] - h[before])
             gaps.append(post[before] + slack + pre[l] + (tail_ns if l == 0 else 0.0))
         return gaps
-    r_end, c_end, gaps, starts = 0.0, [], [], []
+    r_end, c_end, gaps = 0.0, [], []
     for l in range(layers):
         before = c_end[l - 1] if l else 0.0
         start = max(r_end, c_end[l - 1 - depth] if l - 1 - depth >= 0 else 0.0)
@@ -255,7 +255,7 @@ def _float(text):
 
 def retime(run_dir, *, mode="gaps", write_gb_s=0.0, erases_per_s=0.0, programs_per_step=0.0,
            erases_per_step=0.0, t_prog=None, t_bers=None, suspend_ns=None, wave_banks=1024, page_bytes=4096,
-           dies=64, banks_per_die=16, block_unit="die", iterations=60):
+           dies=64, banks_per_die=16, block_unit="die", iterations=500):
     """interference_steps rows for a finished phase A run with the system model.
 
     Time-driven loads (``write_gb_s``, ``erases_per_s``) scale with TPOT', so TPOT' is a fixed point
@@ -300,7 +300,8 @@ def retime(run_dir, *, mode="gaps", write_gb_s=0.0, erases_per_s=0.0, programs_p
         out.append({"step": step, "mode": mode, "tpot_ns": tpot,
                     "tpot_m5_ns": current if converged else math.inf,
                     "extra_step_ns": result["extra_step_ns"] if converged else math.inf,
-                    "max_step_extra_ns": result["max_step_extra_ns"], "programs_per_step": load["programs"],
+                    "max_step_extra_ns": result["max_step_extra_ns"] if converged else math.inf,
+                    "programs_per_step": load["programs"],
                     "erases_per_step": load["erases"], "busy_ns": result["busy_ns"], "idle_ns": result["idle_ns"],
                     "overflow_ns": result["overflow_ns"], "t_prog_ns": t_prog, "t_bers_ns": t_bers,
                     "suspend_ns": suspend_ns, "wave_banks": wave_banks, "block_unit": block_unit})

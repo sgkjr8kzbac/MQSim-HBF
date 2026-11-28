@@ -140,3 +140,23 @@ def test_cli_writes_steps(tmp_path):
     assert (tmp_path / "out" / "interference_steps.csv").is_file()
     assert "写入与擦除" in (tmp_path / "out" / "interference_report.md").read_text()
     assert rows[0]["tpot_m5_ns"] > rows[0]["tpot_ns"]
+
+
+def test_suspend_zero_gap_scales_with_fractional_ops():
+    # M4: with mean_gap == 0 and ops < 1, suspended layers scale by ops (continuous with gap -> 0+).
+    zero = interference(load(0.1 * ROW, gap_ns=0.0), "suspend", T_PROG, T_BERS, suspend_ns=5_000)
+    tiny = interference(load(0.1 * ROW, gap_ns=1e-6), "suspend", T_PROG, T_BERS, suspend_ns=5_000)
+    assert zero["extra_step_ns"] == pytest.approx(0.1 * 32 * 5_000 + 0.1 * T_PROG)
+    assert zero["extra_step_ns"] == pytest.approx(tiny["extra_step_ns"], rel=1e-6)
+
+
+def test_retime_high_duty_convergence_and_inf_max_step(tmp_path):
+    # M4: high-duty finite fixed point (rate = 0.95 -> TPOT' = 20 x TPOT) converges; non-converged
+    # load reports inf for max_step_extra_ns as well as tpot_m5_ns and extra_step_ns.
+    tpot = write_run(tmp_path / "run")
+    write_gb_s = 0.95 / (1e9 / 4096 / 1024 * T_PROG / 1e9)
+    high = retime(tmp_path / "run", mode="fifo", write_gb_s=write_gb_s)[0]
+    assert high["tpot_m5_ns"] == pytest.approx(tpot / 0.05, rel=1e-4)
+    diverged = retime(tmp_path / "run", mode="fifo", write_gb_s=50.0)[0]
+    assert math.isinf(diverged["tpot_m5_ns"]) and math.isinf(diverged["extra_step_ns"])
+    assert math.isinf(diverged["max_step_extra_ns"])

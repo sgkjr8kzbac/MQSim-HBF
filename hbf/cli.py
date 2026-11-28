@@ -8,7 +8,8 @@ from uuid import uuid4
 
 from .access import (LAYOUTS, MODES, Shape, default_tensors, generate, parse_tensors, read_access, tensors_meta,
                      write_access)
-from .analysis import ENGINES, GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group
+from .analysis import (ENGINES, GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group,
+                       plane_geometry, summarize)
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule_run, unwritten_reads
 from .simulator import build, dump, simulate, write_table
@@ -136,6 +137,42 @@ def subbatch_count(layer_rows, plane_groups):
     return sum(row["subbatches"] for row in layer_rows if row["group"] == plane_groups[0])
 
 
+def _zero_timing_row(cfg, group, step, layer, protocol):
+    """Empty layer row matching ``analyze_pages(..., timing=True)`` when a layer has no reads."""
+    dies, per_die = plane_geometry(cfg)
+    row = {
+        "step": step, "layer": layer, "group": group, "planes": dies * per_die, "pages": 0,
+        "active_planes": 0, "rounds": 0, "min_rounds": 0, "channel_rounds": 0,
+        "utilization": None, "balance_loss": None, "sensed_pages": 0, "sense_amplification": None,
+        "useful_bytes": 0, "page_bytes": 0, "burst_bytes": 0, "read_amplification": None,
+        "transfer_amplification": None, "subbatches": 0, "batch_rounds": 0,
+    }
+    if protocol is not None:
+        row |= {"commands": 0, "credit_rounds": 0, "link_rounds": 0, "protocol_rounds": 0,
+                "protocol_utilization": None}
+    row |= {
+        "est_ns": 0, "est_batches_ns": 0, "bound_ns": 0, "t_balanced_ns": 0, "t_imbalance_ns": 0,
+        "t_protocol_ns": 0, "t_channel_ns": 0, "t_overhead_ns": 0, "bottleneck": "none",
+        "attended_tokens": 0, "attended_elements": 0, "hbf_elements": 0, "hbm_bytes": 0, "dequant_ops": 0.0,
+    }
+    return row
+
+
+def _pad_timing_rows(cfg, layer_rows, step_rows, plane_groups, layers, steps, protocol):
+    """Pad missing (step, layer) rows with zeros per plane group so every layer is present under ``timing``."""
+    by_key = {(row["group"], row["step"], row["layer"]): row for row in layer_rows}
+    step_list = sorted(set(steps) | {row["step"] for row in layer_rows})
+    if not step_list or len(by_key) == len(plane_groups) * len(step_list) * layers:
+        return layer_rows, step_rows
+    block_reads = {row["step"]: row["max_block_reads"] for row in step_rows}
+    padded = [by_key.get((group, step, layer)) or _zero_timing_row(cfg, group, step, layer, protocol)
+              for group in plane_groups for step in step_list for layer in range(layers)]
+    steps_out = summarize(padded, protocol, timing=True)
+    for total in steps_out:
+        total["max_block_reads"] = block_reads.get(total["step"], 0)
+    return padded, steps_out
+
+
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
              placement="static", protocol=None, engine="auto", timing=False, system=None, kv_format=None,
@@ -219,6 +256,9 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     layer_rows, step_rows = analyze_accesses(cfg, layout, accesses, plane_groups, placement, protocol, engine,
                                              batches=batches if needs_schedule else None, timing=timing)
     if timing:
+        expected_steps = range(generation["steps"]) if input_csv is None else ()
+        layer_rows, step_rows = _pad_timing_rows(cfg, layer_rows, step_rows, plane_groups, shape.layers,
+                                                 expected_steps, protocol)
         attn_dims = fmt.attn_dims if fmt else 2 * shape.head_dim
         for row in layer_rows:
             row["attn_dims"] = attn_dims
@@ -305,7 +345,8 @@ def build_parser():
     parser.add_argument("--access-csv", type=Path)
     parser.add_argument("--format", dest="kv_format",
                         help="named KV storage format NAME[:key=value,...]: bf16, fp8, int4, int2, kivi4, kivi2 "
-                             "(group, residual, think), think (ratio), quest (page); see hbf/formats.py")
+                             "(group, residual, think, fused, pow2), think (ratio), quest (page), "
+                             "mla, mla_fp8 (lora, rope, split, indexer, indexer_hbm, q_heads); see hbf/formats.py")
     parser.add_argument("--kv-spec", help="layer and head groups PRESET[:key=value,...]: hybrid, ssm, cla, yoco, duo, "
                         "pyramid (see hbf/kvspec.py); generated modes dense, uniform_tokens, sink_recent only")
     parser.add_argument("--tensors", help="JSON list or file of stored tensor formats, "

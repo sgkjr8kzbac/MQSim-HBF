@@ -1,11 +1,11 @@
-"""Endurance of KV cache stored on HBF (module M4): Clock and closed-form steady state.
+"""Endurance of KV cache stored on HBF (module M4): Clock, closed-form steady state and event simulation.
 
 ``analytic`` gives steady-state write, refresh and wear rates per stack for a closed-loop
 (concurrency) or Poisson (rate) workload, instantly, as curves over X, N_PE and pages per block.
+``simulate`` runs the segment-level event simulation (design-B section 4).
 Simulated time comes from a ``Clock``: phase A's per-layer estimate est = layer_ns + round_ns x
 rounds (fitted to MQSim, design-B F1, or refitted by ``calibrate`` against phase A runs) fed as
-layer rows into the unchanged ``system.evaluate``. The request-level event simulation
-(design-B section 4) is not implemented yet.
+layer rows into the unchanged ``system.evaluate``.
 
 Spec rules used (OCP HBF v0.7.0):
 
@@ -86,38 +86,49 @@ class Geometry:
     @staticmethod
     def window(spec, ctx):
         ctx = np.asarray(ctx, dtype=np.int64)
-        lo, hi = spec.window or (None, None)
+        if spec.window is None:
+            hi = np.maximum(ctx, 0)
+            return np.zeros_like(hi), hi
+        lo, hi = spec.window
         lo = np.zeros_like(ctx) if lo is None else (ctx + lo if lo < 0 else np.full_like(ctx, lo))
         hi = ctx.copy() if hi is None else (ctx + hi if hi < 0 else np.full_like(ctx, hi))
         lo = np.clip(lo, 0, ctx)
         return lo, np.clip(hi, lo, ctx)
+
+    def _tokens(self, spec, ctx):
+        if spec.window is None:
+            return np.maximum(ctx, 0)
+        lo, hi = self.window(spec, ctx)
+        return hi - lo
 
     def stored_pages(self, ctx):
         """Full HBF pages of a request with ``ctx`` tokens (all layers and heads)."""
         ctx = np.asarray(ctx, dtype=np.int64)
         total = np.zeros_like(ctx)
         for spec, tpp in zip(self.hbf, self.tpp):
-            lo, hi = self.window(spec, ctx)
-            total += (hi - lo) // tpp
+            total += self._tokens(spec, ctx) // tpp
         return self.layers * self.heads * total
+
+    def per_request_row_pages(self, ctx, role_share=None):
+        """Pages one layer senses per step (ceil) for each request in ``ctx``, scaled per role."""
+        ctx = np.asarray(ctx, dtype=np.int64)
+        total = np.zeros(len(ctx), dtype=float)
+        for spec, tpp in zip(self.hbf, self.tpp):
+            tokens = self._tokens(spec, ctx)
+            share = 1.0 if role_share is None else role_share.get(spec.role, 1.0)
+            total += (-(-tokens // tpp)) * share
+        return self.heads * total
 
     def row_pages(self, ctx, role_share=None):
         """Pages one layer senses per step (ceil), summed over requests, scaled per role."""
-        ctx = np.asarray(ctx, dtype=np.int64)
-        total = 0.0
-        for spec, tpp in zip(self.hbf, self.tpp):
-            lo, hi = self.window(spec, ctx)
-            share = 1.0 if role_share is None else role_share.get(spec.role, 1.0)
-            total += float(np.sum(-(-(hi - lo) // tpp))) * share
-        return self.heads * total
+        return float(self.per_request_row_pages(ctx, role_share).sum())
 
     def hbm_bytes(self, ctx):
         """HBM-tier KV bytes of one request with ``ctx`` tokens (e.g. KIVI's full-precision residual)."""
         ctx = np.asarray(ctx, dtype=np.int64)
         total = np.zeros_like(ctx)
         for spec in self.hbm:
-            lo, hi = self.window(spec, ctx)
-            total += (hi - lo) * spec.token_bytes
+            total += self._tokens(spec, ctx) * spec.token_bytes
         return self.layers * self.heads * total
 
     def partial_pages(self):
@@ -128,30 +139,35 @@ class Geometry:
         """Per-layer demand of one dense step over requests with ``ctx`` tokens (phase A columns)."""
         ctx = np.asarray(ctx, dtype=np.int64)
         extra = np.zeros_like(ctx) if hbm_tokens is None else np.asarray(hbm_tokens, dtype=np.int64)
-        burst = hbm = elements = dequant = 0.0
+        burst = hbm = elements = hbf_elements = dequant = 0.0
         for spec in self.tensors:
-            lo, hi = self.window(spec, ctx)
-            tokens = hi - lo
+            tokens = self._tokens(spec, ctx)
+            tok_sum = float(np.sum(tokens))
             if spec.tier == "hbf":
-                full = tokens * spec.token_bytes // self.page_bytes
-                rest = tokens * spec.token_bytes - full * self.page_bytes
-                burst += float(np.sum(full * self.page_bytes + -(-rest // 64) * 64))
+                tpp = self.page_bytes // spec.token_bytes
+                full_burst = -(-(tpp * spec.token_bytes) // 64) * 64
+                full = tokens // tpp
+                rem = tokens - full * tpp
+                burst += float(np.sum(full * full_burst + -(-(rem * spec.token_bytes) // 64) * 64))
             else:
-                hbm += float(np.sum(tokens)) * spec.token_bytes
-            if spec.role == "data":
-                elements += float(np.sum(tokens)) * spec.dims
-            dequant += float(np.sum(tokens)) * spec.dims * spec.dequant_ops
+                hbm += tok_sum * spec.token_bytes
+            if spec.attended_dims:
+                elements += tok_sum * spec.attended_dims
+            if spec.role == "data" and spec.tier == "hbf":
+                hbf_elements += tok_sum * spec.logical
+            if spec.dequant_ops:
+                dequant += tok_sum * spec.logical * spec.dequant_ops
         hbm += float(np.sum(extra)) * sum(spec.token_bytes for spec in self.hbf)
         los, his = zip(*(self.window(spec, ctx) for spec in self.data)) if self.data else ((ctx * 0,), (ctx,))
         attended = float(np.sum(np.max(his, axis=0) - np.min(los, axis=0)))
         h = self.heads
         return {"burst_bytes": h * burst, "hbm_bytes": h * hbm, "attended_tokens": h * attended,
-                "attended_elements": h * elements, "dequant_ops": h * dequant}
+                "attended_elements": h * elements, "hbf_elements": h * hbf_elements, "dequant_ops": h * dequant}
 
 
 def geometry_for(model, kv_format=None, page_bytes=4096):
     from .formats import parse_format
-    fmt = parse_format(kv_format or "bf16", model.head_dim)
+    fmt = parse_format(kv_format or "bf16", model.head_dim, model.q_heads // model.kv_heads)
     return Geometry(model.layers, model.kv_heads, fmt.tensors, page_bytes), fmt
 
 
@@ -206,18 +222,19 @@ class Clock:
         geo, r = self.geometry, self.ratios
         hbf_ctx = ctx if hbm_tokens is None else ctx - np.asarray(hbm_tokens, dtype=np.int64)
         share = r.get("pages", 1.0)
-        pages = geo.row_pages(hbf_ctx) * share
+        per_req = geo.per_request_row_pages(hbf_ctx) * share
+        pages = float(per_req.sum())
         if partitions is not None and partition_banks:
-            parts = np.asarray(partitions)
-            loads = [geo.row_pages(hbf_ctx[parts == p]) * share for p in np.unique(parts)]
-            rounds = max(math.ceil(self.balance * load / partition_banks - 1e-9) for load in loads)
+            parts = np.asarray(partitions, dtype=np.int64)
+            max_load = float(np.bincount(parts, weights=per_req).max())
+            rounds = math.ceil(self.balance * max_load / partition_banks - 1e-9)
         elif self.rounds_fn is not None and len(set(ctx.tolist())) == 1 and hbm_tokens is None:
             rounds = self.rounds_fn(b, int(ctx[0]))
         else:
             rounds = math.ceil(self.balance * pages / self.banks - 1e-9)
         d = geo.demand(hbf_ctx, None if hbm_tokens is None else hbm_tokens)
         scale = {"burst_bytes": "burst", "hbm_bytes": "hbm", "attended_tokens": "attended",
-                 "attended_elements": "elements", "dequant_ops": "dequant"}
+                 "attended_elements": "elements", "hbf_elements": "elements", "dequant_ops": "dequant"}
         d = {key: value * r.get(scale[key], 1.0) for key, value in d.items()}
         key = (b, rounds) + tuple(int(round(math.log1p(d[k]) * 200)) for k in sorted(d))
         hit = self.cache.get(key)
@@ -265,7 +282,7 @@ def layout_rounds(model, kv_format=None, layout="striped_contiguous", pages_per_
     from .config import load
     from .formats import parse_format
     cfg = load("ocp", pages_per_block=pages_per_block, blocks_per_plane=max(1, 131072 // pages_per_block))
-    tensors = parse_format(kv_format or "bf16", model.head_dim).tensors
+    tensors = parse_format(kv_format or "bf16", model.head_dim, model.q_heads // model.kv_heads).tensors
     cache = {}
 
     def rounds(b, ctx):
@@ -711,11 +728,144 @@ def analytic(geometry, clock, workload, device=None, *, policy="packed", x_value
 
 
 # --------------------------------------------------------------------------------------------
+# vLLM free-list legality tracker
+
+class VllmTracker:
+    """Write legality of a vLLM-style per-layer pool on HBF (one layer's pool; all layers are alike).
+
+    Block id i holds pool pages [i P_id, (i + 1) P_id); a page's NAND block is (lpa mod banks,
+    (lpa // banks) // ppb) and its position (lpa // banks) mod ppb. A write is legal when it is
+    the block's next position (fill), or position 0 of a block without live pages (auto-erase,
+    section 5.4.1 item 5). Otherwise it is an overlap (an already-written position, section
+    11.5.2.2), a skip (section 11.5.2.6) or a live erase (page 0 of a block that still holds live
+    data). Freed ids return to the free queue (``reuse``: fifo as vLLM, or lifo); stranded ids
+    are free ids below the fill position of a block that still holds live data.
+    """
+
+    def __init__(self, ids, pages_per_id, pages_per_block, banks=1024, order="fresh", reuse="fifo"):
+        from collections import deque
+        if ids < 1 or pages_per_id < 1 or pages_per_block < 1 or banks < 1:
+            raise ValueError("ids, pages_per_id, pages_per_block and banks must be positive")
+        self.ids, self.pages_per_id, self.ppb, self.banks = ids, pages_per_id, pages_per_block, banks
+        # When pages_per_id divides banks, every id occupies one whole bank-group on a single row
+        # and all banks of a group receive identical writes and frees, so tracking one bank per
+        # group is exact and pages_per_id times faster.
+        self._grouped = (banks % pages_per_id == 0)
+        self._scale = pages_per_id if self._grouped else 1
+        groups = banks // pages_per_id if self._grouped else banks
+        rows = -(-ids * pages_per_id // banks)
+        self.nblocks = -(-rows // pages_per_block)
+        self.fill = np.zeros(groups * self.nblocks, dtype=np.int64)
+        self.live = np.zeros(groups * self.nblocks, dtype=np.int64)
+        start = np.arange(ids)
+        if order.startswith("shuffled:"):
+            try:
+                seed = int(order[9:])
+            except ValueError:
+                raise ValueError(f"Invalid free_order {order!r}: use fresh or shuffled:<int>") from None
+            np.random.Generator(np.random.PCG64(seed)).shuffle(start)
+        elif order != "fresh":
+            raise ValueError("free_order must be fresh or shuffled:<seed>")
+        if reuse not in ("fifo", "lifo"):
+            raise ValueError("vllm_reuse must be fifo or lifo")
+        self.queue, self.reuse = deque(start.tolist()), reuse
+        self.used = np.zeros(ids, dtype=bool)
+        self.counts = {"skip": 0, "overlap": 0, "live_erase": 0, "erases": 0, "writes": 0, "legalize_pages": 0}
+
+    def _pages(self, ids):
+        arr = np.asarray(ids, dtype=np.int64)
+        if self._grouped:
+            lpa = arr * self.pages_per_id
+            row = lpa // self.banks
+            return ((lpa % self.banks) // self.pages_per_id) * self.nblocks + row // self.ppb, row % self.ppb
+        lpa = (arr[:, None] * self.pages_per_id + np.arange(self.pages_per_id)).ravel()
+        row = lpa // self.banks
+        return (lpa % self.banks) * self.nblocks + row // self.ppb, row % self.ppb
+
+    def allocate(self, n):
+        if n <= 0:
+            return []
+        if n > len(self.queue):
+            raise CapacityError(f"vLLM pool exhausted: need {n} ids, {len(self.queue)} free")
+        ids = [self.queue.popleft() for _ in range(n)]
+        self.used[ids] = True
+        self.write(ids)
+        return ids
+
+    def write(self, ids):
+        if not len(ids):
+            return
+        key, pos = self._pages(ids)
+        owner = (np.arange(len(ids), dtype=np.int64) if self._grouped
+                 else np.repeat(np.arange(len(ids)), self.pages_per_id))
+        order = np.argsort(key, kind="stable")
+        k, p, o = key[order], pos[order], owner[order]
+        first = np.ones(len(k), dtype=bool)
+        first[1:] = k[1:] != k[:-1]
+        live_before = self.live[k]
+        erase = (p == 0) & first & (live_before == 0)
+        live_erase = (p == 0) & ~erase
+        # Within each block, split erase epochs only on legal erases (live_before == 0), not on
+        # live_erase, so fill never shrinks below still-live pages.
+        epoch_start = first | erase
+        epoch = np.cumsum(epoch_start) - 1
+        scale = self.ppb + 2
+        val = np.where(first & ~erase, np.maximum(self.fill[k] - 1, p), p)
+        keyed = epoch * scale + (val + 1)
+        after = np.maximum.accumulate(keyed)
+        before = np.empty_like(keyed)
+        before[:1] = 0
+        before[1:] = after[:-1]
+        prev_high = np.where(erase, -1, np.where(first, self.fill[k] - 1, before - epoch * scale - 1))
+        legal = erase | ((p != 0) & (p == prev_high + 1))
+        overlap = ~legal & ~live_erase & (p <= prev_high)
+        skip = ~legal & ~live_erase & (p > prev_high + 1)
+        for name, mask in (("overlap", overlap), ("skip", skip), ("live_erase", live_erase)):
+            if mask.any():
+                self.counts[name] += len(np.unique(o[mask]))
+        bad_mask = overlap | live_erase
+        if bad_mask.any():  # legalising = replaying the offending blocks up to their fill at violation time
+            bad_k = k[bad_mask]
+            eff_fill = np.zeros(len(self.fill), dtype=np.int64)
+            np.maximum.at(eff_fill, bad_k, np.maximum(self.fill[bad_k], prev_high[bad_mask] + 1))
+            self.counts["legalize_pages"] += int(eff_fill[np.unique(bad_k)].sum()) * self._scale
+        self.counts["erases"] += int(erase.sum()) * self._scale
+        self.counts["writes"] += len(ids)
+        ends = np.flatnonzero(np.r_[first[1:], True])
+        self.fill[k[ends]] = after[ends] - epoch[ends] * scale
+        np.add.at(self.live, k, 1)
+
+    def free(self, ids):
+        if not len(ids):
+            return
+        key, _ = self._pages(ids)
+        np.subtract.at(self.live, key, 1)
+        self.used[list(ids)] = False
+        if self.reuse == "fifo":
+            self.queue.extend(ids)
+        else:
+            self.queue.extendleft(ids)
+
+    def stranded(self):
+        """Fraction of all ids that are free but cannot be rewritten legally now."""
+        free = np.flatnonzero(~self.used)
+        if not len(free):
+            return 0.0
+        key, pos = self._pages(free)
+        stuck = (self.live[key] > 0) & (pos < self.fill[key])
+        if self._grouped:
+            return float(stuck.sum()) / self.ids
+        per_id = stuck.reshape(len(free), self.pages_per_id).any(axis=1)
+        return float(per_id.sum()) / self.ids
+
+
+# --------------------------------------------------------------------------------------------
 # Event simulation (M4b)
 
-SIM_POLICIES = ("packed", "dedicated", "hbm_decode", "layer_major")
-WEAR = ("none", "dynamic", "ideal")
+SIM_POLICIES = ("packed", "dedicated", "hbm_decode", "layer_major", "vllm_pool")
+WEAR = ("none", "dynamic", "ideal", "remap")
 REFRESH = ("auto", "relocate", "replay")
+VICTIMS = ("greedy", "cost_benefit")
 CAUSE = {cause: index for index, cause in enumerate(CAUSES)}
 EPS = 1e-6
 OPEN, FULL = 1, 2  # segment states (0: never written)
@@ -745,6 +895,10 @@ class SimOptions:
     refresh: str = "auto"  # auto: replay for layer_major, relocate otherwise
     refresh_idle: str = "relocate"  # or evict: idle entries in a refreshed segment are dropped
     reclaim: str = "evict"  # or compact: idle entries in a reclaim victim are copied too
+    victim: str = "greedy"  # greedy (fewest pages to copy) or cost_benefit ((1 - u) * age / (1 + u))
+    prefill: str = "disaggregated"  # disaggregated or colocated (adds input / prefill_tok_s per admission)
+    pre_open: bool = False  # pre-open free segments in idle time (takes non-replay erases off M5)
+    separate_prefix: bool = False  # keep shared prefixes on their own write frontier per partition
     low_watermark: int | None = None  # free segments per partition kept by reclaim (default 2 + one request)
     align: str = "row"  # packed: a new entry starts on a row
     slots: int | None = None  # running requests at most (layer_major: slots per wave)
@@ -756,15 +910,21 @@ class SimOptions:
     suspend_ns: float | None = None
     block_unit: str = "die"
     pe_limits: tuple = (1e4, 1e5, 1e6)
+    block_tokens: int | None = None  # vllm_pool: tokens per vLLM block (default: lcm of HBF tpp)
+    free_order: str = "fresh"  # vllm_pool: fresh (ascending ids) or shuffled:<seed>
+    vllm_reuse: str = "fifo"  # vllm_pool: fifo (vLLM default) or lifo
 
     def __post_init__(self):
         if self.policy not in SIM_POLICIES:
-            raise ValueError(f"The simulation supports the policies {', '.join(SIM_POLICIES)}; "
-                             "vllm_pool is analytic only (--analytic)")
+            raise ValueError(f"The simulation supports the policies {', '.join(SIM_POLICIES)}")
         if self.wear not in WEAR or self.refresh not in REFRESH:
             raise ValueError(f"wear must be one of {', '.join(WEAR)} and refresh one of {', '.join(REFRESH)}")
         if self.refresh_idle not in ("relocate", "evict") or self.reclaim not in ("evict", "compact"):
             raise ValueError("refresh_idle is relocate or evict; reclaim is evict or compact")
+        if self.victim not in VICTIMS:
+            raise ValueError(f"victim must be one of {', '.join(VICTIMS)}")
+        if self.prefill not in ("disaggregated", "colocated"):
+            raise ValueError("prefill must be disaggregated or colocated")
         if self.prefix_reads not in ("per_request", "once") or self.align not in ("row", "none"):
             raise ValueError("prefix_reads is per_request or once; align is row or none")
         if self.m5 not in M5_MODES + ("off",):
@@ -783,6 +943,17 @@ class SimOptions:
             raise ValueError("slots must be positive")
         if self.policy == "layer_major" and self.refresh == "relocate":
             raise ValueError("layer_major regions are refreshed in place (replay, spec section 5.7)")
+        if self.block_tokens is not None and self.block_tokens < 1:
+            raise ValueError("block_tokens must be positive")
+        if self.free_order != "fresh" and not self.free_order.startswith("shuffled:"):
+            raise ValueError("free_order must be fresh or shuffled:<seed>")
+        if self.free_order.startswith("shuffled:"):
+            try:
+                int(self.free_order[9:])
+            except ValueError:
+                raise ValueError(f"Invalid free_order {self.free_order!r}: use fresh or shuffled:<int>") from None
+        if self.vllm_reuse not in ("fifo", "lifo"):
+            raise ValueError("vllm_reuse must be fifo or lifo")
 
 
 class Simulator:
@@ -805,18 +976,21 @@ class Simulator:
     idle expiry, read-disturb refresh, retention refresh and reclaim run (design-B section 4.2).
     """
 
-    def __init__(self, geometry, clock, workload, device=None, options=None, model=None):
+    def __init__(self, geometry, clock, workload, device=None, options=None, model=None, gpu=None):
         self.geo, self.clock, self.workload = geometry, clock, workload
         self.dev = d = device or Device()
         self.opt = o = options or SimOptions()
         self.model = model if model is not None else getattr(clock, "model", None)
-        if o.policy == "layer_major" and d.partition != "none":
-            raise ValueError("layer_major uses the whole device (no partition)")
+        self.gpu = gpu if gpu is not None else getattr(clock, "gpu", None)
+        if o.policy in ("layer_major", "vllm_pool") and d.partition != "none":
+            raise ValueError(f"{o.policy} uses the whole device (no partition)")
+        if o.prefill == "colocated" and (self.model is None or self.gpu is None):
+            raise ValueError("prefill='colocated' needs model and gpu (from Clock or arguments)")
         if o.refresh == "auto":
             self.refresh = "replay" if o.policy == "layer_major" else "relocate"
         else:
             self.refresh = o.refresh
-        self.writes_decode = o.policy in ("packed", "dedicated")
+        self.writes_decode = o.policy in ("packed", "dedicated", "vllm_pool")
         self.hbm_out = o.policy in ("hbm_decode", "layer_major")
         self.parts, self.row, self.P = d.parts, d.segment_banks, d.segment_pages
         self.S = S = d.capacity_pages // self.P
@@ -826,6 +1000,7 @@ class Simulator:
         # segments
         self.fill, self.live, self.reads = np.zeros(S), np.zeros(S), np.zeros(S)
         self.pec = np.zeros(S, dtype=np.int64)
+        self.remap_epoch = np.zeros(S, dtype=np.int64)
         self.state = np.zeros(S, dtype=np.int8)
         self.owner = np.full(S, -1, dtype=np.int64)
         self.busy = np.zeros(S, dtype=bool)
@@ -836,12 +1011,15 @@ class Simulator:
         self.free_count = np.array([len(heap) for heap in self.heaps], dtype=np.int64)
         self.part_live = np.zeros(self.parts)
         self.part_pec = np.zeros(self.parts)  # sum of segment PECs per partition (tie-break for new entries)
+        self.part_ver = np.zeros(self.parts, dtype=np.int64)
+        self.reclaim_blocked = np.full(self.parts, -1, dtype=np.int64)
         self.frontier = [-1] * self.parts
+        self.prefix_frontier = [-1] * self.parts
         # entries
         self.e_cap = 0
         self.free_entries = []
         self._grow_entries(256)
-        self.e_rows, self.e_owned, self.e_key = {}, {}, {}
+        self.e_rows, self.e_owned, self.e_key, self.e_ids = {}, {}, {}, {}
         self.prefix_entry, self.session_entry = {}, {}
         self.protected = set()
         # occupancy rows
@@ -868,15 +1046,40 @@ class Simulator:
         self.queue = []
         self.stream = Stream(workload, stagger=o.stagger)
         self.region, self.region_cache = [], {}
+        # vLLM free-list tracker (runs alongside packed wear when policy == "vllm_pool")
+        self.vllm = None
+        self.block_tokens = 0
+        self._vllm_residual = 0
+        self.vllm_stranded = 0.0
+        self.vllm_dirty = False
+        if o.policy == "vllm_pool":
+            bt = o.block_tokens or math.lcm(*self.geo.tpp)
+            if any(bt % tpp for tpp in self.geo.tpp):
+                raise ValueError("vllm_pool block_tokens must be a multiple of every HBF tensor's tokens per page")
+            self.block_tokens = bt
+            windows = {spec.window for spec in self.geo.hbf}
+            if len(windows) == 1:
+                win = next(iter(windows))
+                if win is not None and win[0] in (None, 0) and win[1] is not None and win[1] < 0:
+                    self._vllm_residual = -win[1]
+            per_id = self.geo.heads * sum(bt // tpp for tpp in self.geo.tpp)
+            pool_pages = self.S * self.P // self.geo.layers
+            n_ids = pool_pages // per_id
+            if n_ids < 1:
+                raise ValueError("vllm_pool capacity too small for even one block id")
+            self.vllm = VllmTracker(n_ids, per_id, d.pages_per_block, d.banks, o.free_order, o.vllm_reuse)
         # clocks and counters
         self.t = 0.0
         self.page_cache = {}
         self.programs = np.zeros(len(CAUSES))
         self.seg_erases = np.zeros(len(CAUSES), dtype=np.int64)
         self.block_erases = 0
-        self.acc = dict.fromkeys(("steps", "tokens", "batch_s", "ctx_s", "decode_s", "tpot_s", "m5_s"), 0.0)
+        self.m5_erases = 0
+        self.acc = dict.fromkeys(("steps", "tokens", "batch_s", "ctx_s", "decode_s", "tpot_s", "m5_s",
+                                  "stranded_s", "prefill_s"), 0.0)
         self.n = dict.fromkeys(("completed", "admitted", "refresh_rd", "refresh_ret", "compaction", "evicted_pages",
                                 "recompute_tokens", "stalls", "reclaims", "waves", "quanta"), 0.0)
+        self.prefill_dt = 0.0
         self.guard = False
         self.pending_reads = False
         self.drops = 0  # bumps whenever live data dies or moves (retry point of a stalled admission)
@@ -892,7 +1095,11 @@ class Simulator:
 
     # ---- helpers ---------------------------------------------------------------------------
     def _key(self, s):
-        return (0 if self.opt.wear == "none" else int(self.pec[s]), s)
+        if self.opt.wear == "none":
+            return (0, s)
+        if self.opt.wear == "remap":
+            return (int(self.remap_epoch[s]), s)
+        return (int(self.pec[s]), s)
 
     def pages(self, tokens):
         """Full HBF pages of ``tokens`` tokens of one request (cached)."""
@@ -984,10 +1191,12 @@ class Simulator:
         self.c_v[i] = False
         self.dead_rows += 1
         self.drops += 1
+        p = self.part_of[s]
+        self.part_ver[p] += 1
         del self.e_rows[e][s]
         self.e_pages[e] -= n
         self.live[s] -= n
-        self.part_live[self.part_of[s]] -= n
+        self.part_live[p] -= n
         if self.live[s] < EPS:
             self.live[s] = 0.0
             self._release(s)
@@ -1004,6 +1213,7 @@ class Simulator:
         heapq.heappush(self.heaps[p], self._key(s))
         self.free_count[p] += 1
         self.drops += 1
+        self.part_ver[p] += 1
 
     def _take(self, part):
         heap = self.heaps[part]
@@ -1011,6 +1221,7 @@ class Simulator:
             s = heapq.heappop(heap)[1]
             if self.is_free[s]:
                 self.is_free[s] = False
+                self.remap_epoch[s] += 1
                 self.free_count[part] -= 1
                 self.free_min = min(self.free_min, int(self.free_count.sum()))
                 return s
@@ -1024,15 +1235,18 @@ class Simulator:
         self.erases[s, c] += 1
         self.seg_erases[c] += 1
         self.block_erases += self.row
+        if not self.opt.pre_open or cause == "replay":
+            self.m5_erases += self.row
         self.reads[s] = 0.0
 
-    def _open(self, part, cause, owner=-1):
+    def _open(self, part, cause, owner=-1, prefix=False):
         """Take a free segment of ``part`` and write its row 0 (an erase), reclaiming first when none is free."""
+        front = self.prefix_frontier if (prefix and self.opt.separate_prefix) else self.frontier
         s = self._take(part)
         if s < 0 and not self.guard:
-            self._reclaim(part, force=True, target=self.P)
-            if owner < 0 and self.frontier[part] >= 0:  # compaction opened a frontier: continue there
-                return self.frontier[part]
+            self._reclaim(part, force=True, target=lambda: self.free_count[part] >= 1 or (owner < 0 and front[part] >= 0))
+            if owner < 0 and front[part] >= 0:  # compaction opened a frontier: continue there
+                return front[part]
             s = self._take(part)
         if s < 0:
             raise CapacityError(f"No free segment in partition {part} at t = {self.t:.1f} s "
@@ -1042,7 +1256,7 @@ class Simulator:
         if owner >= 0:
             self.e_owned[owner].append(s)
         else:
-            self.frontier[part] = s
+            front[part] = s
         return s
 
     def _close(self, s):
@@ -1050,9 +1264,12 @@ class Simulator:
         p = self.part_of[s]
         if self.frontier[p] == s:
             self.frontier[p] = -1
+        if self.prefix_frontier[p] == s:
+            self.prefix_frontier[p] = -1
         o = self.owner[s]
         if o >= 0 and self.e_dseg[o] == s:
             self.e_dseg[o] = -1
+        self.part_ver[p] += 1
         self._release(s)
 
     # ---- writes ----------------------------------------------------------------------------
@@ -1060,6 +1277,8 @@ class Simulator:
         """Append n pages of entry e: the partition's frontier, or the entry's own segment (dedicated)."""
         part = int(self.e_part[e])
         dedicated = self.opt.policy == "dedicated"
+        use_prefix = self.opt.separate_prefix and self.e_kind[e] == PREFIX
+        front = self.prefix_frontier if use_prefix else self.frontier
         while n > EPS:
             if dedicated:
                 s = int(self.e_dseg[e])
@@ -1067,7 +1286,7 @@ class Simulator:
                     s = self._open(part, cause, owner=e)
                     self.e_dseg[e] = s
             else:
-                s = self.frontier[part]
+                s = front[part]
                 if s >= 0 and align and self.opt.align == "row":
                     pad = math.ceil(self.fill[s] / self.row - 1e-9) * self.row - self.fill[s]
                     if pad > EPS:
@@ -1077,7 +1296,7 @@ class Simulator:
                             self._close(s)
                             s = -1
                 if s < 0:
-                    s = self._open(part, cause)
+                    s = self._open(part, cause, prefix=use_prefix)
                 align = False
             k = min(n, self.P - self.fill[s])
             self.fill[s] += k
@@ -1152,23 +1371,88 @@ class Simulator:
         return float((geo.stored_pages(self.sl_end[on]) - geo.stored_pages(self.sl_ctx[on])).sum()
                      + self.sl_staged[on].sum())
 
-    def _room(self, part):
-        room = float(self.free_count[part] * self.P)
-        s = self.frontier[part]
-        if s >= 0 and self.opt.policy != "dedicated":
-            room += self.P - self.fill[s]
-        return room
-
-    def _space(self, part, need):
-        """Room for ``need`` pages plus outstanding writes and the reserve, reclaiming when short."""
+    def _frontier_rem(self, part, prefix=False):
         if self.opt.policy == "dedicated":
-            need = math.ceil(need / self.P - 1e-9) * self.P
+            return 0.0
+        front = self.prefix_frontier if (prefix and self.opt.separate_prefix) else self.frontier
+        s = front[part]
+        return (self.P - self.fill[s]) if s >= 0 else 0.0
+
+    def _room(self, part, prefix=False):
+        return float(self.free_count[part] * self.P) + self._frontier_rem(part, prefix)
+
+    def _segs_needed(self, part, main_pages, prefix_pages=0.0):
+        """Free segments of ``part`` needed to write ``main_pages`` and ``prefix_pages``."""
+        if self.opt.policy == "dedicated":
+            s_main = math.ceil(main_pages / self.P - 1e-9) if main_pages > EPS else 0
+            s_pre = math.ceil(prefix_pages / self.P - 1e-9) if prefix_pages > EPS else 0
+            return s_main + s_pre
+        if self.opt.separate_prefix:
+            rem_main = self._frontier_rem(part, prefix=False)
+            rem_pre = self._frontier_rem(part, prefix=True)
+            s_main = max(0, math.ceil((main_pages - rem_main) / self.P - 1e-9)) if main_pages > EPS else 0
+            s_pre = max(0, math.ceil((prefix_pages - rem_pre) / self.P - 1e-9)) if prefix_pages > EPS else 0
+            return s_main + s_pre
+        total = main_pages + prefix_pages
+        rem = self._frontier_rem(part, prefix=False)
+        return max(0, math.ceil((total - rem) / self.P - 1e-9)) if total > EPS else 0
+
+    def _space(self, part, need, prefix_need=0.0):
+        """Room for ``need`` (and ``prefix_need``) pages plus outstanding writes and reserve, reclaiming when short."""
         want = need + self._outstanding(part)
-        reserve = (self.low_wm - 1) * self.P
-        if self._room(part) - want >= reserve:
+        reserve = self.low_wm - 1
+        if self.free_count[part] >= self._segs_needed(part, want, prefix_need) + reserve:
             return True
-        self._reclaim(part, force=True, target=want + reserve)
-        return self._room(part) - want >= -EPS
+        self._reclaim(part, force=True,
+                      target=lambda: self.free_count[part] >= self._segs_needed(part, want, prefix_need) + reserve)
+        return self.free_count[part] >= self._segs_needed(part, want, prefix_need)
+
+    def _vllm_tokens(self, tokens):
+        return max(0, int(tokens) - self._vllm_residual)
+
+    def _vllm_outstanding(self):
+        """vLLM block ids that currently running requests will still allocate during decode."""
+        if self.vllm is None or not self.writes_decode:
+            return 0
+        on = np.flatnonzero(self.sl_on)
+        if not len(on):
+            return 0
+        bt, res = self.block_tokens, self._vllm_residual
+        end_ids = np.maximum(0, self.sl_end[on] - res) // bt
+        ctx_ids = np.maximum(0, self.sl_ctx[on] - res) // bt
+        return int((end_ids - ctx_ids).sum())
+
+    def _vllm_ensure(self, need_ids):
+        """Evict oldest idle entries when the vLLM free queue lacks ``need_ids`` ids."""
+        if self.vllm is None or need_ids <= len(self.vllm.queue):
+            return True
+        idle = [e for e in np.flatnonzero(self.e_state == IDLE).tolist()
+                if e not in self.protected and e in self.e_ids]
+        idle.sort(key=lambda e: min((self.c_t[i] for i in self.e_rows[e].values()), default=math.inf))
+        for e in idle:
+            self._kill(e, evicted=True)
+            if need_ids <= len(self.vllm.queue):
+                return True
+        return need_ids <= len(self.vllm.queue)
+
+    def _vllm_write(self, e, lo, hi):
+        """vllm_pool: allocate and write the ids of full vLLM blocks in HBF tokens [lo, hi) of entry e."""
+        if self.vllm is None:
+            return
+        bt = self.block_tokens
+        count = self._vllm_tokens(hi) // bt - self._vllm_tokens(lo) // bt
+        if count > 0:
+            self._vllm_ensure(count)
+            self.e_ids.setdefault(e, []).extend(self.vllm.allocate(count))
+            self.vllm_dirty = True
+
+    def _update_stranded(self, dt):
+        """Integrate time-averaged stranded fraction over ``dt`` seconds (vllm_pool only)."""
+        if self.vllm is not None and dt > 0:
+            if self.vllm_dirty:
+                self.vllm_stranded = self.vllm.stranded()
+                self.vllm_dirty = False
+            self.acc["stranded_s"] += self.vllm_stranded * dt
 
     def _admit(self, req):
         """Start a request: prefix and session entries, prefill writes. False when space is short."""
@@ -1178,18 +1462,29 @@ class Simulator:
         end = start + req.output
         sess = self.session_entry.get(req.session, -1) if req.session >= 0 else -1
         pre = self.prefix_entry.get(req.prefix, -1) if req.prefix >= 0 else -1
+        new_prefix = req.prefix >= 0 and pre < 0
         # A session's history is on HBF up to e_stored (under hbm_decode the last call's output is not:
         # it is written with this call's prompt); an evicted history is recomputed and rewritten.
         have = int(self.e_stored[sess]) if sess >= 0 else pre_tokens
         own = self.pages(start) - self.pages(have)
-        need = own + (self.pages(pre_tokens) if req.prefix >= 0 and pre < 0 else 0.0)
-        if self.writes_decode:
-            need += self.pages(end) - self.pages(start)
+        pre_need = self.pages(pre_tokens) if new_prefix else 0.0
+        need = own + (self.pages(end) - self.pages(start) if self.writes_decode else 0.0)
+        if not self.opt.separate_prefix:
+            need += pre_need
+            pre_need = 0.0
+        vllm_need = 0
+        if self.vllm is not None:
+            bt = self.block_tokens
+            if new_prefix:
+                vllm_need += self._vllm_tokens(pre_tokens) // bt
+            v_hi = self._vllm_tokens(end if self.writes_decode else start)
+            vllm_need += max(0, v_hi // bt - self._vllm_tokens(have) // bt)
+            vllm_need += self._vllm_outstanding()
         part = int(self.e_part[sess]) if sess >= 0 else self._partition()
         keep = [e for e in (sess, pre) if e >= 0]
         self.protected.update(keep)  # a forced reclaim must not evict what this request reuses
         try:
-            if not self._space(part, need):
+            if not self._space(part, need, pre_need) or not self._vllm_ensure(vllm_need):
                 return False
         finally:
             self.protected.difference_update(keep)
@@ -1200,6 +1495,7 @@ class Simulator:
                 pre = self._new_entry(PREFIX, part, pre_tokens)
                 self.prefix_entry[req.prefix], self.e_key[pre] = pre, ("prefix", req.prefix)
                 self._write(pre, self.pages(pre_tokens), "prefill", align=True)
+                self._vllm_write(pre, 0, pre_tokens)
             self.e_state[pre], self.e_ttl[pre] = ACTIVE, math.inf
             self.e_readers[pre] += 1
         if sess >= 0:
@@ -1213,6 +1509,12 @@ class Simulator:
         self.e_state[e], self.e_readers[e], self.e_ttl[e] = ACTIVE, 1.0, math.inf
         self.e_tokens[e], self.e_stored[e] = start - pre_tokens, start
         self._write(e, own, "prefill", align=sess < 0)
+        self._vllm_write(e, have, start)
+        if self.opt.prefill == "colocated":
+            prefill_toks = req.input + (pre_tokens if new_prefix else 0) + (req.history if sess < 0 else 0)
+            dt = self.opt.stacks * prefill_toks / prefill_tok_s(self.model, self.gpu, start)
+            self.prefill_dt += dt
+            self.acc["prefill_s"] += dt
         slot = self.free_slots.pop()
         self.sl_on[slot], self.sl_req[slot] = True, req
         self.sl_entry[slot], self.sl_prefix[slot], self.sl_part[slot] = e, pre, part
@@ -1223,8 +1525,8 @@ class Simulator:
 
     def _complete(self, slot):
         req, e, pre = self.sl_req[slot], int(self.sl_entry[slot]), int(self.sl_prefix[slot])
+        self._entry_reads(e)
         if self.sl_staged[slot] > EPS:  # the request's last staged full pages (a partial row)
-            self._entry_reads(e)
             self._write(e, float(self.sl_staged[slot]), "decode")
         if self.writes_decode:
             self.e_stored[e] = self.sl_end[slot]
@@ -1251,6 +1553,7 @@ class Simulator:
 
     def _idle(self, e, ttl):
         self.e_state[e], self.e_readers[e], self.e_ttl[e] = IDLE, 0.0, ttl
+        self.part_ver[self.e_part[e]] += 1
 
     def _kill(self, e, evicted=False):
         self._entry_reads(e)
@@ -1265,6 +1568,9 @@ class Simulator:
                 if self.state[s] == OPEN:
                     self.state[s] = FULL
                 self._release(s)
+        if self.vllm is not None and e in self.e_ids:
+            self.vllm.free(self.e_ids.pop(e))
+            self.vllm_dirty = True
         key = self.e_key.pop(e, None)
         if key is not None:
             table = self.prefix_entry if key[0] == "prefix" else self.session_entry
@@ -1322,7 +1628,7 @@ class Simulator:
         span = self._region_span(max(prompts))
         need = math.ceil(span / self.P - 1e-9)
         if self.free_count[0] < need:
-            self._reclaim(0, force=True, target=need * self.P)
+            self._reclaim(0, force=True, target=lambda: self.free_count[0] >= need)
         if self.free_count[0] < need:
             raise CapacityError(f"A wave region of {span:.0f} pages needs {need} segments, "
                                 f"{self.free_count[0]} are free")
@@ -1352,6 +1658,10 @@ class Simulator:
             self.sl_part[slot], self.sl_staged[slot] = 0, 0.0
             self.n_running += 1
             self.n["admitted"] += 1
+            if self.opt.prefill == "colocated":
+                dt = self.opt.stacks * prompt / prefill_tok_s(self.model, self.gpu, prompt)
+                self.prefill_dt += dt
+                self.acc["prefill_s"] += dt
         self._program("prefill", real)
         self._program("padding", span - real)
         self.n["waves"] += 1
@@ -1416,54 +1726,125 @@ class Simulator:
         self.reads[s] = 0.0
         self._release(s)
 
-    def _victim(self, part):
-        """Reclaim victim of ``part``: the closed segment with the fewest pages to copy (greedy)."""
+    def _victim_state(self):
+        """Per-segment copy counts and idle-owner mask for victim selection (shared across partitions)."""
         n = self.c_count
         e = self.c_e[:n]
-        keep = self.e_state[e] == ACTIVE
-        if self.protected:
-            keep |= np.isin(e, list(self.protected))
+        v = self.c_v[:n]
         if self.opt.reclaim == "compact":
-            keep = self.e_state[e] > 0
-        keep &= self.c_v[:n]
-        copy = np.bincount(self.c_s[:n][keep], self.c_n[:n][keep], self.S)
+            keep = (self.e_state[e] > 0) & v
+        else:
+            keep = (self.e_state[e] == ACTIVE) & v
+            if self.protected:
+                keep |= np.isin(e, list(self.protected)) & v
+        if self.opt.separate_prefix:
+            is_pre = self.e_kind[e] == PREFIX
+            copy_main = np.bincount(self.c_s[:n][keep & ~is_pre], self.c_n[:n][keep & ~is_pre], self.S)
+            copy_pre = np.bincount(self.c_s[:n][keep & is_pre], self.c_n[:n][keep & is_pre], self.S)
+            copy = copy_main + copy_pre
+        else:
+            copy_main = copy_pre = None
+            copy = np.bincount(self.c_s[:n][keep], self.c_n[:n][keep], self.S)
         owner_idle = np.zeros(self.S, dtype=bool)
         owned = self.owner >= 0
         if owned.any():
-            owner_idle[owned] = (self.e_state[self.owner[owned]] == IDLE) & ~np.isin(self.owner[owned],
-                                                                                      list(self.protected))
+            owner_idle[owned] = (self.e_state[self.owner[owned]] == IDLE)
+            if self.protected:
+                owner_idle[owned] &= ~np.isin(self.owner[owned], list(self.protected))
             copy[owner_idle] = 0.0
-        cand = ((self.part_of == part) & (self.state == FULL) & ~self.busy & ~self.is_free
-                & (self.live > EPS) & ((self.owner == -1) | owner_idle))
-        index = np.flatnonzero(cand)
-        if not len(index):
-            return -1
-        least = index[copy[index] <= copy[index].min() + EPS]
-        if len(least) > 1:  # ties: the segment with the oldest data (least recently written first)
-            oldest = np.full(self.S, math.inf)
-            valid = self.c_v[:n]
-            np.minimum.at(oldest, self.c_s[:n][valid], self.c_t[:n][valid])
-            least = least[np.argsort(oldest[least], kind="stable")]
-        best = int(least[0])
-        if copy[best] >= self.P - EPS or copy[best] > self._room(part) + EPS:
-            return -1
-        return best
+            if self.opt.separate_prefix:
+                copy_main[owner_idle] = 0.0
+                copy_pre[owner_idle] = 0.0
+        return [copy, owner_idle, None, copy_main, copy_pre]
 
-    def _reclaim(self, part, force=False, target=None):
-        """Free segments of ``part``: while fewer than the low watermark, or (forced) until ``target`` pages fit."""
+    def _oldest_times(self, state):
+        if state[2] is None:
+            n = self.c_count
+            v = self.c_v[:n]
+            oldest = np.full(self.S, math.inf)
+            np.minimum.at(oldest, self.c_s[:n][v], self.c_t[:n][v])
+            state[2] = oldest
+        return state[2]
+
+    def _victim(self, part, state=None):
+        """Reclaim victim of ``part``: fewest pages to copy (greedy) or highest (1 - u) * age / (1 + u)."""
+        if state is None:
+            state = self._victim_state()
+        copy, owner_idle, _, copy_main, copy_pre = state
+        sl = slice(part, self.S, self.parts)
+        cand = (~self.busy[sl] & ~self.is_free[sl] & (self.live[sl] > EPS)
+                & (((self.state[sl] == FULL) & (self.owner[sl] == -1)) | owner_idle[sl]))
+        local = np.flatnonzero(cand)
+        if not len(local):
+            return -1
+        index = part + local * self.parts
+        if self.opt.separate_prefix:
+            rem_main = self._frontier_rem(part, prefix=False)
+            rem_pre = self._frontier_rem(part, prefix=True)
+            cm, cp = copy_main[index], copy_pre[index]
+            segs_main = np.where(cm > EPS, np.maximum(0, np.ceil((cm - rem_main) / self.P - 1e-9)), 0)
+            segs_pre = np.where(cp > EPS, np.maximum(0, np.ceil((cp - rem_pre) / self.P - 1e-9)), 0)
+            fits = (copy[index] < self.P - EPS) & (segs_main + segs_pre <= self.free_count[part])
+            index = index[fits]
+            if not len(index):
+                return -1
+        else:
+            room = self._room(part)
+            if self.opt.victim == "cost_benefit":
+                index = index[(copy[index] < self.P - EPS) & (copy[index] <= room + EPS)]
+                if not len(index):
+                    return -1
+            else:
+                c_idx = copy[index]
+                c_min = float(c_idx.min())
+                if c_min >= self.P - EPS or c_min > room + EPS:
+                    return -1
+                least = index[c_idx <= c_min + EPS]
+                if len(least) > 1:  # ties: the segment with the oldest data (least recently written first)
+                    oldest = self._oldest_times(state)
+                    least = least[np.argsort(oldest[least], kind="stable")]
+                return int(least[0])
+        if self.opt.victim == "cost_benefit":
+            oldest = self._oldest_times(state)
+            u = copy[index] / self.P
+            age = np.maximum(self.t - oldest[index], 1e-6)
+            score = (1.0 - u) * age / (1.0 + u)
+            best_score = float(score.max())
+            top = index[score >= best_score - 1e-12 * max(1.0, best_score)]
+            if len(top) > 1:
+                top = top[np.argsort(copy[top], kind="stable")]
+            return int(top[0])
+        c_idx = copy[index]
+        c_min = float(c_idx.min())
+        least = index[c_idx <= c_min + EPS]
+        if len(least) > 1:
+            oldest = self._oldest_times(state)
+            least = least[np.argsort(oldest[least], kind="stable")]
+        return int(least[0])
+
+    def _reclaim(self, part, force=False, target=None, state=None):
+        """Free segments of ``part``: while fewer than the low watermark, or (forced) until ``target`` holds.
+        Returns True if any segment was reclaimed."""
         if self.guard:
-            return
+            return False
+        if not force and not self.protected and self.reclaim_blocked[part] == self.part_ver[part]:
+            return False
         self.guard = True
+        changed = False
         try:
             for _ in range(self.S):
                 if force:
-                    if target is not None and self._room(part) >= target:
+                    if target is not None and (target() if callable(target) else self._room(part) >= target):
                         break
                 elif self.free_count[part] >= self.low_wm:
                     break
-                victim = self._victim(part)
+                victim = self._victim(part, state)
                 if victim < 0:
+                    if not self.protected:
+                        self.reclaim_blocked[part] = self.part_ver[part]
                     break
+                changed = True
+                state = None  # partition state changed; recompute if another victim is needed
                 self.n["reclaims"] += 1
                 owner = int(self.owner[victim])
                 if owner >= 0:  # dedicated: an idle owner is evicted with all its segments
@@ -1473,6 +1854,7 @@ class Simulator:
                     self._relocate(victim, "compaction")
         finally:
             self.guard = False
+        return changed
 
     # ---- one quantum ---------------------------------------------------------------------------
     def _next_retention(self):
@@ -1510,8 +1892,13 @@ class Simulator:
     def _advance(self, on, k, T):
         ctx0 = self.sl_ctx[on]
         ctx1 = ctx0 + k
+        dt = k * T
+        self._update_stranded(dt)
         if self.writes_decode:
             self.sl_staged[on] += self.geo.stored_pages(ctx1) - self.geo.stored_pages(ctx0)
+        if self.vllm is not None:
+            for idx, slot in enumerate(on.tolist()):
+                self._vllm_write(int(self.sl_entry[slot]), int(ctx0[idx]), int(ctx1[idx]))
         np.add.at(self.e_steps, self.sl_entry[on], k)
         pre = self.sl_prefix[on]
         pre = pre[pre >= 0]
@@ -1523,14 +1910,23 @@ class Simulator:
         self.pending_reads = True
         self.sl_ctx[on] = ctx1
         self.sl_gen[on] += k
-        dt = k * T
         self.acc["batch_s"] += len(on) * dt
         self.acc["ctx_s"] += float(ctx0.sum() + ctx1.sum()) / 2 * dt
         self.acc["tokens"] += len(on) * k
 
-    def _quantum(self, n, T):
+    def _consume_prefill(self):
+        """Advance clock by serial colocated-prefill time accumulated during admissions."""
+        if self.prefill_dt > 0:
+            dt = self.prefill_dt
+            self.prefill_dt = 0.0
+            self._update_stranded(dt)
+            self.t += dt
+            return dt
+        return 0.0
+
+    def _quantum(self, n, T, stop=math.inf):
         """Run n decode steps of length T; requests complete and arrive at their exact step. Returns steps run."""
-        t0, done = self.t, 0
+        t0, done, prefill_q = self.t, 0, 0.0
         splits = self.opt.policy != "layer_major"
         while done < n:
             on = np.flatnonzero(self.sl_on)
@@ -1539,16 +1935,19 @@ class Simulator:
             k = max(1, min(n - done, int((self.sl_end[on] - self.sl_ctx[on]).min())))
             if splits and self.free_slots and self.blocked != self.drops:
                 arrival = self.stream.next_time()
-                if arrival < t0 + n * T:
-                    k = min(k, max(1, math.ceil((arrival - t0) / T - 1e-9) - done))
+                if arrival < t0 + n * T + prefill_q:
+                    k = min(k, max(1, math.ceil((arrival - t0 - prefill_q) / T - 1e-9) - done))
             self._advance(on, k, T)
             done += k
-            self.t = t0 + done * T
+            self.t = t0 + done * T + prefill_q
             finished = on[self.sl_ctx[on] >= self.sl_end[on]]
             for slot in finished.tolist():
                 self._complete(slot)
             if len(finished) or (self.free_slots and self.stream.next_time() <= self.t + 1e-12):
                 self._admit_pending()
+                prefill_q += self._consume_prefill()
+                if self.t >= stop - 1e-9:
+                    break
         return done
 
     def _flush_decode(self):
@@ -1599,12 +1998,19 @@ class Simulator:
                 if self.live[s] > EPS:
                     self._refresh(s, "refresh_ret")
         if o.policy != "layer_major":
-            for part in range(self.parts):
-                if self.free_count[part] < self.low_wm:
-                    self._reclaim(part)
+            need = [part for part in range(self.parts)
+                    if self.free_count[part] < self.low_wm and self.reclaim_blocked[part] != self.part_ver[part]]
+            if need:
+                state = self._victim_state()
+                for part in need:
+                    if self.free_count[part] < self.low_wm:
+                        if state is None:
+                            state = self._victim_state()
+                        if self._reclaim(part, state=state):
+                            state = None
 
     def _m5(self, step, steps):
-        programs, erases = float(self.programs.sum()), self.block_erases
+        programs, erases = float(self.programs.sum()), self.m5_erases
         if self.opt.m5 != "off":
             o = self.opt
             load = {"programs": (programs - self.m5_mark[0]) / steps, "erases": (erases - self.m5_mark[1]) / steps,
@@ -1630,6 +2036,7 @@ class Simulator:
         if warm <= 0:
             self.warm = self._snapshot()
         self._admit_pending()
+        self._consume_prefill()
         while self.t < horizon - 1e-9:
             if self.warm is None and self.t >= warm - 1e-9:
                 self.warm = self._snapshot()
@@ -1645,9 +2052,11 @@ class Simulator:
                     events.append(warm)
                 before = self.t
                 self.t = max(min(events), self.t)
+                self._update_stranded(self.t - before)
                 self._housekeeping()
-                self.m5_mark = (float(self.programs.sum()), self.block_erases)
+                self.m5_mark = (float(self.programs.sum()), self.m5_erases)
                 self._admit_pending()
+                self._consume_prefill()
                 stuck = stuck + 1 if self.t <= before and not self.n_running else 0
                 if stuck > 1000:
                     raise RuntimeError(f"The simulation makes no progress at t = {self.t:.3f} s")
@@ -1655,7 +2064,8 @@ class Simulator:
             step = self._clock_step()
             T = (step.tpot_ns + self.m5_extra) / 1e9
             n = self._limit(max(1, int(o.quantum_s / T + 1e-9)), T, horizon, warm)
-            steps = self._quantum(n, T)
+            stop = min(horizon, warm) if self.warm is None else horizon
+            steps = self._quantum(n, T, stop)
             self.n["quanta"] += 1
             self._staging()
             self._flush_reads()  # before the flush: staged pages were read from HBM, not HBF
@@ -1668,6 +2078,7 @@ class Simulator:
                 self.acc["m5_s"] += steps * self.m5_extra / 1e9
                 self._m5(step, steps)
             self._admit_pending()
+            self._consume_prefill()
         if self.warm is None:
             self.warm = self._snapshot()
         self._record(step)
@@ -1677,11 +2088,20 @@ class Simulator:
     # ---- outputs -------------------------------------------------------------------------------
     def _snapshot(self):
         return {"t": self.t, "programs": self.programs.copy(), "seg_erases": self.seg_erases.copy(),
-                "block_erases": self.block_erases, "pec": self.pec.copy(), "acc": dict(self.acc), "n": dict(self.n)}
+                "block_erases": self.block_erases, "pec": self.pec.copy(), "acc": dict(self.acc), "n": dict(self.n),
+                "vllm": dict(self.vllm.counts) if self.vllm is not None else {}}
 
     def _record(self, step):
         page, on = self.dev.page_bytes, np.flatnonzero(self.sl_on)
         idle = float(self.e_pages[self.e_state == IDLE].sum())
+        stranded_frac = 0.0
+        stranded_pages = 0.0
+        if self.vllm is not None:
+            if self.vllm_dirty:
+                self.vllm_stranded = self.vllm.stranded()
+                self.vllm_dirty = False
+            stranded_frac = self.vllm_stranded
+            stranded_pages = stranded_frac * self.vllm.ids * self.vllm.pages_per_id * self.geo.layers
         row = {"t_s": self.t, "running": self.n_running, "queued": len(self.queue),
                "sum_context": int(self.sl_ctx[on].sum()),
                "tpot_ms": step.tpot_ns / 1e6 if step else None,
@@ -1689,8 +2109,8 @@ class Simulator:
         row |= {f"{cause}_gb": self.programs[i] * page / 1e9 for i, cause in enumerate(CAUSES)}
         row |= {f"erases_{cause}": int(self.seg_erases[i]) for i, cause in enumerate(CAUSES)}
         row |= {"block_erases": self.block_erases, "free_segments": int(self.free_count.sum()),
-                "live_pages": float(self.live.sum()), "idle_pages": idle, "stranded_pages": 0.0,
-                "avg_pec": float(self.pec.mean()), "max_pec": int(self.pec.max()),
+                "live_pages": float(self.live.sum()), "idle_pages": idle, "stranded_pages": stranded_pages,
+                "stranded_frac": stranded_frac, "avg_pec": float(self.pec.mean()), "max_pec": int(self.pec.max()),
                 "max_reads_over_x": float(self.reads.max() / self.opt.x)}
         self.timeseries.append(row)
 
@@ -1712,6 +2132,8 @@ class Simulator:
         mean_ctx = acc["ctx_s"] / acc["batch_s"] if acc["batch_s"] else 0.0
         tpot = acc["tpot_s"] / steps if steps else None
         refresh = prog[CAUSE["refresh_rd"]] + prog[CAUSE["refresh_ret"]] + prog[CAUSE["replay"]]
+        vllm = ({key: self.vllm.counts[key] - w0["vllm"].get(key, 0) for key in self.vllm.counts}
+                if self.vllm is not None else {})
         row = {"workload": self.workload.name, "policy": o.policy, "partition": d.partition, "pages_per_block": ppb,
                "x": o.x, "stacks": o.stacks, "mean_batch": acc["batch_s"] / span, "mean_context": mean_ctx,
                "mean_tpot_ms": tpot * 1e3 if steps else None,
@@ -1721,7 +2143,7 @@ class Simulator:
                "kv_bytes_per_token": self.geo.hbf_token_bytes,
                "hbm_bytes_per_request": float(self.geo.hbm_bytes(np.array([int(round(mean_ctx))]))[0]),
                "threshold_steps": threshold_steps(o.x, ppb, o.share, o.hot),
-               "refreshes_per_request": prog[CAUSE["refresh_rd"]] / host if host else None,
+               "refreshes_per_request": (prog[CAUSE["refresh_rd"]] + prog[CAUSE["replay"]]) / host if host else None,
                "kv_write_gb_s": host * page / span / 1e9}
         row |= {f"{cause}_gb_s": prog[i] * page / span / 1e9 for i, cause in enumerate(CAUSES)}
         row |= {"program_gb_s": total * page / span / 1e9,
@@ -1739,7 +2161,7 @@ class Simulator:
         row["pending_units_per_channel"] = row["mean_batch"] * self.geo.partial_pages() / 16
         row["unit_open_s"] = max(self.geo.tpp) * tpot if steps else None
         row["replay_buffer_mib"] = self.P * page / 2 ** 20 if self.refresh == "replay" else 0.0
-        row["legal"] = True
+        row["legal"] = o.policy != "vllm_pool"
         row |= {"hours": o.hours, "warmup_h": o.warmup_h, "measured_h": span / 3600, "segments": self.S,
                 "segment_pages": self.P, "low_watermark": self.low_wm, "decode_steps": int(steps),
                 "completed": int(n["completed"]),
@@ -1747,8 +2169,13 @@ class Simulator:
                 "compaction_events": int(n["compaction"]), "waves": int(n["waves"]),
                 "segment_erases": int((self.seg_erases - w0["seg_erases"]).sum()),
                 "free_segments_min": self.free_min, "evicted_gb": n["evicted_pages"] * page / 1e9,
-                "recompute_tokens": n["recompute_tokens"], "stalls": int(n["stalls"]), "stranded_frac": 0.0,
-                "quanta": int(self.n["quanta"]), "wall_s": self.wall_s}
+                "recompute_tokens": n["recompute_tokens"], "stalls": int(n["stalls"]),
+                "stranded_frac": acc["stranded_s"] / span if self.vllm is not None else 0.0,
+                "violations_skip": int(vllm.get("skip", 0)),
+                "violations_overlap": int(vllm.get("overlap", 0)),
+                "violations_live_erase": int(vllm.get("live_erase", 0)),
+                "legalize_gb": vllm.get("legalize_pages", 0) * page * self.geo.layers / 1e9,
+                "prefill_s": acc["prefill_s"], "quanta": int(self.n["quanta"]), "wall_s": self.wall_s}
         return row
 
     def segment_rows(self):
@@ -1762,10 +2189,10 @@ class Simulator:
         return rows
 
 
-def simulate(geometry, clock, workload, device=None, options=None, model=None):
+def simulate(geometry, clock, workload, device=None, options=None, model=None, gpu=None):
     """Run the event simulation of one stack; returns the Simulator with ``result`` (the summary row),
     ``timeseries`` and ``segment_rows()``. ``workload`` is one stack's share (``workload.per_stack``)."""
-    sim = Simulator(geometry, clock, workload, device, options, model)
+    sim = Simulator(geometry, clock, workload, device, options, model, gpu)
     sim.result = sim.run()
     return sim
 
@@ -1779,7 +2206,8 @@ METRICS = ("mean_batch", "mean_context", "mean_tpot_ms", "tpot_m5_ms", "max_step
     "program_gb_s", "program_bw_share", "wa", "erase_amp", "erase_wa", "refresh_to_kv", "erases_per_s", "avg_pec_per_day",
     "max_pec_per_day", "pe_per_mtok", "break_even_x", "staging_peak_mib", "pending_units_per_channel",
     "unit_open_s", "replay_buffer_mib", "legal") + (  # event simulation only (empty for --analytic)
-    "evicted_gb", "recompute_tokens", "stalls", "free_segments_min", "analytic_avg_pec_per_day",
+    "evicted_gb", "recompute_tokens", "stalls", "free_segments_min", "stranded_frac", "violations_skip",
+    "violations_overlap", "violations_live_erase", "legalize_gb", "analytic_avg_pec_per_day",
     "analytic_refresh_to_kv")
 SPARSE_MODES = ("dense", "uniform_tokens", "uniform_pages", "sink_recent")
 
@@ -1872,14 +2300,32 @@ def build_parser():
     sim.add_argument("--warmup-h", type=float, default=1.0, help="first hours excluded from the rates (default 1)")
     sim.add_argument("--wear", choices=WEAR, default="dynamic",
                      help="free-segment allocation: none (lowest index), dynamic (least PEC, default), "
-                          "ideal (as dynamic; max PEC reported as AVGPEC)")
+                          "ideal (as dynamic; max PEC reported as AVGPEC), remap (cyclic zone remap, "
+                          "spec section 11.4.1)")
     sim.add_argument("--refresh", choices=REFRESH, default="auto",
                      help="read-disturb and retention refresh: relocate live pages (auto for packed, dedicated, "
-                          "hbm_decode) or replay the segment in place (spec section 5.7; auto for layer_major)")
+                          "hbm_decode, vllm_pool) or replay the segment in place (spec section 5.7; auto for "
+                          "layer_major)")
     sim.add_argument("--refresh-idle", choices=("relocate", "evict"), default="relocate",
                      help="idle cached entries in a refreshed segment: relocate (default) or drop them")
     sim.add_argument("--reclaim", choices=("evict", "compact"), default="evict",
                      help="reclaim victims: evict idle entries, copy active pages (default); compact copies all")
+    sim.add_argument("--victim", choices=VICTIMS, default="greedy",
+                     help="reclaim victim selection: greedy (fewest pages to copy, default) or cost_benefit "
+                          "((1 - u) * age / (1 + u))")
+    sim.add_argument("--prefill", choices=("disaggregated", "colocated"), default="disaggregated",
+                     help="prefill timing: disaggregated (default, no decode delay) or colocated (adds "
+                          "input / prefill_tok_s serial time per admission)")
+    sim.add_argument("--pre-open", action="store_true",
+                     help="pre-open free segments in idle time (takes non-replay erases off M5 interference)")
+    sim.add_argument("--separate-prefix", action="store_true",
+                     help="place shared prefixes on their own write frontier per partition (hot/cold separation)")
+    sim.add_argument("--block-tokens", type=int,
+                     help="vllm_pool: tokens per vLLM block (default: lcm of HBF tensors' tokens per page)")
+    sim.add_argument("--free-order", default="fresh",
+                     help="vllm_pool: initial free queue order: fresh (ascending ids, default) or shuffled:<seed>")
+    sim.add_argument("--vllm-reuse", choices=("fifo", "lifo"), default="fifo",
+                     help="vllm_pool: freed block-id reuse order (fifo default, or lifo)")
     sim.add_argument("--low-watermark", type=int,
                      help="free segments per partition kept by reclaim (default 2 + one maximal request)")
     sim.add_argument("--report-s", type=float, default=60.0, help="timeseries interval, simulated s (default 60)")
@@ -1907,8 +2353,7 @@ def configure(args):
             raise ValueError("The event simulation needs --hours (simulated time); use --analytic for the "
                              "closed-form steady state")
         if args.alloc not in SIM_POLICIES:
-            raise ValueError(f"--alloc {args.alloc} is not simulated (only {', '.join(SIM_POLICIES)}); "
-                             "use --analytic")
+            raise ValueError(f"--alloc {args.alloc} is not simulated (only {', '.join(SIM_POLICIES)})")
         if args.hours <= 0 or not 0 <= args.warmup_h < args.hours:
             raise ValueError("--hours must be positive and --warmup-h in [0, --hours)")
         if args.report_s <= 0 or args.quantum_s <= 0 or not 0 <= args.rd_slack < 1:
@@ -1917,6 +2362,15 @@ def configure(args):
             raise ValueError("--low-watermark and --slots must be positive")
         if args.alloc == "layer_major" and args.refresh == "relocate":
             raise ValueError("layer_major regions are refreshed in place: use --refresh replay or auto")
+        if args.block_tokens is not None and args.block_tokens < 1:
+            raise ValueError("--block-tokens must be positive")
+        if args.free_order != "fresh" and not args.free_order.startswith("shuffled:"):
+            raise ValueError("--free-order must be fresh or shuffled:<seed>")
+        if args.free_order.startswith("shuffled:"):
+            try:
+                int(args.free_order[9:])
+            except ValueError:
+                raise ValueError(f"Invalid --free-order {args.free_order!r}: use fresh or shuffled:<int>") from None
     params = json.loads((Path(__file__).resolve().parent / "configs" / "parameters.json").read_text())
     models = [load_model(name) for name in _list(args.model, name="model")]
     formats = _list(args.kv_format, name="format")
@@ -1934,14 +2388,21 @@ def configure(args):
         raise ValueError("pages per block, X and P/E limits must be positive")
     if type(args.stacks) is not int or args.stacks < 1 or args.capacity_gib <= 0 or args.rd_hot <= 0:
         raise ValueError("--stacks, --capacity-gib and --rd-hot must be positive")
+    if args.retention_h < 0:
+        raise ValueError("--retention-h must be non-negative")
     if args.read_share is not None and not 0 < args.read_share <= 1:
         raise ValueError("--read-share must be in (0, 1]")
     if args.partition != "none" and args.alloc not in ("packed", "dedicated", "hbm_decode"):
         raise ValueError("--partition applies to packed, dedicated and hbm_decode")
     if args.m5 == "suspend" and args.suspend_ns is None:
         raise ValueError("--m5 suspend needs --suspend-ns (OCP v0.7.0 has no suspend; the value is product specific)")
-    for fmt in formats:
-        geometry_for(models[0], fmt)  # validates the format name and parameters
+    for model in models:
+        for fmt in formats:
+            geo, _ = geometry_for(model, fmt)  # validates the format name and parameters for every model
+            if not args.analytic and args.alloc == "vllm_pool" and args.block_tokens is not None:
+                if any(args.block_tokens % tpp for tpp in geo.tpp):
+                    raise ValueError(f"--block-tokens ({args.block_tokens}) must be a multiple of every HBF "
+                                     f"tensor's tokens per page ({geo.tpp}) for {model.name}/{fmt}")
     device_flags = []
     for flag, value in (("--read-ns", args.read_ns), ("--aggregate-gb-s", args.aggregate_gb_s)):
         if value is not None:
@@ -1963,6 +2424,9 @@ def configure(args):
             "calibration_dir": args.calibration_dir, "calib_context": args.calib_context,
             "analytic": args.analytic, "hours": args.hours, "warmup_h": args.warmup_h, "wear": args.wear,
             "refresh": args.refresh, "refresh_idle": args.refresh_idle, "reclaim": args.reclaim,
+            "victim": args.victim, "prefill": args.prefill, "pre_open": args.pre_open,
+            "separate_prefix": args.separate_prefix, "block_tokens": args.block_tokens,
+            "free_order": args.free_order, "vllm_reuse": args.vllm_reuse,
             "low_watermark": args.low_watermark, "report_s": args.report_s, "quantum_s": args.quantum_s,
             "rd_slack": args.rd_slack, "slots": args.slots, "align": args.align, "stagger": not args.no_stagger}
 
@@ -2059,11 +2523,16 @@ def _simulation_run(directory, config):
                 prefix_reads=config["prefix_reads"], hours=config["hours"], warmup_h=config["warmup_h"],
                 quantum_s=config["quantum_s"], report_s=config["report_s"], rd_slack=config["rd_slack"],
                 wear=config["wear"], refresh=config["refresh"], refresh_idle=config["refresh_idle"],
-                reclaim=config["reclaim"], low_watermark=config["low_watermark"], align=config["align"],
+                reclaim=config["reclaim"], victim=config.get("victim", "greedy"),
+                prefill=config.get("prefill", "disaggregated"), pre_open=config.get("pre_open", False),
+                separate_prefix=config.get("separate_prefix", False),
+                block_tokens=config.get("block_tokens"), free_order=config.get("free_order", "fresh"),
+                vllm_reuse=config.get("vllm_reuse", "fifo"),
+                low_watermark=config["low_watermark"], align=config["align"],
                 slots=config["slots"], stagger=config["stagger"], stacks=config["stacks"], m5=config["m5"],
                 t_prog=config["t_prog"], t_bers=config["t_bers"], suspend_ns=config["suspend_ns"],
                 block_unit=config["block_unit"], pe_limits=tuple(config["pe_limits"]))
-            sim = simulate(geometry, clock, share_of_stack, device, options, model=model)
+            sim = simulate(geometry, clock, share_of_stack, device, options, model=model, gpu=config["gpu"])
             try:  # the closed form at the same settings, for comparison
                 ref = analytic(geometry, clock, workload, device, policy=config["policy"], x_values=(x,),
                                pe_limits=config["pe_limits"], share=share, hot=config["hot"],
@@ -2207,12 +2676,25 @@ def _calibration_lines(calibrations):
 
 
 SIM_NAMES = {"packed": "紧凑追加（packed）", "dedicated": "每请求独占段（dedicated）",
-             "layer_major": "静态批次波（layer_major）", "hbm_decode": "生成的 KV 留在 HBM（hbm_decode）"}
+             "layer_major": "静态批次波（layer_major）", "hbm_decode": "生成的 KV 留在 HBM（hbm_decode）",
+             "vllm_pool": "vLLM 空闲块池（vllm_pool，规范下不合法）"}
 
 
 def sim_report_lines(rows, config, calibrations=()):
     """Chinese report section 寿命评估 of an event simulation, with every assumption and its source tag."""
     limits = config["pe_limits"]
+    extras = []
+    if config.get("victim", "greedy") != "greedy":
+        extras.append(f"回收选段 `{config['victim']}`")
+    if config.get("prefill", "disaggregated") != "disaggregated":
+        extras.append(f"prefill `{config['prefill']}`")
+    if config.get("pre_open"):
+        extras.append("预开段 `--pre-open`")
+    if config.get("separate_prefix"):
+        extras.append("前缀独立前沿 `--separate-prefix`")
+    if config["policy"] == "vllm_pool":
+        extras.append(f"vLLM 重用 `{config.get('vllm_reuse', 'fifo')}`、空闲顺序 `{config.get('free_order', 'fresh')}`")
+    extra_note = ("；" + "，".join(extras)) if extras else ""
     lines = ["# 寿命评估（事件模拟）", "",
              f"分配方式：{SIM_NAMES[config['policy']]}，分区 `{config['partition']}`；读取方式 `{config['mode']}`；"
              f"每个 stack 容量 {config['capacity_gib']:g} GiB，{config['stacks']} 个 stack 分担请求（模拟其中一个）；"
@@ -2220,7 +2702,8 @@ def sim_report_lines(rows, config, calibrations=()):
              f"保持刷新间隔 {config['retention_s'] / 3600:g} h（0 表示关闭），持续读偏斜 h = {config['hot']:g}；"
              f"模拟 {config['hours']:g} h，前 {config['warmup_h']:g} h 预热不计入速率；"
              f"磨损分配 `{config['wear']}`，刷新 `{config['refresh']}`，空闲条目刷新时 `{config['refresh_idle']}`，"
-             f"回收 `{config['reclaim']}`，写入干扰 `{config['m5']}`（以 {config['block_unit']} 为阻塞单位）。", ""]
+             f"回收 `{config['reclaim']}`，写入干扰 `{config['m5']}`（以 {config['block_unit']} 为阻塞单位）"
+             f"{extra_note}。", ""]
     for w in config["workloads"]:
         lines.append(f"- 负载 {w.describe()}。来源：{w.source}")
     lines += ["", "下表每行是一次模拟（一个 stack，预热之后的速率）。P/E 每天取各段 PEC 的增量：平均即 AVGPEC，"
@@ -2308,15 +2791,22 @@ def assumptions(config):
         "读扰与保持刷新：relocate（日志式分配的默认）把段内有效页写到前沿（dedicated 写到条目自己的新段），旧段在下次写第 0 行时才擦除；"
         "replay（layer_major 默认，第 5.7 节）原地重写第 0 行到最后写入的行，包括无效页和填充页（不得跳跃），需要一段的 HBM 副本。"
         "--refresh-idle evict 时段内的空闲缓存条目直接丢弃（以后重算）。",
-        "回收：某分区空闲段少于低水位（默认 2 段 + 一个最大请求的段数）时，选需要搬移的页最少的段（贪心；相同时选数据最老的），"
+        "回收：某分区空闲段少于低水位（默认 2 段 + 一个最大请求的段数）时，选需要搬移的页最少的段（贪心；相同时选数据最老的；"
+        "`--victim cost_benefit` 按 (1−u)·age/(1+u) 选段），"
         "先驱逐其中的空闲条目（整条丢弃，记为重算 token），再把活跃页搬到前沿（compaction）；--reclaim compact 时空闲条目也搬移。"
         "准入时为请求预留全部预计页数（prefill + 解码）和低水位减一段；做不到时先强制回收，仍放不下就排队。",
-        "磨损分配：none 取编号最小的空闲段，dynamic 取 PEC 最小的空闲段，ideal 同 dynamic。只在空闲段之间均衡，"
+        "磨损分配：none 取编号最小的空闲段，dynamic 取 PEC 最小的空闲段，ideal 同 dynamic，"
+        "remap 按区域循环轮转（第 11.4.1 节区域重映射，无额外写入）。只在空闲段之间均衡，"
         "不搬移冷数据（没有静态磨损均衡），所以容量被空闲缓存占满时最大 PEC 会远高于平均。"
         "新条目放在有效页最少的分区，相同时选磨损最少的分区（wear none 时选编号最小的）。",
         "hbm_decode 的会话：上一次调用生成的 KV 不写入 HBF，由下一次调用的 prompt 一起写入（偏保守）。"
         "被驱逐的会话历史在下一次调用时整段重算并重写。",
-        "vllm_pool 只有解析模式（--analytic）；事件模拟不支持。",
+        "vllm_pool：磨损按 packed 计，同时由 VllmTracker 跟踪每层块池的块号分配与释放，统计写序违规"
+        "（skip/overlap/live_erase）、时间平均滞留比例（stranded_frac）与合法化所需重放写入量（legalize_gb）；"
+        "该策略在规范下不合法（legal = False）。",
+        "可选开关：`--prefill colocated` 在每次准入时串行计入 input / prefill_tok_s 的 prefill 时间；"
+        "`--pre-open` 在空闲时预先打开段（非重放擦除不计入 M5 干扰，P/E 照计）；"
+        "`--separate-prefix` 把共享前缀写到独立前沿以实现冷热分离。",
     ]
     return out
 

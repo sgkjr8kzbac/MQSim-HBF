@@ -130,11 +130,17 @@ def parse_length(text):
     need = {"lognormal": {"median", "sigma"}, "uniform": {"lo", "hi"}}[kind]
     if not need <= set(params) or set(params) - need - {"min", "max"}:
         raise ValueError(f"{kind} needs {sorted(need)} (optional min, max), got {sorted(params)}")
-    if any(value < 0 for value in params.values()) or params.get("min", 1) < 1:
-        raise ValueError(f"Length parameters must be non-negative and min >= 1: {text!r}")
+    if any(not math.isfinite(value) or value < 0 for value in params.values()) or params.get("min", 1) < 1:
+        raise ValueError(f"Length parameters must be finite, non-negative and min >= 1: {text!r}")
     for key in ("min", "max"):
         if key in params:
             params[key] = int(params[key])
+    if "max" in params and params["max"] < params.get("min", 1):
+        raise ValueError(f"Length max must be >= min ({params.get('min', 1)}): {text!r}")
+    if kind == "uniform" and params["lo"] > params["hi"]:
+        raise ValueError(f"uniform needs lo <= hi: {text!r}")
+    if kind == "lognormal" and params["median"] <= 0:
+        raise ValueError(f"lognormal needs median > 0: {text!r}")
     return Length(kind, tuple(sorted(params.items())))
 
 
@@ -191,7 +197,8 @@ class Workload:
     def describe(self):
         text = f"`{self.name}`：输入 {self.input}，输出 {self.output}"
         if self.sessions:
-            text += f"，会话 {self.calls} 次调用、初始历史 {self.history}、调用间隔 {self.think_s:g} s"
+            history = f"、初始历史 {self.history}" if self.history is not None else ""
+            text += f"，会话 {self.calls} 次调用{history}、调用间隔 {self.think_s:g} s"
         if self.prefix_share:
             text += (f"，共享前缀 {self.prefix_groups} 组 × {self.prefix_tokens} token，"
                      f"命中比例 {self.prefix_share:g}，Zipf {self.zipf:g}")

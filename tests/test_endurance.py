@@ -17,7 +17,7 @@ from hbf.model import load_gpu, load_model
 from hbf.workload import Workload, load_workload, parse_length, presets
 # Event simulation (design-B section 4, tests 10-15) and the seeded request stream.
 from hbf.access import TensorSpec
-from hbf.endurance import CAUSE, GIB, CapacityError, Geometry, SimOptions, simulate
+from hbf.endurance import (CAUSE, GIB, CapacityError, Geometry, SimOptions, VllmTracker, prefill_tok_s, simulate)
 from hbf.interference import interference
 from hbf.workload import Stream, scripted
 
@@ -359,6 +359,7 @@ def test_10_read_disturb_refresh_tiny_device():
     # In-place replay instead (spec section 5.7): the same segment is erased and rewritten 3 times.
     replay = simulate(ONE_PAGE, TEN_MS, w, tiny(8), sim_opts(policy="hbm_decode", x=40, refresh="replay"))
     assert replay.result["refresh_events_rd"] == 3 and programs(replay, "replay") == 48
+    assert replay.result["refreshes_per_request"] == pytest.approx(3.0)
     assert replay.result["segment_erases"] == 4 and replay.pec.max() == 4
 
 
@@ -428,6 +429,7 @@ def test_layer_major_wave_replays_padding():
     r = sim.result
     assert r["waves"] == 1 and programs(sim, "prefill") == 12 and programs(sim, "padding") == 4
     assert r["refresh_events_rd"] == 2 and programs(sim, "replay") == 32
+    assert r["refreshes_per_request"] == pytest.approx(32 / 12)
     assert sim.seg_erases[CAUSE["wave"]] == 1 and sim.seg_erases[CAUSE["replay"]] == 2
     assert r["replay_buffer_mib"] == 16 * 4096 / 2 ** 20
 
@@ -517,18 +519,37 @@ def test_cli_simulation(tmp_path):
     assert "## 与解析模型的差别" in report
 
 
-def test_cli_simulation_validation():
+def test_cli_simulation_validation(tmp_path):
     parser = build_parser()
     with pytest.raises(ValueError, match="--hours"):
         configure(parser.parse_args(["--no-calibrate"]))
-    with pytest.raises(ValueError, match="vllm_pool"):
-        configure(parser.parse_args(["--hours", "2", "--alloc", "vllm_pool"]))
+    with pytest.raises(ValueError, match="partition"):
+        configure(parser.parse_args(["--hours", "2", "--alloc", "vllm_pool", "--partition", "die"]))
+    with pytest.raises(ValueError, match="free-order"):
+        configure(parser.parse_args(["--hours", "2", "--alloc", "vllm_pool", "--free-order", "bogus"]))
+    with pytest.raises(ValueError, match="block-tokens"):
+        configure(parser.parse_args(["--hours", "2", "--alloc", "vllm_pool", "--block-tokens", "0"]))
+    with pytest.raises(ValueError, match="multiple"):
+        configure(parser.parse_args(["--hours", "2", "--alloc", "vllm_pool", "--block-tokens", "10"]))
+    with pytest.raises(ValueError, match="retention-h"):
+        configure(parser.parse_args(["--hours", "2", "--retention-h", "-1"]))
+    odd = tmp_path / "odd.json"
+    odd.write_text(json.dumps({"name": "odd", "layers": 2, "hidden": 384, "q_heads": 6, "kv_heads": 1,
+                               "head_dim": 64, "intermediate": 512, "vocab": 1000}))
+    with pytest.raises(ValueError, match="multiple of q_heads"):
+        configure(parser.parse_args(["--analytic", "--model", f"llama-3.1-8b,{odd}", "--format", "mla:indexer=1"]))
     with pytest.raises(ValueError, match="replay"):
         configure(parser.parse_args(["--hours", "2", "--alloc", "layer_major", "--refresh", "relocate"]))
     with pytest.raises(ValueError, match="warmup"):
         configure(parser.parse_args(["--hours", "1"]))  # the default warm-up is 1 h
-    config = configure(parser.parse_args(["--hours", "2", "--wear", "none", "--no-stagger"]))
-    assert config["analytic"] is False and config["wear"] == "none" and config["stagger"] is False
+    config = configure(parser.parse_args(["--hours", "2", "--wear", "remap", "--no-stagger",
+                                          "--alloc", "vllm_pool", "--vllm-reuse", "lifo",
+                                          "--prefill", "colocated", "--victim", "cost_benefit",
+                                          "--pre-open", "--separate-prefix"]))
+    assert config["analytic"] is False and config["wear"] == "remap" and config["stagger"] is False
+    assert config["policy"] == "vllm_pool" and config["vllm_reuse"] == "lifo"
+    assert config["prefill"] == "colocated" and config["victim"] == "cost_benefit"
+    assert config["pre_open"] is True and config["separate_prefix"] is True
     assert {"models", "formats", "workloads", "pages_per_block", "x_values"} <= set(config)
 
 
@@ -561,3 +582,335 @@ def test_m5_hook_per_quantum(monkeypatch):
         assert np.dot([call[1] for call in calls], steps) == pytest.approx(sim.m5_mark[1], rel=1e-9)
         assert r["max_step_extra_ms"] * 1e6 >= extra[mode] > 0
     assert extra["gaps"] < extra["fifo"]
+
+
+# ---- test 16: vllm_pool tracker and simulation (design-B section 4.3, test 16) --------------------
+
+def test_16_vllm_pool_tracker_and_simulation(tmp_path):
+    """Allocate ids 0..7, free 2 and 5, allocate 2 with LIFO -> 2 overlaps; stranded = 2/8 until the
+    whole range is free. Also checks VllmTracker edge cases and full Simulator / CLI integration."""
+    tracker = VllmTracker(ids=8, pages_per_id=1, pages_per_block=8, banks=1, order="fresh", reuse="lifo")
+    ids = tracker.allocate(8)
+    assert ids == list(range(8)) and tracker.counts["overlap"] == 0 and tracker.counts["erases"] == 1
+    assert tracker.stranded() == 0.0
+    tracker.free([2, 5])
+    assert tracker.stranded() == pytest.approx(2 / 8)
+    reused = tracker.allocate(2)
+    assert reused == [5, 2]
+    assert tracker.counts["overlap"] == 2 and tracker.counts["skip"] == 0 and tracker.counts["live_erase"] == 0
+    assert tracker.counts["legalize_pages"] == 8
+    assert tracker.stranded() == 0.0
+    tracker.free([2, 5])
+    assert tracker.stranded() == pytest.approx(2 / 8)
+    tracker.free([0, 1, 3, 4, 6, 7])
+    assert tracker.stranded() == 0.0  # whole range is free
+    # Consecutive writes into an already-filled block are both overlaps (not legal); legal append after overlap.
+    t2 = VllmTracker(ids=8, pages_per_id=1, pages_per_block=8, banks=1, order="fresh", reuse="fifo")
+    t2.allocate(8)
+    t2.free([5, 6])
+    assert t2.allocate(2) == [5, 6] and t2.counts["overlap"] == 2
+    t3 = VllmTracker(ids=8, pages_per_id=1, pages_per_block=8, banks=1, order="fresh", reuse="fifo")
+    t3.allocate(4)
+    t3.free([1])
+    t3.write([1, 4])  # 1 is overlap (< fill=4), 4 is legal append (== fill=4)
+    assert t3.counts["overlap"] == 1 and t3.counts["skip"] == 0 and t3.counts["live_erase"] == 0
+    # Grouped fast path (banks % pages_per_id == 0) matches ungrouped path on identical operations.
+    g = VllmTracker(ids=16, pages_per_id=4, pages_per_block=4, banks=8, order="shuffled:5", reuse="lifo")
+    u = VllmTracker(ids=16, pages_per_id=4, pages_per_block=4, banks=8, order="shuffled:5", reuse="lifo")
+    u._grouped, u._scale = False, 1
+    u.fill, u.live = np.zeros(8 * u.nblocks, dtype=np.int64), np.zeros(8 * u.nblocks, dtype=np.int64)
+    for fn, arg in (("allocate", 6), ("free", None), ("allocate", 4)):
+        if fn == "allocate":
+            a, b = g.allocate(arg), u.allocate(arg)
+            assert a == b
+            saved = a[:3]
+        else:
+            g.free(saved)
+            u.free(saved)
+        assert g.stranded() == pytest.approx(u.stranded())
+        assert g.counts == u.counts
+    # End-to-end Simulator: 2 segments of 8 pages (16 ids, banks=1, ppb=8), 8 tokens per page so <8 decode
+    # steps add no new block ids. Requests 0..7 arrive at t=0 (1 page each -> ids 0..7). Requests 2 and 5
+    # finish after 1 step (t=0.01s), leaving 2/16 stranded for [0.01, 0.05) = 0.04s. At t=0.05s two new
+    # 1-page requests arrive and reuse [5, 2] (LIFO) -> 2 overlaps, stranded drops to 0. Horizon = 0.10s.
+    eight_tpp = Geometry(1, 1, (TensorSpec("kv", 16, 256),))  # 512 B/tok -> 8 tokens/page
+    reqs = [{"arrival": 0.0, "input": 8, "output": 1 if i in (2, 5) else 7} for i in range(8)]
+    reqs += [{"arrival": 0.05, "input": 8, "output": 2}, {"arrival": 0.05, "input": 8, "output": 2}]
+    sim = simulate(eight_tpp, TEN_MS, scripted(reqs), tiny(2, banks=1, ppb=8),
+                   sim_opts(policy="vllm_pool", x=1e9, hours=0.1 / 3600, low_watermark=1, vllm_reuse="lifo",
+                            align="none"))
+    r = sim.result
+    assert r["legal"] is False and r["violations_overlap"] == 2 and r["violations_skip"] == 0
+    assert r["violations_live_erase"] == 0 and r["legalize_gb"] > 0
+    # 2/16 stranded over 0.04s out of 0.10s -> time average = 0.05.
+    assert r["stranded_frac"] == pytest.approx((2 / 16) * (0.04 / 0.10), rel=1e-6)
+    # CLI end-to-end check for vllm_pool (and report header echo of non-default options).
+    out = tmp_path / "vllm"
+    main(["--no-calibrate", "--alloc", "vllm_pool", "--vllm-reuse", "lifo", "--workload", "long32k",
+          "--concurrency", "2", "--capacity-gib", "64", "--hours", ".05", "--warmup-h", ".01",
+          "--report-s", "30", "--victim", "cost_benefit", "--pre-open", "--separate-prefix",
+          "--prefill", "colocated", "--output", str(out)])
+    with (out / "endurance_summary.csv").open(newline="") as stream:
+        row = next(csv.DictReader(stream))
+    assert row["policy"] == "vllm_pool" and row["legal"] == "False"
+    assert float(row["violations_overlap"]) > 0 and float(row["legalize_gb"]) > 0
+    report = (out / "report.md").read_text()
+    assert "vLLM 空闲块池" in report and "vLLM 重用 `lifo`" in report
+    assert "回收选段 `cost_benefit`" in report and "prefill `colocated`" in report
+    assert "`--pre-open`" in report and "`--separate-prefix`" in report
+
+
+def test_vllm_tracker_live_erase_and_legalize_edge_cases():
+    """(a) write([0, 1]) on a live block preserves fill (no shrinkage) and counts live_erase + overlap;
+    (b) intra-batch violation [2, 1] on an empty block charges effective fill;
+    (c) ungrouped multi-block IDs charge only offending blocks."""
+    # (a) Block 0 filled 0..7; free 0 and 1 (live=6, fill=8); allocate(2) writes [0, 1] -> live_erase=1, overlap=1, fill stays 8.
+    t = VllmTracker(ids=8, pages_per_id=1, pages_per_block=8, banks=1, order="fresh", reuse="fifo")
+    t.allocate(8)
+    t.free([0, 1])
+    assert t.allocate(2) == [0, 1]
+    assert t.counts["live_erase"] == 1 and t.counts["overlap"] == 1 and t.counts["legalize_pages"] == 8
+    assert t.fill[0] == 8
+    t.free([3])
+    assert t.stranded() == pytest.approx(1 / 8)
+    # (b) Empty block: write([2, 1]) -> skip=1 (pos 2), overlap=1 (pos 1 <= 2), legalize_pages = 3.
+    t2 = VllmTracker(ids=8, pages_per_id=1, pages_per_block=8, banks=1, order="fresh", reuse="fifo")
+    t2.write([2, 1])
+    assert t2.counts["skip"] == 1 and t2.counts["overlap"] == 1 and t2.counts["legalize_pages"] == 3
+    assert t2.fill[0] == 3
+    # (c) Ungrouped multi-block ID (banks=3, pages_per_id=2, ppb=4 -> _grouped=False).
+    # ID 0 -> (bank=0, pos=0), (bank=1, pos=0). ID 1 -> (bank=2, pos=0), (bank=0, pos=1).
+    # ID 2 -> (bank=1, pos=1), (bank=2, pos=1).
+    # Allocate IDs 0, 1, 2 (fills: bank0=2, bank1=2, bank2=2; live=2 each).
+    # Free ID 1 (bank2 live=1, bank0 live=1) and ID 2 (bank1 live=1, bank2 live=0!).
+    # Now write ID 1: (bank=2, pos=0) has live=0 -> LEGAL erase (must NOT be charged to legalize_pages),
+    # while (bank=0, pos=1) has fill=2, live=1 -> OVERLAP (charges only bank 0's fill=2).
+    t3 = VllmTracker(ids=6, pages_per_id=2, pages_per_block=4, banks=3, order="fresh", reuse="fifo")
+    assert not t3._grouped
+    t3.allocate(3)
+    t3.free([1, 2])
+    assert t3.live[2 * t3.nblocks] == 0 and t3.fill[2 * t3.nblocks] == 2
+    t3.write([1])
+    assert t3.counts["overlap"] == 1 and t3.counts["live_erase"] == 0
+    assert t3.counts["legalize_pages"] == 2  # only bank 0 (fill=2), not legally erased bank 2
+
+
+def test_vllm_pool_outstanding_ids_and_kivi_prefix_residual():
+    """Admission reserves outstanding decode IDs of running requests; KIVI residual is subtracted once."""
+    # 2 segments of 8 pages = 16 IDs (1 tok/page, bt=1). Req 0 needs 2 prefill + 6 decode = 8 IDs;
+    # Req 1 needs 2 prefill + 6 decode = 8 IDs; Req 2 needs 2 + 6 = 8 IDs -> must stall (not crash during decode).
+    reqs = [{"arrival": 0.0, "input": 2, "output": 6} for _ in range(3)]
+    sim = simulate(ONE_PAGE, TEN_MS, scripted(reqs), tiny(2, banks=1, ppb=8),
+                   sim_opts(policy="vllm_pool", x=1e9, hours=0.2 / 3600, low_watermark=1, align="none"))
+    assert sim.result["completed"] == 3 and sim.result["stalls"] >= 1
+    # KIVI-2 with residual=128 (tpp=(128, 256, 128, 256), default block_tokens=256) and shared prefix=512,
+    # input=512, output=128: total HBF tokens = 512 + 512 + 128 - 128 = 1024 -> 4 vLLM blocks
+    # (not 3 from double-subtracting residual on both prefix and own tokens).
+    geo, _ = geometry_for(LLAMA8, "kivi2")
+    w = scripted([{"arrival": 0.0, "input": 512, "output": 128, "prefix": 0}], prefix_groups=1, prefix_tokens=512)
+    ksim = simulate(geo, TEN_MS, w, Device(capacity_gib=64),
+                    sim_opts(policy="vllm_pool", x=1e9, hours=0.05))
+    assert ksim.vllm.counts["writes"] == 4
+
+
+def test_separate_prefix_tight_capacity_reclaim():
+    """--separate-prefix accounts for both frontiers during admission and reclaim under tight capacity."""
+    # 3 segments of 16 pages, low_watermark=1: prefix 0 (8p, retain=100s) on prefix frontier, private (8p)
+    # on main frontier; subsequent requests with a second prefix force eviction/reclaim without CapacityError.
+    reqs = [
+        {"arrival": 0.0, "input": 8, "output": 2, "prefix": 0, "retain_s": 100.0},
+        {"arrival": 0.05, "input": 8, "output": 2, "prefix": 0, "retain_s": 100.0},
+        {"arrival": 0.10, "input": 8, "output": 2, "prefix": 1, "retain_s": 100.0},
+        {"arrival": 0.15, "input": 8, "output": 2, "prefix": 1, "retain_s": 100.0},
+        {"arrival": 0.20, "input": 8, "output": 2, "prefix": 0, "retain_s": 0.0},
+    ]
+    w = scripted(reqs, prefix_groups=2, prefix_tokens=8, retain_s=100.0)
+    sim = simulate(ONE_PAGE, TEN_MS, w, tiny(3),
+                   sim_opts(policy="hbm_decode", x=1e9, hours=0.5 / 3600, low_watermark=1, separate_prefix=True))
+    assert sim.result["completed"] == 5 and sim.result["evicted_gb"] > 0
+
+
+def test_dedicated_evicts_open_idle_segments():
+    """Idle dedicated entries with <1 full segment (state == OPEN) are evicted cleanly under tight capacity."""
+    reqs = [{"arrival": 0.1 * i, "input": 4, "output": 1, "retain_s": 100.0} for i in range(6)]
+    sim = simulate(ONE_PAGE, TEN_MS, scripted(reqs), tiny(3),
+                   sim_opts(policy="dedicated", x=1e9, hours=1.0 / 3600, low_watermark=1))
+    assert sim.result["completed"] == 6 and sim.result["evicted_gb"] > 0
+
+
+def test_session_short_think_time_no_retroactive_reads():
+    """A session resuming inside the same quantum under hbm_decode flushes call 0's reads before call 1 writes."""
+    # Call 0: history 4 + input 4 = 8 pages, decodes 4 steps -> 8 * 4 / 4 = 8 block reads.
+    # think_s = 0.02s (< quantum_s = 1.0s). Call 1: prefill reads existing 8 pages once (+8/4 = 2),
+    # writes 8 new pages (call 0's 4 output + call 1's 4 input -> 16 pages total), decodes 4 steps (+16*4/4 = 16).
+    # Exact total block reads on seg 0 = 8 + 2 + 16 = 26 (without flushing in _complete, call 0's 4 steps would
+    # retroactively hit call 1's 8 new pages -> 34).
+    s = Workload(input="fixed:4", output="fixed:4", calls=2, history="fixed:4", think_s=.02, concurrency=1)
+    sim = simulate(ONE_PAGE, TEN_MS, s, tiny(8),
+                   sim_opts(policy="hbm_decode", x=1e9, hours=0.11 / 3600, quantum_s=1.0, align="none"))
+    assert sim.reads[0] == pytest.approx(26.0)
+
+
+# ---- optional flags from design-B (phase2b-sim-plan.md next step 3) -------------------------------
+
+def test_prefill_colocated_adds_serial_admission_time():
+    geometry, _ = geometry_for(LLAMA8, "bf16")
+    w = Workload(input="fixed:4096", output="fixed:32", concurrency=1)
+    clock = ConstantClock(10e6)
+    dis = simulate(geometry, clock, w, Device(capacity_gib=64),
+                   sim_opts(hours=10.0 / 3600, prefill="disaggregated", stagger=False), model=LLAMA8, gpu=B200)
+    col = simulate(geometry, clock, w, Device(capacity_gib=64),
+                   sim_opts(hours=10.0 / 3600, prefill="colocated", stagger=False), model=LLAMA8, gpu=B200)
+    per_admit = 4096 / prefill_tok_s(LLAMA8, B200, 4096)
+    assert col.result["prefill_s"] == pytest.approx(col.n["admitted"] * per_admit, rel=1e-9)
+    assert dis.result["prefill_s"] == 0.0
+    assert col.result["req_per_s"] < dis.result["req_per_s"]
+    # Multi-stack scales serial prefill time by stacks; new prefix tokens are charged too.
+    wp = scripted([{"arrival": 0.0, "input": 1024, "output": 4, "prefix": 0}], prefix_groups=1, prefix_tokens=2048)
+    s2 = simulate(geometry, clock, wp, Device(capacity_gib=64),
+                  sim_opts(hours=1.0 / 3600, prefill="colocated", stacks=2), model=LLAMA8, gpu=B200)
+    expected_p = 2 * (1024 + 2048) / prefill_tok_s(LLAMA8, B200, 3072)
+    assert s2.result["prefill_s"] == pytest.approx(expected_p, rel=1e-9)
+    # Warm-up boundary: _quantum breaks when colocated prefill crosses warm, keeping snapshot close to warm.
+    w_warm = Workload(input="fixed:4096", output="fixed:2", concurrency=1)
+    sw = simulate(geometry, clock, w_warm, Device(capacity_gib=64),
+                  sim_opts(hours=2.0 / 3600, warmup_h=0.5 / 3600, prefill="colocated", stagger=False),
+                  model=LLAMA8, gpu=B200)
+    assert sw.warm["t"] == pytest.approx(0.5, abs=0.1)
+    with pytest.raises(ValueError, match="model and gpu"):
+        simulate(geometry, clock, w, Device(capacity_gib=64), sim_opts(prefill="colocated"))
+
+
+def test_victim_cost_benefit_prefers_older_cold_segment():
+    """Segment 0 (written at t=0): 8 active + 8 dead (u=0.5, age=100s -> score 33.3).
+    Segment 1 (written at t=99s): 4 active + 12 dead (u=0.25, age=1s -> score 0.6).
+    At t=100s, an 8-page request opens segment 2 (room=8, free=0 < low_watermark=1) triggering reclaim:
+    greedy picks segment 1 (4 pages copied); cost_benefit picks segment 0 (8 pages copied)."""
+    reqs = [
+        {"arrival": 0.0, "input": 8, "output": 20000},   # active in seg 0
+        {"arrival": 0.0, "input": 8, "output": 1},       # dies at t=0.01s in seg 0
+        {"arrival": 99.0, "input": 4, "output": 20000},  # active in seg 1
+        {"arrival": 99.0, "input": 12, "output": 1},     # dies at t=99.01s in seg 1
+        {"arrival": 100.0, "input": 8, "output": 100},   # opens seg 2 (room=8, free=0 -> triggers reclaim)
+    ]
+    greedy = simulate(ONE_PAGE, TEN_MS, scripted(reqs), tiny(3),
+                      sim_opts(policy="hbm_decode", x=1e9, hours=101 / 3600, low_watermark=1, victim="greedy"))
+    cb = simulate(ONE_PAGE, TEN_MS, scripted(reqs), tiny(3),
+                  sim_opts(policy="hbm_decode", x=1e9, hours=101 / 3600, low_watermark=1, victim="cost_benefit"))
+    assert programs(greedy, "compaction") == 4
+    assert programs(cb, "compaction") == 8
+
+
+def test_pre_open_removes_non_replay_erases_from_m5():
+    geometry, _ = geometry_for(LLAMA8, "bf16")
+    w = Workload(input="fixed:32768", output="fixed:338", concurrency=8)
+    clock = ConstantClock(38.57e6, layers=32)
+    base = simulate(geometry, clock, w, Device(),
+                    SimOptions(hours=.2, warmup_h=.05, m5="fifo", t_bers=10e6, retention_s=0, pre_open=False))
+    pre = simulate(geometry, clock, w, Device(),
+                   SimOptions(hours=.2, warmup_h=.05, m5="fifo", t_bers=10e6, retention_s=0, pre_open=True))
+    assert pre.result["tpot_m5_ms"] < base.result["tpot_m5_ms"]
+    assert pre.result["max_step_extra_ms"] < base.result["max_step_extra_ms"]
+    assert pre.m5_erases == 0 and pre.block_erases > 0
+    # In-place replay erases cannot be pre-opened and still hit M5.
+    rw = scripted([{"arrival": 0, "input": 16, "output": 35}])
+    rep = simulate(ONE_PAGE, TEN_MS, rw, tiny(8),
+                   sim_opts(policy="hbm_decode", x=40, refresh="replay", m5="fifo", pre_open=True))
+    assert rep.m5_erases == 3 * 4  # 3 replays x 4 banks; initial open erase was pre-opened
+
+
+def test_separate_prefix_avoids_dragging_cold_neighbors():
+    """Hot 8-page prefix (2 readers -> 4 block reads/step) + cold 8-page private entry (1 reader -> 2 block
+    reads/step) in 16-page segments at X=40 over 15 steps:
+    - shared frontier: both share seg 0 (6 reads/step -> refreshes at step 7 and 14, copying 16 pages each = 32+);
+    - separate_prefix: prefix owns seg 0 (4 reads/step -> 1 refresh of 8 pages at step 10), private stays on seg 1
+      (2 reads/step -> 30 < 40, 0 refreshes)."""
+    reqs = [{"arrival": 0, "input": 8, "output": 15, "prefix": 0},
+            {"arrival": 0, "input": 0, "output": 15, "prefix": 0}]
+    # Note: input must be >= 1 in Workload/scripted; use input=1 for second reader (1/4 = 0.25 reads/step).
+    reqs[1]["input"] = 1
+    w = scripted(reqs, prefix_groups=1, prefix_tokens=8)
+    shared = simulate(ONE_PAGE, TEN_MS, w, tiny(8),
+                      sim_opts(policy="hbm_decode", x=40, separate_prefix=False, align="none"))
+    sep = simulate(ONE_PAGE, TEN_MS, w, tiny(8),
+                   sim_opts(policy="hbm_decode", x=40, separate_prefix=True, align="none"))
+    assert programs(sep, "refresh_rd") == 8  # only the 8-page prefix refreshes once at step 10
+    assert programs(shared, "refresh_rd") > programs(sep, "refresh_rd")
+
+
+def test_wear_remap_rotates_static_waves():
+    w = scripted([{"arrival": float(i), "input": 16, "output": 1} for i in range(100)])
+    none = simulate(ONE_PAGE, TEN_MS, w, tiny(4),
+                    sim_opts(policy="layer_major", x=1e9, hours=.03, slots=1, wear="none"))
+    remap = simulate(ONE_PAGE, TEN_MS, w, tiny(4),
+                     sim_opts(policy="layer_major", x=1e9, hours=.03, slots=1, wear="remap"))
+    assert none.pec.tolist() == [100, 0, 0, 0]
+    assert remap.pec.tolist() == [25, 25, 25, 25]
+    assert remap.result["wa"] == none.result["wa"]
+    # Wave 0 suffers 2 replays (seg 0 reaches PEC=3); waves 1..3 have 0 replays (segs 1..3 PEC=1).
+    # Wave 4: remap rotates back to seg 0 ([4, 1, 1, 1]), while dynamic picks least-PEC seg 1 ([3, 2, 1, 1]).
+    asym = scripted([{"arrival": 0.0, "input": 16, "output": 25}]
+                    + [{"arrival": float(i), "input": 16, "output": 1} for i in range(1, 5)])
+    r_remap = simulate(ONE_PAGE, TEN_MS, asym, tiny(4),
+                       sim_opts(policy="layer_major", x=40, hours=.01, slots=1, wear="remap"))
+    r_dyn = simulate(ONE_PAGE, TEN_MS, asym, tiny(4),
+                     sim_opts(policy="layer_major", x=40, hours=.01, slots=1, wear="dynamic"))
+    assert r_remap.pec.tolist() == [4, 1, 1, 1]
+    assert r_dyn.pec.tolist() == [3, 2, 1, 1]
+
+
+# ---- Part 2: K1 page formats in hbf.endurance (MLA, fused int/KIVI) -------------------------------
+
+def test_k1_formats_demand_matches_phase_a_and_kv_bytes():
+    """Geometry.demand uses attended_dims and logical_dims identically to pages.layer_pages;
+    kv_bytes_per_token counts HBF bytes only; analytic and simulate work on MLA and fused formats."""
+    from hbf.access import LAYOUTS, Shape, generate
+    from hbf.config import load
+    from hbf.formats import parse_format
+    from hbf.model import ModelSpec
+    from hbf.pages import iter_layer_pages
+
+    cfg = load("ocp")
+    mla_model = ModelSpec(name="mla-tiny", layers=4, hidden=2048, q_heads=16, kv_heads=1, head_dim=128,
+                          intermediate=4096, vocab=32000)
+    for model, fmt_name, ctx in (
+        (mla_model, "mla", 2048),
+        (mla_model, "mla:split=1", 2048),
+        (mla_model, "mla_fp8", 2048),
+        (mla_model, "mla:indexer=1", 2048),
+        (mla_model, "mla:indexer_hbm=1", 2048),
+        (LLAMA8, "int4:fused=1", 2048),
+        (LLAMA8, "kivi2:fused=1", 2048),
+        (LLAMA8, "kivi2:fused=1,pow2=1", 2048),
+    ):
+        geo, fmt = geometry_for(model, fmt_name)
+        layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, model.kv_heads, model.head_dim, ctx), tensors=fmt.tensors)
+        (pages,) = iter_layer_pages(cfg, layout, generate(cfg, layout, "dense"))
+        d = geo.demand([ctx])
+        assert d["attended_elements"] == pages.attended_elements, fmt_name
+        assert d["hbf_elements"] == pages.hbf_elements, fmt_name
+        assert d["dequant_ops"] == pytest.approx(pages.dequant_ops), fmt_name
+        assert d["burst_bytes"] == int(pages.burst.sum()), fmt_name
+        assert d["hbm_bytes"] == pages.hbm_bytes, fmt_name
+        assert d["attended_tokens"] == pages.attended_tokens, fmt_name
+    # kv_bytes_per_token counts HBF bytes only (excludes KIVI HBM residual and HBM DSA indexer).
+    kivi_geo, _ = geometry_for(LLAMA8, "kivi2:fused=1")
+    assert kivi_geo.hbf_token_bytes == 32 * 8 * 96  # fused K+V+scales = 96 B/head; residual in HBM excluded
+    assert kivi_geo.token_bytes > kivi_geo.hbf_token_bytes
+    idx_hbm_geo, _ = geometry_for(mla_model, "mla:indexer_hbm=1")
+    idx_hbf_geo, _ = geometry_for(mla_model, "mla:indexer=1")
+    assert idx_hbm_geo.hbf_token_bytes == 4 * 1 * 1152
+    assert idx_hbf_geo.hbf_token_bytes == 4 * 1 * (1152 + 132)
+    # Analytic and simulation run end-to-end on MLA, mla_fp8, int4:fused=1, kivi2:fused=1.
+    for model, fmt_name in ((mla_model, "mla"), (mla_model, "mla_fp8"),
+                            (LLAMA8, "int4:fused=1"), (LLAMA8, "kivi2:fused=1")):
+        geo, fmt = geometry_for(model, fmt_name)
+        clock = Clock(model, B200, geo, kv_format=fmt.name)
+        w = Workload(input="fixed:2048", output="fixed:128", concurrency=4)
+        a = analytic(geo, clock, w, Device(capacity_gib=64), x_values=(1e6,), **no_m5())[0]
+        s = simulate(geo, clock, w, Device(capacity_gib=64),
+                     sim_opts(hours=.05, warmup_h=.01, x=1e6), model=model, gpu=B200).result
+        assert a["kv_bytes_per_token"] == geo.hbf_token_bytes
+        assert s["kv_bytes_per_token"] == geo.hbf_token_bytes
+        assert a["avg_pec_per_day"] > 0 and s["avg_pec_per_day"] > 0
+        assert s["kv_write_gb_s"] == pytest.approx(a["kv_write_gb_s"], rel=.05), fmt_name

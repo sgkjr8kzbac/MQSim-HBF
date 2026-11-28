@@ -195,3 +195,26 @@ def test_endurance_tool_checks(tmp_path):
     assert rows[0]["status"].startswith("infeasible: the point gives 2 rows")
     assert rows[1]["status"] == "ok"
     assert not (tmp_path / "sweep" / "runs" / rows[0]["run"]).exists()
+
+
+def test_endurance_sweep_jobs_two_matches_jobs_one(tmp_path):
+    # L6/M7: parallel endurance sweep with shared calibration directory matches jobs=1.
+    one = sweep(ENDURANCE, tmp_path / "one", jobs=1, progress=io.StringIO())
+    two = sweep(ENDURANCE, tmp_path / "two", jobs=2, progress=io.StringIO())
+    assert [row["status"] for row in two] == ["ok"] * 4
+    assert one == two
+
+
+def test_workload_length_validation_and_describe():
+    # M5 & L5: parse_length rejects lo > hi, min > max, median <= 0; describe omits None history.
+    from hbf.workload import Workload, parse_length
+    for bad in ("uniform:lo=100,hi=50", "lognormal:median=0,sigma=0.8",
+                "lognormal:median=100,sigma=0.8,min=50,max=20",
+                "lognormal:median=100,sigma=0.8,max=0", "uniform:lo=10,hi=20,min=30,max=10"):
+        with pytest.raises(ValueError):
+            parse_length(bad)
+    session = Workload(name="s", calls=4, history=None, think_s=1.0)
+    desc = session.describe()
+    assert "None" not in desc and "会话 4 次调用" in desc
+    with_hist = Workload(name="s", calls=4, history="fixed:512", think_s=1.0)
+    assert "初始历史 fixed:512" in with_hist.describe()

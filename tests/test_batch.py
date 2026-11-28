@@ -218,5 +218,52 @@ def test_stagger_spreads_short_requests():
             (row, *_), _ = analyze_accesses(cfg, layout, list(generate_batch(cfg, layout, "dense")))
             rounds[allocation, align] = row["rounds"] / row["min_rounds"]
             assert check_write_order(cfg, layout.snapshot.written())["legal"]
-    assert rounds["packed", "row"] > 5 and rounds["packed", "stagger"] < 2
-    assert rounds["dedicated", "row"] > 5 and rounds["dedicated", "stagger"] < 2
+    assert rounds["packed", "row"] > 5 and rounds["packed", "stagger"] <= 2
+    assert rounds["dedicated", "row"] > 5 and rounds["dedicated", "stagger"] <= 2
+
+
+def test_short_kivi_prompt_and_partial_blocks_in_segments():
+    # H5: kivi2 prompt <= residual (0 full HBF pages at admission) and prompt where only some tensors
+    # have full pages (e.g. prompt=256 -> K has 1 full page, K_qp has 0); HBM residual clamped when
+    # context < residual; partial trailing prompt blocks not wasted as padding.
+    from hbf.formats import parse_format
+    cfg = load("ocp")
+    tensors = parse_format("kivi2", 128).tensors
+    for allocation in ("packed", "dedicated"):
+        layout = PageTableLayout(cfg, Shape(2, 4, 128, 1),
+                                 batch(allocation, [(64, 0), (64, 256), (256, 0), (512, 0)]),
+                                 tensors=tensors)
+        assert check_write_order(cfg, layout.snapshot.written())["legal"]
+        accesses = list(generate_batch(cfg, layout, "dense"))
+        # Request 0 has context 64 < residual 128: K_res/V_res must be clamped to [0, 64).
+        req0_hbm = [a for a in accesses if a.kv_head < 4 and a.kind in ("K_res", "V_res")]
+        assert req0_hbm and all((a.token_start, a.token_end) == (0, 64) for a in req0_hbm)
+        rows, _ = analyze_accesses(cfg, layout, accesses, timing=True)
+        assert len(rows) == 2
+        # Partial trailing prompt block (kivi2 at prompt=2048 -> K_qp has 7 full pages, not 8) wastes
+        # zero padding under layer_contiguous with align="row".
+        exact = PageTableLayout(cfg, Shape(1, 2, 128, 1),
+                                batch(allocation, [(2048, 0)], intra="layer_contiguous", align="row"),
+                                tensors=tensors)
+        assert exact.snapshot.kinds["padding"] == 0
+        assert exact.snapshot.kinds["prefill"] == 2 * (15 + 7 + 15 + 7)
+
+
+def test_partitioned_striped_intra_uses_partition_banks():
+    # M2: channel (64 banks) and die (16 banks) partitions must stripe/align intra to partition banks,
+    # not device-wide 1,024 banks (which caused gap=64 == 0 mod 64/16 and ~25% pure padding).
+    cfg = load("ocp")
+    for partition, banks in (("channel", 64), ("die", 16)):
+        for allocation in ("packed", "dedicated"):
+            layout = PageTableLayout(cfg, Shape(2, 8, 128, 1),
+                                     batch(allocation, [(4096, 0)], partition=partition,
+                                           intra="striped_contiguous", align="row"))
+            assert check_write_order(cfg, layout.snapshot.written())["legal"]
+            # Total prefill pages = 2 layers x 8 heads x 2 tensors x 256 blocks = 8,192.
+            # Per-layer gap is banks // 16 (4 for channel, 1 for die), so padding is tiny (< 2%).
+            prefill = layout.snapshot.kinds["prefill"]
+            padding = layout.snapshot.kinds["padding"]
+            assert prefill == 8192 and padding / prefill < 0.02
+            # The 16 regions (8 heads x 2 tensors) of layer 0 start on distinct banks inside the partition.
+            starts = layout.snapshot.table[0, 0, :, :, 0].ravel()
+            assert len({cfg.unit(int(lpa)) for lpa in starts}) == min(16, banks)

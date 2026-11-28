@@ -30,7 +30,7 @@ stays in HBM (staging) and is written when it fills, like every generated page, 
 request's write stream. Snapshot reads cover each request's full pages; the staged tail (under
 one page per head and tensor) is left out.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from random import Random
 
 import numpy as np
@@ -315,11 +315,24 @@ class LayerMajor(Placer):
         self.snapshot.write(lpa, "decode")
 
 
+class _PartitionCfg:
+    """View of a Config restricted to one partition's banks for intra-request striping and alignment."""
+
+    def __init__(self, cfg, banks):
+        self.page_bytes = cfg.page_bytes
+        self.units = banks
+        self._cfg = cfg
+
+    def lba(self, pa):
+        return self._cfg.lba(pa)
+
+
 class Segments(Placer):
     """dedicated and packed allocations in the address space of a partition (see the module docstring)."""
 
     def run(self, timeline):
         self.parts, self.banks, self.to_lpa = partition_geometry(self.cfg, self.spec.partition)
+        self.intra_cfg = self.cfg if self.banks == self.cfg.units else _PartitionCfg(self.cfg, self.banks)
         self.segment = self.banks * self.cfg.pages_per_block
         self.load = [0] * self.parts
         self.owner, self.frontier, self.segments, self.used, self.admitted = {}, {}, {}, {}, {}
@@ -342,11 +355,18 @@ class Segments(Placer):
         return np.asarray(segments, dtype=np.int64)[used // self.segment] * self.segment + used % self.segment
 
     def admit(self, r):
-        request = self.spec.requests[r]
         p = min(range(self.parts), key=lambda q: (self.load[q], q))
         self.owner[r] = p
-        intra = LAYOUTS[self.spec.intra](self.cfg, Shape(self.shape.layers, self.shape.kv_heads, self.shape.head_dim,
-                                                         request.prompt), tensors=self.tensors)
+        if self.spec.allocation == "dedicated":
+            self.segments[r], self.used[r] = [], 0
+        active = [t for t in range(len(self.tensors)) if self.full_prompt[r, t] > 0]
+        if not active:
+            return
+        intra_tensors = tuple(replace(self.tensors[t], window=(0, self.full_prompt[r, t] * self.tokens_per_page[t]))
+                              for t in active)
+        intra_context = max(self.full_prompt[r, t] * self.tokens_per_page[t] for t in active)
+        intra = LAYOUTS[self.spec.intra](self.intra_cfg, Shape(
+            self.shape.layers, self.shape.kv_heads, self.shape.head_dim, intra_context), tensors=intra_tensors)
         # Every prompt starts on a row of the partition; with ``stagger`` the k-th request of the
         # partition then skips k * banks / n pages (n requests per partition, written as padding), so
         # that layer l of different requests does not start on the same banks.
@@ -360,18 +380,19 @@ class Segments(Placer):
             if aligned > start:
                 self.snapshot.write(self.to_lpa(p, np.arange(start, aligned, dtype=np.int64)), "padding")
             self.frontier[p] = aligned
-        else:
-            self.segments[r], self.used[r] = [], 0
-            if offset:
-                self.snapshot.write(self.to_lpa(p, self.local(r, offset)), "padding")
+        elif offset:
+            self.snapshot.write(self.to_lpa(p, self.local(r, offset)), "padding")
         self.load[p] += intra.span
         local = self.local(r, intra.span)
         lpa = self.to_lpa(p, local)
         layer, head, t, block = self.prompt_keys(r)
+        t_map = np.empty(len(self.tensors), dtype=np.int64)
+        for i, orig in enumerate(active):
+            t_map[orig] = i
         slots = np.empty(len(layer), dtype=np.int64)
         for value in np.unique(layer):
             mask = layer == value
-            slots[mask] = intra.lpa_array(int(value), head[mask], t[mask], block[mask])
+            slots[mask] = intra.lpa_array(int(value), head[mask], t_map[t[mask]], block[mask])
         self.record(r, layer, head, t, block, lpa[slots])
         filled = np.zeros(intra.span, dtype=bool)
         filled[slots] = True
@@ -527,7 +548,9 @@ def generate_batch(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, 
                                 yield from clipped(spec_t, context - recent, context)
                     for spec_t in always:
                         if spec_t.tier == "hbm":
-                            lo, hi = spec_t.tokens(context)
+                            lo, hi = spec_t.window or (None, None)
+                            lo = 0 if lo is None else max(0, lo + context) if lo < 0 else min(lo, context)
+                            hi = context if hi is None else max(0, hi + context) if hi < 0 else min(hi, context)
                         else:
                             lo, hi = windows[spec_t.name]
                         if lo < hi:

@@ -18,7 +18,8 @@ One KV "head" per layer holds MLA's latent, so MLA runs use ``--heads 1`` (or an
 ``q_heads`` (from ``--model`` or the parameter) sets the indexer's attention FLOPs per query head.
 ``fused=1`` on the int and KIVI presets packs K, V and both scale tensors into one row per token
 (tensor KV, ``bits=8``, ``dims`` = bytes), so a selected block reads one page set instead of four;
-``pow2=1`` pads the row to a power of two so that rows never straddle a page boundary.
+``pow2=1`` pads the row to a power of two so that power-of-two selection blocks align to page
+boundaries instead of straddling two pages.
 
 ``think=r`` also applies to the int and KIVI presets (K keeps (1-r)d channels). KIVI's per-channel
 K scales are one row per G tokens; they are amortized as per-token rows of 2d/G elements, as are
@@ -67,7 +68,7 @@ def parse_params(text):
 
 def _flag(params, key):
     value = params[key]
-    if value not in (0, 1):
+    if type(value) is not int or value not in (0, 1):
         raise ValueError(f"{key} must be 0 or 1")
     return bool(value)
 
@@ -77,7 +78,11 @@ def mla_format(name, params, q_heads=None):
     lora, rope, heads, dims = (params[key] for key in ("lora", "rope", "index_heads", "index_dims"))
     if any(type(value) is not int or value <= 0 for value in (lora, rope, heads, dims)):
         raise ValueError("lora, rope, index_heads and index_dims must be positive integers")
+    if type(params["q_heads"]) is not int or params["q_heads"] < 0:
+        raise ValueError("q_heads must be a positive integer")
     split, indexer, indexer_hbm = (_flag(params, key) for key in ("split", "indexer", "indexer_hbm"))
+    if indexer and indexer_hbm:
+        raise ValueError("indexer and indexer_hbm are mutually exclusive")
     fp8 = name == "mla_fp8"
     if fp8 and lora % 128:
         raise ValueError("mla_fp8 needs lora to be a multiple of 128 (one FP32 scale per 128 elements)")
@@ -100,8 +105,8 @@ def mla_format(name, params, q_heads=None):
         notes.append("潜向量与 rope 分成两个张量，各自整页存放；稀疏读时一个 token 要读两页")
     if indexer or indexer_hbm:
         q_heads = params["q_heads"] or q_heads
-        if not q_heads:
-            raise ValueError("The DSA indexer needs q_heads (from --model or the q_heads parameter)")
+        if type(q_heads) is not int or q_heads <= 0:
+            raise ValueError("The DSA indexer needs a positive integer q_heads (from --model or the q_heads parameter)")
         if heads * dims % q_heads:
             raise ValueError(f"index_heads x index_dims ({heads * dims}) must be a multiple of q_heads ({q_heads})")
         tensors.append(TensorSpec("K_idx", 8, dims + 4, tier="hbm" if indexer_hbm else "hbf", role="meta",
@@ -119,7 +124,7 @@ def fuse(tensors, k_dims, d, pow2):
     fused = TensorSpec("KV", 8, size, body[0].window, attn_dims=k_dims + d, logical_dims=k_dims + d,
                        dequant_ops=INT_DEQUANT_OPS)
     note = (f"量化参数与数据同页：K、V 与两组 scale/zero 合成一行 {row} B"
-            + (f"，补齐到 {size} B（2 的幂，行不跨页）" if size != row else "（行可以不整除页，页尾留空）"))
+            + (f"，补齐到 {size} B（2 的幂，2 的幂选择块对齐页边界）" if size != row else "（行不整除页时页尾留空）"))
     return (fused,) + tuple(spec for spec in tensors if spec.tier != "hbf"), note
 
 

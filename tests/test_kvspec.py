@@ -45,8 +45,9 @@ def test_cross_layer_sharing():
     assert steps[0]["max_block_reads"] == 2 * unshared["max_block_reads"]
     layout, rows, steps = grouped("cla:share=2,reuse=hbm", Shape(4, 8, 128, 4096))
     assert steps[0]["pages"] == 8192 and [row["hbm_bytes"] for row in rows] == [0, 16_777_216, 0, 16_777_216]
-    assert layout.request_bytes(cfg) == {"kv_bytes_per_request": 2 * 33_554_432,
-                                         "hbm_tier_bytes_per_request": 33_554_432}
+    # 2 owner layers stored (33,554,432 B); only 1 owner layer live in HBM staging at a time (16,777,216 B).
+    assert layout.request_bytes(cfg) == {"kv_bytes_per_request": 33_554_432,
+                                         "hbm_tier_bytes_per_request": 16_777_216}
 
 
 def test_duo_heads():
@@ -113,3 +114,104 @@ def test_cli_kv_spec_with_the_system_model(tmp_path):
         with pytest.raises(SystemExit):
             main(HBF_FLAGS + ["--kv-spec", "cla", "--layers", "2", "--context", "1024", *extra,
                               "--output", str(tmp_path / "x")])
+
+
+def test_short_context_clamps_group_windows():
+    # H1: context < window must clamp instead of failing TensorSpec.tokens().
+    for tier in ("hbf", "hbm"):
+        layout, rows, _ = grouped(f"hybrid:pattern=LLLLLG,window=1024,local_tier={tier}", Shape(6, 8, 128, 512))
+        assert len(rows) == 6
+        assert [row["attended_tokens"] for row in rows] == [8 * 512] * 6
+        if tier == "hbf":
+            assert [row["pages"] for row in rows] == [512] * 6
+        else:
+            assert [row["pages"] for row in rows] == [0] * 5 + [512]
+            assert [row["hbm_bytes"] for row in rows[:5]] == [8 * 2 * 512 * 256] * 5
+
+
+def test_overlapping_alias_peak_live_owners_and_yoco_hbm_reuse():
+    # H2: peak live owners for interleaved aliases ((2, 0), (3, 1)) is 2; for yoco it is 1;
+    # kv_bytes_per_request excludes staging copies.
+    cfg = load("ocp")
+    shape = Shape(4, 8, 128, 4096)
+    spec = KVSpec("interleaved", {}, (KVGroup("kv", (0, 1, 2, 3), alias=((2, 0), (3, 1)), reuse="hbm"),))
+    layout = GroupedLayout(cfg, shape, spec, default_tensors(shape))
+    assert layout.copy_owners == {"kv_K_copy": 2, "kv_V_copy": 2}
+    layer_bytes = 8 * 2 * 4096 * 256
+    assert layout.request_bytes(cfg) == {"kv_bytes_per_request": 2 * layer_bytes,
+                                         "hbm_tier_bytes_per_request": 2 * layer_bytes}
+    yoco, _, _ = grouped("yoco:window=1024,local_tier=hbm,reuse=hbm", shape)
+    local_bytes = 2 * 8 * 2 * 1024 * 256
+    assert yoco.copy_owners == {"global_K_copy": 1, "global_V_copy": 1}
+    assert yoco.request_bytes(cfg) == {"kv_bytes_per_request": layer_bytes + local_bytes,
+                                       "hbm_tier_bytes_per_request": local_bytes + layer_bytes}
+
+
+def test_striped_grouped_layout_avoids_bank_collisions():
+    # H4: 1,024-token local layers (16 entries x 64 blocks) and 3,072-token layers (16 x 192)
+    # must not collide onto half or a quarter of the banks under intra="striped".
+    _, rows, _ = grouped("hybrid:pattern=LLLLLG,window=1024,local_tier=hbf", Shape(6, 8, 128, 32768), intra="striped")
+    assert [row["rounds"] for row in rows] == [1] * 5 + [32]
+    assert [row["balance_loss"] for row in rows] == [pytest.approx(1.0)] * 6
+    _, rows3k, _ = grouped("hybrid:pattern=LLLLLG,window=3072,local_tier=hbf", Shape(6, 8, 128, 32768), intra="striped")
+    assert [row["rounds"] for row in rows3k] == [3] * 5 + [32]
+    assert [row["balance_loss"] for row in rows3k] == [pytest.approx(1.0)] * 6
+
+
+def test_duo_overlapping_sink_and_recent_does_not_double_count():
+    # M1: when sink + recent >= context, streaming heads must count each token once.
+    cfg = load("ocp")
+    for context in (320, 100):
+        layout, (row,), _ = grouped("duo:retrieval=0.5,sink=64,recent=256", Shape(1, 8, 128, context))
+        assert row["attended_tokens"] == 8 * context
+        assert row["hbm_bytes"] == 4 * 2 * context * 256
+        assert layout.request_bytes(cfg)["hbm_tier_bytes_per_request"] == 4 * 2 * context * 256
+        layout_hbf, (row_hbf,), _ = grouped("duo:retrieval=0.5,sink=64,recent=256,streaming_tier=hbf",
+                                            Shape(1, 8, 128, context))
+        assert row_hbf["attended_tokens"] == 8 * context
+        assert row_hbf["pages"] == 8 * 2 * -(-context // 16)
+
+
+def test_cli_pads_missing_sparse_layers_under_timing(tmp_path):
+    # H3: sparse uniform_tokens on hybrid with local_tier=hbf can miss a local layer completely;
+    # --timing and --model must pad zero rows per plane group so CSVs and system.evaluate succeed.
+    model = {"name": "tiny6", "layers": 6, "hidden": 1024, "q_heads": 32, "kv_heads": 8, "head_dim": 128,
+             "intermediate": 2048, "vocab": 1000}
+    out = tmp_path / "sparse"
+    main(HBF_FLAGS + ["--model", json.dumps(model), "--context", "32768", "--kv-spec",
+                      "hybrid:pattern=LLLLLG,window=128,local_tier=hbf", "--mode", "uniform_tokens",
+                      "--fraction", "0.001", "--seed", "1", "--plane-group", "1", "--plane-group", "16",
+                      "--mocs", "256", "--output", str(out)])
+    layers = list(csv.DictReader((out / "analysis_layers.csv").open()))
+    assert len(layers) == 12  # 2 plane groups x 6 layers
+    g1 = [row for row in layers if row["group"] == "1"]
+    assert [int(row["layer"]) for row in g1] == list(range(6))
+    zeros = [row for row in g1 if row["pages"] == "0"]
+    assert zeros  # at least one local layer had no sampled tokens inside its 128-token window
+    for row in zeros:
+        assert (row["rounds"], row["est_ns"], row["bound_ns"], row["bottleneck"], row["commands"]) == (
+            "0", "0", "0", "none", "0")
+    steps = list(csv.DictReader((out / "analysis_steps.csv").open()))
+    assert [row["layers"] for row in steps] == ["6", "6"]
+    sys_layers = list(csv.DictReader((out / "system_layers.csv").open()))
+    assert len(sys_layers) == 6
+
+
+@pytest.mark.parametrize("spec_text", ["hybrid:pattern=LLLLLG,window=1024,local_tier=hbf",
+                                       "cla:share=2,reuse=hbf", "duo:retrieval=0.5,sink=64,recent=256",
+                                       "pyramid:first=4096,last=1024", "yoco:window=512,local_tier=hbf"])
+@pytest.mark.parametrize("intra", ["contiguous", "striped"])
+def test_grouped_layout_engine_parity(spec_text, intra):
+    # L6: numpy and pure-Python reference engines must agree row-by-row on GroupedLayout.
+    from hbf.analysis import Protocol, analyze
+    from hbf.controller import schedule
+    cfg = load("ocp")
+    shape = Shape(6, 4, 128, 4096)
+    spec = parse_kvspec(spec_text, shape.layers, shape.kv_heads, shape.context)
+    layout = GroupedLayout(cfg, shape, spec, default_tensors(shape), intra=intra)
+    protocol = Protocol(256, read_unit="wanted")
+    for mode in ("dense", "uniform_tokens", "sink_recent"):
+        accesses = list(generate_grouped(cfg, layout, mode, fraction=.1, seed=2))
+        expected = analyze(cfg, schedule(cfg, layout, accesses), (1, 16), protocol=protocol)
+        actual = analyze_accesses(cfg, layout, accesses, (1, 16), protocol=protocol, engine="numpy")
+        assert actual == expected
