@@ -25,6 +25,7 @@ exclude = ["hbf.mqsim*"]
 hbf = [
     "mqsim.commit",
     "mqsim.sha256",
+    "hbfsim.commit",
     "mqsim/.gitignore",
     "mqsim/*",
     "mqsim/*/*",
@@ -32,7 +33,10 @@ hbf = [
     "mqsim/*/*/*/*",
     "configs/*.xml",
     "configs/*.json",
+    "configs/*.cfg",
     "ext/system/*.json",
     "patches/*.patch",
     "patches/series",
+    "patches/hbfsim/*.patch",
+    "patches/hbfsim/series",
 ]

@@ -1,0 +1,2 @@
+# Order in which scripts/hbfsim_build.sh and hbf.backends.hbfsim.build apply patches.
+0001-die-blocking.patch

@@ -1,0 +1,60 @@
+"""HBFSim backend: pinned build, raw-physical trace conversion, session runner, and parsers."""
+from .build import PIN, build, patch_series, sha256, version
+from .convert import (
+    ConvertedBatch,
+    ConvertedRequest,
+    ConvertedTrace,
+    HbfSimGeometry,
+    batches_to_converted,
+    convert_trace,
+    decode_physical_address,
+    encode_physical_address,
+    hbfsim_geometry,
+    physical_coords,
+    physical_coords_array,
+    write_replay_trace,
+)
+from .parse import (
+    aggregate_layer_rows,
+    aggregate_step_rows,
+    parse_heatmap_v1,
+    parse_live_heatmap,
+    parse_wear_snapshot,
+)
+from .run import (
+    HBFSIM_OCP_CFG,
+    HbfSimSession,
+    simulate_batches,
+    simulate_trace,
+    write_config,
+)
+
+__all__ = [
+    "HBFSIM_OCP_CFG",
+    "PIN",
+    "ConvertedBatch",
+    "ConvertedRequest",
+    "ConvertedTrace",
+    "HbfSimGeometry",
+    "HbfSimSession",
+    "aggregate_layer_rows",
+    "aggregate_step_rows",
+    "batches_to_converted",
+    "build",
+    "convert_trace",
+    "decode_physical_address",
+    "encode_physical_address",
+    "hbfsim_geometry",
+    "parse_heatmap_v1",
+    "parse_live_heatmap",
+    "parse_wear_snapshot",
+    "patch_series",
+    "physical_coords",
+    "physical_coords_array",
+    "sha256",
+    "simulate_batches",
+    "simulate_trace",
+    "version",
+    "write_config",
+    "write_replay_trace",
+]

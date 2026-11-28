@@ -1,0 +1,266 @@
+diff --git a/src/app/system_config.cpp b/src/app/system_config.cpp
+index 1a1f4eb..ad7b5d3 100644
+--- a/src/app/system_config.cpp
++++ b/src/app/system_config.cpp
+@@ -136,6 +136,7 @@ const std::unordered_set<std::string>& owned_keys() {
+         "hbf-blocks-per-plane", "hbf-pages-per-block", "hbf-page-size",
+         "hbf-oob-bytes", "hbf-media-lanes-per-plane",
+          "hbf-page-buffer-banks-per-plane",
++        "hbf-die-blocking",
+         "hbf-read-ns", "hbf-program-ns",
+         "hbf-erase-ns", "hbf-ecc-decode-latency-ns",
+         "hbf-ecc-encode-latency-ns", "hbf-ecc-decode-raw-bw",
+@@ -404,6 +405,7 @@ void SystemConfigBuilder::apply(std::string_view key, std::string_view value) {
+     SET_U32(
+         "hbf-page-buffer-banks-per-plane",
+         hbf_.device.page_buffer_banks_per_plane)
++    SET_BOOL("hbf-die-blocking", hbf_.device.die_blocking)
+     SET_F64("hbf-read-ns", hbf_.device.t_read_page_ns)
+     SET_F64("hbf-program-ns", hbf_.device.t_program_page_ns)
+     SET_F64("hbf-erase-ns", hbf_.device.t_erase_block_ns)
+diff --git a/src/host/hbf_controller.cpp b/src/host/hbf_controller.cpp
+index 50270ea..1388b42 100644
+--- a/src/host/hbf_controller.cpp
++++ b/src/host/hbf_controller.cpp
+@@ -4936,13 +4936,17 @@ PhysicalCompletion HbfController::issue_media(const PhysicalRequest& request, do
+             const auto bank = static_cast<std::size_t>(*ppn /
+                 config_.device.pages_per_block / config_.device.blocks_per_plane);
+             const auto& full_plane_windows = planes_[bank].full_plane_windows;
++            const auto& die_pe_windows =
++                dies_[bank / config_.device.planes_per_die].die_program_erase_windows;
+             // Completed program/erase windows are retained until an amortized
+             // cleanup. Their presence must not permanently disable grouping.
+             // Windows are ordered and disjoint; if the last has ended before
+             // this page is ready, no stage of its read can intersect one.
+             const bool group_page = grouped_pipeline &&
+                 (full_plane_windows.empty() ||
+-                 full_plane_windows.back().end_ns <= page_ready_ns);
++                 full_plane_windows.back().end_ns <= page_ready_ns) &&
++                (!config_.device.die_blocking || die_pe_windows.empty() ||
++                 die_pe_windows.back().end_ns <= page_ready_ns);
+             if (!group_page) read_group.pages = 0;
+             const double page_finish = group_page ? schedule_read_group_page(
+                 *ppn, page_ready_ns, device_bytes, out.breakdown, decoded_ready_ns, read_group) :
+@@ -5481,6 +5485,70 @@ void HbfController::record_full_plane_window(
+     });
+ }
+ 
++void HbfController::record_die_window(
++    std::vector<PlaneState::BusyWindow>& windows,
++    double begin_ns,
++    double end_ns) {
++    if (end_ns <= begin_ns) {
++        return;
++    }
++    {
++        const auto dead_end = std::upper_bound(
++            windows.begin(),
++            windows.end(),
++            reservation_causal_watermark_ns_,
++            [](double watermark, const PlaneState::BusyWindow& window) {
++                return watermark < window.end_ns;
++            });
++        const auto dead = static_cast<std::size_t>(dead_end - windows.begin());
++        if (dead >= 64 && dead * 2 >= windows.size()) {
++            windows.erase(windows.begin(), dead_end);
++        }
++    }
++    auto it = std::lower_bound(
++        windows.begin(),
++        windows.end(),
++        begin_ns,
++        [](const PlaneState::BusyWindow& window, double begin) {
++            return window.end_ns < begin;
++        });
++    if (it == windows.end() || end_ns < it->begin_ns) {
++        windows.insert(it, PlaneState::BusyWindow{
++            .begin_ns = begin_ns,
++            .end_ns = end_ns,
++        });
++        return;
++    }
++    it->begin_ns = std::min(it->begin_ns, begin_ns);
++    it->end_ns = std::max(it->end_ns, end_ns);
++    auto next = std::next(it);
++    while (next != windows.end() && next->begin_ns <= it->end_ns) {
++        it->end_ns = std::max(it->end_ns, next->end_ns);
++        ++next;
++    }
++    windows.erase(std::next(it), next);
++}
++
++double HbfController::preview_die_read_clear(
++    const DieState& die,
++    double earliest_ns,
++    double duration_ns) const {
++    double candidate = earliest_ns;
++    const auto& windows = die.die_read_windows;
++    auto it = std::lower_bound(
++        windows.begin(),
++        windows.end(),
++        candidate,
++        [](const PlaneState::BusyWindow& window, double start) {
++            return window.end_ns <= start;
++        });
++    while (it != windows.end() && it->begin_ns < candidate + duration_ns) {
++        candidate = std::max(candidate, it->end_ns);
++        ++it;
++    }
++    return candidate;
++}
++
+ void HbfController::fold_ecc_inflight_intervals(
+     DieState& die,
+     double causal_arrival_watermark_ns) {
+@@ -9904,6 +9972,9 @@ double HbfController::schedule_read_group_page(
+     lane.busy_ns += group.lane_ns;
+     ++lane.read_count;
+     record_plane_media_busy(plane, sense.start_ns, sense.start_ns + d.t_read_page_ns);
++    if (d.die_blocking) {
++        record_die_window(die.die_read_windows, sense.start_ns, staged.finish_ns);
++    }
+     ++plane.read_count;
+     b.scheduler_queue_wait_ns += staged.wait_ns;
+     b.page_buffer_ns += group.buffer_ns;
+@@ -10032,6 +10103,21 @@ double HbfController::schedule_read_page(
+             local_ready_ns = std::max(local_ready_ns, conflict->end_ns);
+             continue;
+         }
++        if (config_.device.die_blocking) {
++            const auto& die_windows = dies_.at(die_index(addr)).die_program_erase_windows;
++            const auto die_conflict = std::lower_bound(
++                die_windows.begin(),
++                die_windows.end(),
++                sense_start_ns,
++                [](const PlaneState::BusyWindow& window, double start) {
++                    return window.end_ns <= start;
++                });
++            if (die_conflict != die_windows.end() &&
++                die_conflict->begin_ns < buffer_finish_ns) {
++                local_ready_ns = std::max(local_ready_ns, die_conflict->end_ns);
++                continue;
++            }
++        }
+ 
+         sense = reserve(sense_start_ns, config_.device.t_read_page_ns, subarray.timeline);
+         if (sense.start_ns != sense_start_ns)
+@@ -10102,6 +10188,10 @@ double HbfController::schedule_read_page(
+     lane.busy_ns += lane_ns;
+     lane.read_count++;
+     record_plane_media_busy(plane, media_start, sense_done);
++    if (config_.device.die_blocking) {
++        record_die_window(
++            dies_.at(die_index(addr)).die_read_windows, media_start, page_buffer.finish_ns);
++    }
+     plane.read_count++;
+ 
+     breakdown.scheduler_queue_wait_ns += page_buffer.wait_ns;
+@@ -10402,8 +10492,18 @@ double HbfController::schedule_buffered_program_page(
+     // previous page; page zero's own program follows its autoerase.
+     auto& block = blocks_.at(static_cast<std::size_t>(
+         ppn / config_.device.pages_per_block));
+-    const double media_start = preview_full_plane_window(
+-        plane, std::max(tsu.finish_ns, block.next_program_media_ns), barrier_ns);
++    double media_start = std::max(tsu.finish_ns, block.next_program_media_ns);
++    if (config_.device.die_blocking) {
++        const auto& die = dies_.at(die_index(addr));
++        for (;;) {
++            const double plane_start = preview_full_plane_window(plane, media_start, barrier_ns);
++            const double die_start = preview_die_read_clear(die, plane_start, barrier_ns);
++            if (die_start == plane_start) { media_start = die_start; break; }
++            media_start = die_start;
++        }
++    } else {
++        media_start = preview_full_plane_window(plane, media_start, barrier_ns);
++    }
+     breakdown.scheduler_queue_wait_ns += std::max(0.0, media_start - tsu.finish_ns);
+     // Program completion and every reserved calendar use the same interval.
+     const double program_done = media_start + barrier_ns;
+@@ -10453,6 +10553,10 @@ double HbfController::schedule_buffered_program_page(
+         }
+     }
+     record_full_plane_window(plane, media_start, program_done);
++    if (config_.device.die_blocking) {
++        record_die_window(
++            dies_.at(die_index(addr)).die_program_erase_windows, media_start, program_done);
++    }
+     record_plane_media_busy(plane, media_start, program_done);
+     plane.program_count++;
+     block.issued_media_ready_ns = std::max(
+@@ -10521,8 +10625,18 @@ double HbfController::schedule_erase_block(
+         TransactionKind::Erase);
+ 
+     const double barrier_ns = config_.device.t_erase_block_ns;
+-    const double media_start = preview_full_plane_window(
+-        plane, tsu.finish_ns, barrier_ns);
++    double media_start = tsu.finish_ns;
++    if (config_.device.die_blocking) {
++        const auto& die = dies_.at(die_index(addr));
++        for (;;) {
++            const double plane_start = preview_full_plane_window(plane, media_start, barrier_ns);
++            const double die_start = preview_die_read_clear(die, plane_start, barrier_ns);
++            if (die_start == plane_start) { media_start = die_start; break; }
++            media_start = die_start;
++        }
++    } else {
++        media_start = preview_full_plane_window(plane, media_start, barrier_ns);
++    }
+     breakdown.scheduler_queue_wait_ns += std::max(0.0, media_start - tsu.finish_ns);
+     const double erase_done = media_start + config_.device.t_erase_block_ns;
+     breakdown.array_erase_ns += config_.device.t_erase_block_ns;
+@@ -10568,6 +10682,10 @@ double HbfController::schedule_erase_block(
+         }
+     }
+     record_full_plane_window(plane, media_start, erase_done);
++    if (config_.device.die_blocking) {
++        record_die_window(
++            dies_.at(die_index(addr)).die_program_erase_windows, media_start, erase_done);
++    }
+     record_plane_media_busy(plane, media_start, erase_done);
+     plane.erase_count++;
+     stats_.block_erases++;
+diff --git a/src/host/hbf_controller.hpp b/src/host/hbf_controller.hpp
+index a79cde5..9dabc8a 100644
+--- a/src/host/hbf_controller.hpp
++++ b/src/host/hbf_controller.hpp
+@@ -1180,6 +1180,10 @@ private:
+         // (backfill): in-order issue would let one late transaction park
+         // the queue while the die sits idle.
+         std::array<ResourceTimeline, 4> source_queues{};
++        // Merged die-wide busy windows used only when hbf-die-blocking=true:
++        // program/erase on any plane blocks reads on all planes of the same die.
++        std::vector<PlaneState::BusyWindow> die_program_erase_windows;
++        std::vector<PlaneState::BusyWindow> die_read_windows;
+     };
+ 
+     struct ChannelState {
+@@ -1987,6 +1991,14 @@ private:
+         PlaneState& plane,
+         double begin_ns,
+         double end_ns);
++    void record_die_window(
++        std::vector<PlaneState::BusyWindow>& windows,
++        double begin_ns,
++        double end_ns);
++    [[nodiscard]] double preview_die_read_clear(
++        const DieState& die,
++        double earliest_ns,
++        double duration_ns) const;
+     void record_plane_media_busy(PlaneState& plane, double begin_ns, double end_ns);
+     // Drop per-operation state that no request arriving at or after the
+     // causal watermark can observe: folded ECC latency intervals, commit
+diff --git a/src/physical/hbf/hbf_config.hpp b/src/physical/hbf/hbf_config.hpp
+index d42001f..9b80b76 100644
+--- a/src/physical/hbf/hbf_config.hpp
++++ b/src/physical/hbf/hbf_config.hpp
+@@ -23,6 +23,10 @@ struct HbfDeviceConfig {
+     std::uint64_t oob_bytes_per_page = 224;
+     std::uint32_t media_lanes_per_plane = 1;
+     std::uint32_t page_buffer_banks_per_plane = 2;
++    // Optional die-level program/erase blocking (off by default to preserve
++    // upstream plane-level blocking). When enabled, program and erase on any
++    // plane of a die block reads on all planes of that die.
++    bool die_blocking = false;
+     double t_read_page_ns = 4000.0;
+     // Total NAND page-program time, including internal program verification.
+     double t_program_page_ns = 75000.0;
