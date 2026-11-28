@@ -41,7 +41,7 @@
 | M5 写入干扰 | `hbf/interference.py`、`tests/test_interference.py` | ✅ 已提交 | fifo、gaps、suspend、random、correlated 五种模式；`python -m hbf.interference RUN_DIR` |
 | M4a 时钟 | `hbf/endurance.py`（Clock、calibrate） | ✅ 已提交 | 用拟合的估算加 `system.evaluate` 代替每步跑分析；与阶段 A 的 TPOT 相差 < 0.01% |
 | M4b 解析模型 | `hbf/endurance.py`（analytic）、`hbf/workload.py` | ✅ 已提交 | `python -m hbf.endurance --analytic`：写入速率、读干扰刷新、数据保持刷新、擦除放大、到达 P/E 上限的天数；参数可逗号分隔批量扫描 |
-| M4c 事件模拟 | `hbf/endurance.py`（simulate）、`hbf/workload.py` | 🔄 子代理开发中（独立 worktree，完成后合并） | 段级状态、按量子推进：到达、写回、读计数、刷新、回收、磨损均衡；未测试的草稿在 `docs/design/drafts/` |
+| M4c 事件模拟 | `hbf/endurance.py`（simulate）、`hbf/workload.py` | 🔄 大部分完成（见 T-B1d）；`python -m hbf.endurance --hours N` | 段级状态、按量子推进：到达、写回、读计数、刷新、回收、磨损均衡；未测试的草稿在 `docs/design/drafts/` |
 | 扫描接入 | `hbf/sweep.py`（`"tool"` 键） | ✅ | `"tool": "endurance"` 让扫描脚本驱动寿命模型，每点一个组合，共用标定缓存 |
 | 实验 | `evidence/phase2b/` | 🔄 | E3.1、E4.1、E5.1、E5.2、E5.6 已在本地跑完；放置实验需在 T-B7 后重跑；其余等事件模拟 |
 | 报告 | REPORT"第 2 阶段 B" | 🔄 | "第 2 阶段 B（一）"已写；（二）等事件模拟 |
@@ -88,7 +88,7 @@
 | ID | 任务 | 要改的文件 | 依赖 | 验收标准 | 状态 |
 |---|---|---|---|---|---|
 | T-B1 | 寿命模型 M4：时钟、解析、CLI | `hbf/endurance.py`、`hbf/workload.py`、`tests/test_endurance.py` | M5 | 设计 §7 的测试 8–9；E3.1 的解析曲线 | ✅ |
-| T-B1d | 寿命模型 M4：事件模拟 | 同上，草稿在 `docs/design/drafts/` | T-B1 | 设计 §7 的测试 10–16；与解析模型在稳态下一致 | 🔄 子代理开发中，计划写在 `docs/design/phase2b-sim-plan.md` |
+| T-B1d | 寿命模型 M4：事件模拟 | 同上，草稿在 `docs/design/drafts/` | T-B1 | 设计 §7 的测试 10–16；与解析模型在稳态下一致 | 🔄 大部分完成：请求流、段级模拟、packed/dedicated/hbm_decode（含分区）、layer_major、M5 接入、CLI；设计测试 10–15 通过。未做：vllm_pool（测试 16）、die 分区高并发提速。剩余步骤见 `docs/design/phase2b-sim-plan.md` 的 Next steps |
 | T-B7 | `packed` 分配的请求起点错开：原来每个请求从行边界开始，短上下文时各请求同一层落在同一批 bank 上（KIVI-2、2K 时轮数是理想的 5.3 倍） | `hbf/batch.py` | — | 黄金文件不变；短上下文的 κ 接近 1 | ✅ 默认 `--align stagger`，同一点 κ 5.33 → 1.67 |
 | T-B2 | 扫描脚本支持 `"tool": "endurance"` | `hbf/sweep.py`、`tests/test_sweep.py` | T-B1 的 CLI | 一个寿命网格能跑出 summary.csv | ✅ |
 | T-B3 | E5.1、E5.2 实验：各分配方式的写顺序合法性与读并行度 | `evidence/grids/phase2b-placement.json` | M2 | 本地运行（docs/local-runs.md 的 `placement`），汇总表与 REPORT 段落 | ✅ 已本地运行，写入 REPORT；T-B7 后需重跑 |
