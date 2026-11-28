@@ -103,14 +103,18 @@ def prefill_batches(cfg, layout):
     """Write every LPA of the layout's span once, in address order, as step -1 (layer -1).
 
     The OCP HBF spec maps an address to a fixed bank, die, block and page and requires the host to
-    write a block's 4 KiB addresses consecutively without skipping (section 5.4.1), so the span is
-    written whole, padding pages of striped layouts included. MQSim then places page k of each
-    plane at offset k, which equals the spec's static offset ``lpa // units`` for a layout at a
-    base that is a multiple of the unit count.
+    write a block's 4 KiB addresses consecutively from page 0 without skipping (section 5.4.1), so
+    the span is written whole, padding pages of striped layouts included. MQSim's data write
+    frontier uses blocks 0, 3, 4, ... (blocks 1 and 2 are reserved for translation and GC write
+    frontiers, Flash_Block_Manager_Base.cpp:53-57), so prior to static-write FTL support MQSim's
+    physical block ID does not equal the static block ID; aligning ``base`` to block page 0
+    (``units * pages_per_block``) keeps each plane's in-block page offset equal to its static page
+    offset.
     """
-    if layout.base % cfg.units:
-        raise ValueError("A prefill needs a layout base that is a multiple of the unit count; otherwise MQSim's "
-                         "offsets differ per plane from the static offsets lpa // units")
+    if layout.base % (cfg.units * cfg.pages_per_block):
+        raise ValueError("A prefill needs a layout base aligned to block page 0 "
+                         "(a multiple of units * pages_per_block); otherwise MQSim's in-block page "
+                         "offsets differ from the static offsets")
     lpas = range(layout.base, layout.base + layout.span)
     limit = cfg.batch_pages
     return [Batch(-1, -1, index, 0, tuple(Request(lpa, "W") for lpa in lpas[start:start + limit]))

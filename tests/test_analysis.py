@@ -546,9 +546,12 @@ def test_generator_and_cli_edge_cases(tmp_path, monkeypatch):
     pages = [a for a in generate(cfg, striped, "same_unit", count=3, unit=0)]  # skips padding pages
     assert len({striped.lpa(a.layer, a.kv_head, striped.tensor_index(a.kind), a.token_start // 16)
                 for a in pages}) == 3
-    shifted = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 64), base=100)
-    with pytest.raises(ValueError, match="multiple of the unit count"):
-        prefill_batches(cfg, shifted)
+    for bad_base in (100, cfg.units):
+        shifted = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 64), base=bad_base)
+        with pytest.raises(ValueError, match="block page 0"):
+            prefill_batches(cfg, shifted)
+    aligned = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 64), base=cfg.units * cfg.pages_per_block)
+    assert prefill_batches(cfg, aligned)[0].requests[0].lpa == cfg.units * cfg.pages_per_block
     with pytest.raises(ValueError, match="multiple of the unit count"):
         cfg.unit_lpa(512, 0, 512)
     # A link grade alone sets no credit limit: rounds stay at the bank bound.
