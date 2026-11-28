@@ -173,7 +173,7 @@ def test_coalesced_command_time(binary, evidence, planes, step, window):
 def test_patch_series_lists_every_patch():
     from hbf.simulator import patch_series
     names = [path.name for path in patch_series()]
-    assert names[-3:] == ["T-SUSP.patch", "T-CMD.patch", "T-CACHE.patch"] and len(names) == len(set(names)) == 9
+    assert names[-3:] == ["T-CMD.patch", "T-CACHE.patch", "T-PERF.patch"] and len(names) == len(set(names)) == 10
 
 
 def cache_cfg(**overrides):

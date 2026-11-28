@@ -1,0 +1,19 @@
+diff --git a/src/ssd/Host_Interface_NVMe.cpp b/src/ssd/Host_Interface_NVMe.cpp
+index 0406e6b..cdba641 100644
+--- a/src/ssd/Host_Interface_NVMe.cpp
++++ b/src/ssd/Host_Interface_NVMe.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include <stdexcept>
+ #include "../sim/Engine.h"
+ #include "Host_Interface_NVMe.h"
+@@ -98,7 +99,8 @@ inline void Input_Stream_Manager_NVMe::Handle_arrived_write_data(User_Request *r
+ inline void Input_Stream_Manager_NVMe::Handle_serviced_request(User_Request *request)
+ {
+ 	stream_id_type stream_id = request->Stream_id;
+-	((Input_Stream_NVMe *)input_streams[request->Stream_id])->Waiting_user_requests.remove(request);
++	{ std::list<User_Request*>& w = ((Input_Stream_NVMe *)input_streams[request->Stream_id])->Waiting_user_requests;
++	  std::list<User_Request*>::iterator it = std::find(w.begin(), w.end(), request); if (it != w.end()) w.erase(it); }
+ 	((Input_Stream_NVMe *)input_streams[stream_id])->On_the_fly_requests--;
+ 
+ 	DEBUG("** Host Interface: Request #" << request->ID << " from stream #" << request->Stream_id << " is finished")
