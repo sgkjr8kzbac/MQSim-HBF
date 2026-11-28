@@ -3,6 +3,7 @@
 > 执行者：本地 agent。审查：云端 agent（每个里程碑完成后）。
 > 起点：分支 `claude/hbf-kv-terms`，提交 `bd3b91c` 之后的文档提交。第一版经子代理对照代码审查后修订（第七节）。
 > 本文件取代 PLAN.md 里所有尚未开始的功能任务。R0–R8 完成前，不再增加新的研究功能。
+> 进度：R0–R6 已在 `refactor/modular` 上完成（`6a977f2`，567 项通过、3 项 xfail）。云端已审查 R1–R3，R4–R6 待审查；R7、R8 未开始；R9（HBFSim 作为第二后端的评估）是新增项。
 
 ## 一、已经定下的决定
 
@@ -20,6 +21,7 @@
 | 第 3 阶段的方法 | MLA、kvspec 分组、loki、sparq 等作为内置扩展保留，默认关闭。短期取数据要用，所以不删；README 写明删掉 `hbf/ext/` 不影响模拟器工作 |
 | 数据 | 请求级用公共数据集；token 级等有 GPU 后用自己截取的 trace。两种都要能跑 |
 | MQSim 修改 | 短期尽量少改。只加 `T-PERF`（提速，不改变结果）和 R5 的写入补丁 |
+| HBFSim | 不替换 MQSim 本体。作为第二个独立后端接入，用于交叉核对和多 stack、HBM 的实验。评估结束后由用户决定是否扩大它的角色（R9） |
 
 另一份重构计划（"三轮独立审查终稿"，不在仓库里）的处理：
 - 第一阶段的 bug 修复并入本方案的 R1，用到的细节已抄进 R1；
@@ -372,6 +374,68 @@ token 级 trace（access.csv）和请求级 trace（requests.csv）是前端的�
 - README 按新结构重写：安装、快速开始（默认即规范行为）、配置文件、地址轨迹格式、扩展。
 - REPORT 开头加一段说明：`baseline-pre-refactor` 之前的数字来自旧默认，复现方式是检出该 tag。
 - PLAN.md 的阶段表和任务表按新结构更新；删除过时的 `docs/handoff.md` 内容。
+
+### R9 HBFSim 作为第二后端（评估）
+
+[HBFSim](https://github.com/FlashLabAE/HBFSim)（MIT 许可，RACS '26）是另一个按 OCP HBF v0.7.0 建模的事件驱动模拟器，C++20 实现，同时建模 HBM4、多个 HBF stack、链路和主机 FTL。R9 与 R7、R8 互不依赖，可以并行做，但不能改变 MQSim 后端的任何结果。
+
+**为什么不替换 MQSim**
+- R5、R6 已经在 MQSim 上实现并验证了 HBF 的写入规则和寿命核对。换后端要重新验证全部结果。
+- 用户定的本体是 MQSim。
+- HBFSim 缺读干扰和刷新（第 3、4 项的核心），编程和擦除阻塞读的单位也和我们的默认不同（见下表）。
+
+两个独立模拟器结果一致，能加强结论；不一致，则暴露各自的建模假设。
+
+**云端已核实的事实**（提交 `8ab183c`，2026-11-10；只看了文档、代码，跑了只读测试）
+
+| 项目 | 事实 | 出处 |
+|---|---|---|
+| 速度和内存 | 26 万页顺序读、2 个场景共 3.1 s，内存 0.4 GB；约 6 s 处理一百万页操作（与 `T-PERF` 后的 MQSim 相当，内存约为它的 1/10） | 云端实测，`hbfsim-reference` |
+| 读时间 | 1 GiB 顺序读（4 个 stack，共 1,024 个 bank，tR 4 µs）用 1.03 ms，接近 1,024 bank × 4 µs 的轮数下界；MQSim 在 `ocp` 上同样的读量是 1.32 ms | 云端实测；`evidence/phase2a/mqsim-confirm.csv` |
+| 静态放置 | `hbf-mapping-mode=raw-physical` 接受页内对齐的读和按 NAND 顺序的整页编程，写块的第 0 页时自动擦除，乱序写返回 0x6。物理字节地址按固定公式解码，由内到外为 page、block、plane、die、channel、stack | `docs/reference/host-hbf-management.md`；`src/host/hbf_controller.cpp:1473`（`decode`） |
+| 初始数据 | raw-physical 模式读已有数据要先装入"物理初始镜像" | `hbf_controller.cpp:2276`（`prepopulate_raw_physical_page`），配置方式待查 |
+| 编程、擦除阻塞 | 只占用所在 plane 的时间窗（`preview_full_plane_window(plane, …)`），同 die 其他 plane 的读不受影响。我们的 MQSim 在 `ocp` 上按 die 阻塞 | `hbf_controller.cpp:10520` 附近 |
+| 读干扰、刷新、保持期 | 明确不建模；只有按 bank、plane、lane 的读计数，没有每块读计数 | `docs/reference/model.md` "Thermal, reliability and evidence limits" |
+| 读协议 | 每个 stack 有读队列深度额度，每个 bank 缓存 2 页，64 B 突发；没有我们按主机通道的 MOCS 和 fcfs/trigger 发射顺序 | `docs/reference/model.md`、`hbf-mapping-organizations.md` |
+| 几何默认值 | 每通道 1 个 die、每 die 16 个 plane、每 plane 2,048 块；tR 4 µs、tPROG 75 µs | `src/physical/hbf/hbf_config.hpp` |
+
+**步骤**
+
+1. **获取与构建**：
+   - 不把 HBFSim 源码放进仓库。写 `scripts/hbfsim_build.sh`：把指定提交克隆到 `.build/hbfsim/<commit>`，用 CMake Release 编出 `hbfsim` 和 `hbfsim_reference` 两个目标（约 30 s）。
+   - 提交号写在一个文件里（类似 `hbf/mqsim.commit`），每次运行记进 `meta.json`。
+   - 对 HBFSim 的修改用补丁文件，放在 `hbf/patches/hbfsim/`，与 MQSim 的做法一致。
+2. **转换器** `hbf/backends/hbfsim/convert.py`：把 `addr.npz` 转成 HBFSim 的 raw-physical trace（格式见 HBFSim 的 `docs/guides/workload-replay.md`）。
+   - 物理地址：(channel, die, plane, block, page) 由 `device/address.py` 的 §4.6 映射给出。主机通道对应 channel，主机通道内的 4 个 die 对应 die，bank 对应 plane，静态偏移按每块页数拆成 block 和 page。编码为 `(((((stack·C + channel)·D + die)·P + plane)·B + block)·PPB + page) × 4096`。
+   - 到达时间：按 (step, layer, subbatch) 的顺序赋值，与 MQSim 后端一致。
+   - `resident` 转成物理初始镜像。
+   - `D` 不发命令：raw-physical 模式本来就拒绝逻辑失效操作。
+   - `cls` 保留，用于归因。
+3. **配置**：新增 `hbf/configs/hbfsim-ocp.cfg`，对应我们的 `ocp`：
+   - 1 个 stack；每 stack 16 通道 × 4 die × 16 plane；每 plane 512 块，每块 256 页；
+   - tR 4,096 ns、tPROG 100 µs、tBERS 1 ms；档位 2；
+   - raw-physical 模式，关闭写合并，关闭热模型。
+   
+   参数逐项对照我们的 `parameters.json`，写进配置文件的注释。
+4. **小例子确认**（验收）：
+   - 读已装入初始镜像的页成功；读未写页报错；
+   - 顺序写满一块后重写它的第 0 页，P/E 次数加 1；乱序写返回 0x6；
+   - 随机 LPA 的物理位置，用 HBFSim 地址热图（`hbfsim.address_heatmap.v1` 的 HBF-physical 域）对照 `device/address.py`，逐页相同。
+5. **三方计时对比**：同一份地址轨迹分别交给 HBFSim、MQSim 和轮数模型，跑这两组点：
+   - 第 2 阶段 A 的 15 个 MQSim 核对点（`evidence/scripts/mqsim_confirm.sh`）；
+   - R5.3 的 9 个写入干扰点（`scripts/r5_write_interference.py`）。
+   
+   目标不是强行对齐，而是把每一处差异和它的机制写清楚，尤其是稠密读 1.03 ms 对 1.32 ms 的差别：命令开销、核心通道上的传输、cache read 的建模。结果写进 REPORT。
+6. **按 die 阻塞的开关**（HBFSim 补丁）：编程和擦除时占用同 die 所有 plane 的时间窗。默认保持 HBFSim 原行为（按 plane），打开后与 MQSim 一致。用 R5.3 的 9 个点两种都跑。
+7. **不做的**：
+   - HBFSim 里的每块读计数：raw-physical 模式下物理位置由我们决定，前端从轨迹就能数；
+   - MOCS 和发射顺序：这组结论留在轮数模型里（已与 HBF-EventLab 核对）；
+   - 用 HBFSim 的逻辑 FTL 跑 KV。
+8. **决策点**：第 5、6 步完成后，向用户汇报两件事，由用户决定 HBFSim 的角色：
+   - 两个后端的差异清单；
+   - 多 stack 和 HBM 的实验是否改用 HBFSim 来做。改用的话，原来设想的"多 stack 读路径"（在我们的前端和轮数模型里加 stack 维度，未写进本方案）就不必自己实现。
+
+工作量估计：转换器、配置和小例子 1–2 天；按 die 阻塞的补丁约半天；对比实验在本地跑。
 
 ## 五、重构期间的协作规则（PLAN.md 第四节已同步）
 
