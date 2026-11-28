@@ -495,6 +495,43 @@ def test_simulation_refresh_with_decode_writes_is_below_analytic():
     assert .8 * ref["avg_pec_per_day"] < sim.result["avg_pec_per_day"] < ref["avg_pec_per_day"]
 
 
+def test_cli_simulation(tmp_path):
+    out = tmp_path / "sim"
+    main(["--no-calibrate", "--workload", "long32k", "--concurrency", "2", "--capacity-gib", "64", "--hours", ".05",
+          "--warmup-h", ".01", "--report-s", "30", "--rd-threshold", "1e5", "--output", str(out)])
+    with (out / "endurance_summary.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1 and rows[0]["policy"] == "packed" and float(rows[0]["mean_batch"]) == pytest.approx(2)
+    assert float(rows[0]["analytic_avg_pec_per_day"]) > 0 and rows[0]["segments"] == "64"
+    with (out / "endurance_timeseries.csv").open(newline="") as stream:
+        series = list(csv.DictReader(stream))
+    assert len(series) == 7 and {"t_s", "running", "tpot_m5_ms", "refresh_rd_gb", "free_segments"} <= set(series[0])
+    with (out / "endurance_segments.csv").open(newline="") as stream:
+        assert len(list(csv.DictReader(stream))) == 64
+    summary = summarize_run(out)
+    assert set(summary) == set(METRICS) and summary["mean_batch"] == pytest.approx(2) and summary["stalls"] == 0
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["tool"] == "endurance" and meta["analytic"] is False and meta["hours"] == .05
+    report = (out / "report.md").read_text()
+    assert "# 寿命评估（事件模拟）" in report and "## 假设" in report and "第 5.7 节" in report
+    assert "## 与解析模型的差别" in report
+
+
+def test_cli_simulation_validation():
+    parser = build_parser()
+    with pytest.raises(ValueError, match="--hours"):
+        configure(parser.parse_args(["--no-calibrate"]))
+    with pytest.raises(ValueError, match="vllm_pool"):
+        configure(parser.parse_args(["--hours", "2", "--alloc", "vllm_pool"]))
+    with pytest.raises(ValueError, match="replay"):
+        configure(parser.parse_args(["--hours", "2", "--alloc", "layer_major", "--refresh", "relocate"]))
+    with pytest.raises(ValueError, match="warmup"):
+        configure(parser.parse_args(["--hours", "1"]))  # the default warm-up is 1 h
+    config = configure(parser.parse_args(["--hours", "2", "--wear", "none", "--no-stagger"]))
+    assert config["analytic"] is False and config["wear"] == "none" and config["stagger"] is False
+    assert {"models", "formats", "workloads", "pages_per_block", "x_values"} <= set(config)
+
+
 def test_m5_hook_per_quantum(monkeypatch):
     """interference() is called once per quantum with that quantum's programs and block erases per step;
     over the run the loads times the steps add up to every program and erase (no idle time here). Its

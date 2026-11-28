@@ -1778,7 +1778,9 @@ METRICS = ("mean_batch", "mean_context", "mean_tpot_ms", "tpot_m5_ms", "max_step
     f"{cause}_gb_s" for cause in CAUSES) + (
     "program_gb_s", "program_bw_share", "wa", "erase_amp", "erase_wa", "refresh_to_kv", "erases_per_s", "avg_pec_per_day",
     "max_pec_per_day", "pe_per_mtok", "break_even_x", "staging_peak_mib", "pending_units_per_channel",
-    "unit_open_s", "replay_buffer_mib", "legal")
+    "unit_open_s", "replay_buffer_mib", "legal") + (  # event simulation only (empty for --analytic)
+    "evicted_gb", "recompute_tokens", "stalls", "free_segments_min", "analytic_avg_pec_per_day",
+    "analytic_refresh_to_kv")
 SPARSE_MODES = ("dense", "uniform_tokens", "uniform_pages", "sink_recent")
 
 
@@ -1795,7 +1797,7 @@ def _list(text, kind=str, name="value"):
 def build_parser():
     parser = argparse.ArgumentParser(prog="python -m hbf.endurance", description=__doc__.split("\n\n")[0])
     parser.add_argument("--analytic", action="store_true",
-                        help="closed-form steady state (the event simulation is not implemented yet)")
+                        help="closed-form steady state instead of the event simulation (which needs --hours)")
     parser.add_argument("--model", default="llama-3.1-8b", help="model preset(s), comma separated")
     parser.add_argument("--gpu", default="b200", help="GPU preset (hbf/configs/gpus.json) or JSON")
     parser.add_argument("--format", dest="kv_format", default="bf16",
@@ -1805,7 +1807,8 @@ def build_parser():
     parser.add_argument("--fraction", type=float, default=.1, help="selected share (uniform_*, sink_recent)")
     parser.add_argument("--select-tokens", type=int, default=16, help="uniform_tokens block (default 16)")
     parser.add_argument("--count", type=int, default=4, help="sink_recent: sink tokens")
-    parser.add_argument("--seed", type=int, default=1, help="seed of the calibration snapshot's selection")
+    parser.add_argument("--seed", type=int, default=1,
+                        help="seed of the request stream (simulation) and of the calibration snapshot's selection")
     parser.add_argument("--alloc", choices=POLICIES, default="packed",
                         help="allocation policy: packed (default), dedicated, layer_major (static waves), "
                              "hbm_decode (generated KV stays in HBM), vllm_pool (not legal as specified)")
@@ -1864,6 +1867,33 @@ def build_parser():
     calib.add_argument("--calibration-dir", type=Path, help="cache of calibration runs (default OUTPUT/calibration)")
     calib.add_argument("--calib-context", type=int,
                        help="context of the calibration runs (default: the workload's mean context, 1K-32K)")
+    sim = parser.add_argument_group("event simulation (without --analytic; design-B section 4)")
+    sim.add_argument("--hours", type=float, help="simulated hours (required without --analytic)")
+    sim.add_argument("--warmup-h", type=float, default=1.0, help="first hours excluded from the rates (default 1)")
+    sim.add_argument("--wear", choices=WEAR, default="dynamic",
+                     help="free-segment allocation: none (lowest index), dynamic (least PEC, default), "
+                          "ideal (as dynamic; max PEC reported as AVGPEC)")
+    sim.add_argument("--refresh", choices=REFRESH, default="auto",
+                     help="read-disturb and retention refresh: relocate live pages (auto for packed, dedicated, "
+                          "hbm_decode) or replay the segment in place (spec section 5.7; auto for layer_major)")
+    sim.add_argument("--refresh-idle", choices=("relocate", "evict"), default="relocate",
+                     help="idle cached entries in a refreshed segment: relocate (default) or drop them")
+    sim.add_argument("--reclaim", choices=("evict", "compact"), default="evict",
+                     help="reclaim victims: evict idle entries, copy active pages (default); compact copies all")
+    sim.add_argument("--low-watermark", type=int,
+                     help="free segments per partition kept by reclaim (default 2 + one maximal request)")
+    sim.add_argument("--report-s", type=float, default=60.0, help="timeseries interval, simulated s (default 60)")
+    sim.add_argument("--quantum-s", type=float, default=1.0, help="longest quantum in seconds (default 1)")
+    sim.add_argument("--rd-slack", type=float, default=.01,
+                     help="shortest quantum as a share of the fastest segment's threshold in steps "
+                          "(default 0.01: a refresh is at most 1%% of X late)")
+    sim.add_argument("--slots", type=int,
+                     help="running requests at most (layer_major: slots per wave; default --concurrency or "
+                          "--max-batch)")
+    sim.add_argument("--align", choices=("row", "none"), default="row",
+                     help="packed: start each new entry on a row (default)")
+    sim.add_argument("--no-stagger", action="store_true",
+                     help="start closed-loop requests together (default: staggered over one request lifetime)")
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -1873,7 +1903,20 @@ def configure(args):
     from .model import load_gpu, load_model
     from .system import SystemOptions
     if not args.analytic:
-        raise ValueError("The event simulation (design-B section 4) is not implemented yet; use --analytic")
+        if args.hours is None:
+            raise ValueError("The event simulation needs --hours (simulated time); use --analytic for the "
+                             "closed-form steady state")
+        if args.alloc not in SIM_POLICIES:
+            raise ValueError(f"--alloc {args.alloc} is not simulated (only {', '.join(SIM_POLICIES)}); "
+                             "use --analytic")
+        if args.hours <= 0 or not 0 <= args.warmup_h < args.hours:
+            raise ValueError("--hours must be positive and --warmup-h in [0, --hours)")
+        if args.report_s <= 0 or args.quantum_s <= 0 or not 0 <= args.rd_slack < 1:
+            raise ValueError("--report-s and --quantum-s must be positive and --rd-slack in [0, 1)")
+        if (args.low_watermark is not None and args.low_watermark < 1) or (args.slots is not None and args.slots < 1):
+            raise ValueError("--low-watermark and --slots must be positive")
+        if args.alloc == "layer_major" and args.refresh == "relocate":
+            raise ValueError("layer_major regions are refreshed in place: use --refresh replay or auto")
     params = json.loads((Path(__file__).resolve().parent / "configs" / "parameters.json").read_text())
     models = [load_model(name) for name in _list(args.model, name="model")]
     formats = _list(args.kv_format, name="format")
@@ -1917,7 +1960,11 @@ def configure(args):
             "t_prog": args.program_ns or params["program_ns"], "t_bers": args.erase_ns or params["erase_ns"],
             "options": SystemOptions(overlap=args.overlap, kv_consume=args.kv_consume), "m5": args.m5,
             "suspend_ns": args.suspend_ns, "block_unit": args.block_unit, "calibrate": not args.no_calibrate,
-            "calibration_dir": args.calibration_dir, "calib_context": args.calib_context}
+            "calibration_dir": args.calibration_dir, "calib_context": args.calib_context,
+            "analytic": args.analytic, "hours": args.hours, "warmup_h": args.warmup_h, "wear": args.wear,
+            "refresh": args.refresh, "refresh_idle": args.refresh_idle, "reclaim": args.reclaim,
+            "low_watermark": args.low_watermark, "report_s": args.report_s, "quantum_s": args.quantum_s,
+            "rd_slack": args.rd_slack, "slots": args.slots, "align": args.align, "stagger": not args.no_stagger}
 
 
 def _calib_context(workload, given):
@@ -1957,19 +2004,95 @@ def make_clock(config, model, kv_format, workload, directory):
 
 
 def run(directory, **config):
-    """Write meta.json, calibration.json, endurance_summary.csv and report.md into ``directory``; returns rows."""
+    """Write meta.json, calibration.json, endurance_summary.csv and report.md into ``directory``; returns rows.
+
+    With ``analytic`` false (no ``--analytic``) every (model, format, workload, ppb, X) is simulated
+    (``simulate``) and endurance_timeseries.csv and endurance_segments.csv are written too.
+    """
     from .system import write_table
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
+    analytic_mode = config.get("analytic", True)
+    if not analytic_mode:
+        rows, calibrations = _simulation_run(directory, config)
+    else:
+        rows, calibrations = _analytic_rows(directory, config)
+    write_table(directory / "endurance_summary.csv", rows)
+    meta = {key: value for key, value in config.items()
+            if key not in ("models", "gpu", "workloads", "options", "calibration_dir")}
+    meta |= {"models": [model.name for model in config["models"]], "gpu": config["gpu_name"],
+             "workloads": [{"name": w.name, "description": w.describe(), "source": w.source}
+                           for w in config["workloads"]],
+             "options": {"overlap": config["options"].overlap, "kv_consume": config["options"].kv_consume},
+             "tool": "endurance", "analytic": analytic_mode, "argv": sys.argv}
+    (directory / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str) + "\n")
+    if calibrations:
+        (directory / "calibration.json").write_text(json.dumps(calibrations, indent=2) + "\n")
+    lines = report_lines(rows, config, calibrations) if analytic_mode else sim_report_lines(rows, config, calibrations)
+    (directory / "report.md").write_text("\n".join(lines) + "\n")
+    return rows
+
+
+def _read_share(config, clock, calib):
+    """Pages read per stored page per step: --read-share, the calibration's, or the sparse fraction."""
+    share = config["read_share"] or (calib["read_share"] if calib else 1.0)
+    if config["mode"] != "dense" and calib is None and config["read_share"] is None:
+        share = config["generation"].get("fraction", 1.0)
+        clock.ratios = {"pages": share}
+    return share
+
+
+def _simulation_run(directory, config):
+    """Simulate every combination; writes the timeseries and segment CSVs, returns (summary rows, calibrations)."""
+    from .system import write_table
+    rows, calibrations, series, segments = [], [], [], []
+    for model, kv_format, workload in itertools.product(config["models"], config["formats"], config["workloads"]):
+        clock, geometry, calib = make_clock(config, model, kv_format, workload, directory)
+        if calib is not None:
+            calibrations.append({"model": model.name, "format": kv_format, "workload": workload.name} | calib)
+        share = _read_share(config, clock, calib)
+        share_of_stack = per_stack(workload, config["stacks"])
+        for ppb, x in itertools.product(config["pages_per_block"], config["x_values"]):
+            device = Device(pages_per_block=ppb, capacity_gib=config["capacity_gib"], partition=config["partition"])
+            options = SimOptions(
+                policy=config["policy"], x=x, hot=config["hot"], share=share, retention_s=config["retention_s"],
+                prefix_reads=config["prefix_reads"], hours=config["hours"], warmup_h=config["warmup_h"],
+                quantum_s=config["quantum_s"], report_s=config["report_s"], rd_slack=config["rd_slack"],
+                wear=config["wear"], refresh=config["refresh"], refresh_idle=config["refresh_idle"],
+                reclaim=config["reclaim"], low_watermark=config["low_watermark"], align=config["align"],
+                slots=config["slots"], stagger=config["stagger"], stacks=config["stacks"], m5=config["m5"],
+                t_prog=config["t_prog"], t_bers=config["t_bers"], suspend_ns=config["suspend_ns"],
+                block_unit=config["block_unit"], pe_limits=tuple(config["pe_limits"]))
+            sim = simulate(geometry, clock, share_of_stack, device, options, model=model)
+            try:  # the closed form at the same settings, for comparison
+                ref = analytic(geometry, clock, workload, device, policy=config["policy"], x_values=(x,),
+                               pe_limits=config["pe_limits"], share=share, hot=config["hot"],
+                               retention_s=config["retention_s"], prefix_reads=config["prefix_reads"],
+                               t_prog=config["t_prog"], t_bers=config["t_bers"], m5=config["m5"],
+                               suspend_ns=config["suspend_ns"], block_unit=config["block_unit"],
+                               stacks=config["stacks"], align=config["align"])[0]
+            except (ValueError, ZeroDivisionError):
+                ref = {}
+            key = {"model": model.name, "format": kv_format, "mode": config["mode"], "read_share": share}
+            rows.append(key | sim.result | {name: ref.get(name[len("analytic_"):]) for name in
+                                            ("analytic_avg_pec_per_day", "analytic_refresh_to_kv",
+                                             "analytic_kv_write_gb_s", "analytic_req_per_s")})
+            tag = {"model": model.name, "format": kv_format, "workload": workload.name, "pages_per_block": ppb, "x": x}
+            series += [tag | row for row in sim.timeseries]
+            segments += [tag | row for row in sim.segment_rows()]
+    write_table(directory / "endurance_timeseries.csv", series)
+    write_table(directory / "endurance_segments.csv", segments)
+    return rows, calibrations
+
+
+def _analytic_rows(directory, config):
+    """Closed-form rows of every combination (``analytic``); returns (rows, calibrations)."""
     rows, calibrations = [], []
     for model, kv_format, workload in itertools.product(config["models"], config["formats"], config["workloads"]):
         clock, geometry, calib = make_clock(config, model, kv_format, workload, directory)
         if calib is not None:
             calibrations.append({"model": model.name, "format": kv_format, "workload": workload.name} | calib)
-        share = config["read_share"] or (calib["read_share"] if calib else 1.0)
-        if config["mode"] != "dense" and calib is None and config["read_share"] is None:
-            share = config["generation"].get("fraction", 1.0)
-            clock.ratios = {"pages": share}
+        share = _read_share(config, clock, calib)
         for ppb in config["pages_per_block"]:
             device = Device(pages_per_block=ppb, capacity_gib=config["capacity_gib"], partition=config["partition"])
             for row in analytic(geometry, clock, workload, device, policy=config["policy"],
@@ -1980,19 +2103,7 @@ def run(directory, **config):
                                 block_unit=config["block_unit"], stacks=config["stacks"]):
                 rows.append({"model": model.name, "format": kv_format, "mode": config["mode"],
                              "read_share": share} | row)
-    write_table(directory / "endurance_summary.csv", rows)
-    meta = {key: value for key, value in config.items()
-            if key not in ("models", "gpu", "workloads", "options", "calibration_dir")}
-    meta |= {"models": [model.name for model in config["models"]], "gpu": config["gpu_name"],
-             "workloads": [{"name": w.name, "description": w.describe(), "source": w.source}
-                           for w in config["workloads"]],
-             "options": {"overlap": config["options"].overlap, "kv_consume": config["options"].kv_consume},
-             "tool": "endurance", "analytic": True, "argv": sys.argv}
-    (directory / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str) + "\n")
-    if calibrations:
-        (directory / "calibration.json").write_text(json.dumps(calibrations, indent=2) + "\n")
-    (directory / "report.md").write_text("\n".join(report_lines(rows, config, calibrations)) + "\n")
-    return rows
+    return rows, calibrations
 
 
 def summarize_run(directory, head_dim=None):
@@ -2063,19 +2174,7 @@ def report_lines(rows, config, calibrations=()):
                   f"（例如第一行 {first['program_bw_share']:.4f}）、HBM 暂存峰值 {first['staging_peak_mib']:.1f} MiB、"
                   f"逐页涓流写时每主机通道同时未完成的 4 KiB 单元 {first['pending_units_per_channel']:.0f} 个"
                   f"（每个要开 {first['unit_open_s']:.2f} s；规范第 5.4.1 节第 7 条举例的产品上限是每通道 64 或 128 个）。"]
-    if calibrations:
-        lines += ["", "## 时钟校准", "",
-                  "时钟按 phase A 的每层估算 est = layer_ns + round_ns × 轮数（对 MQSim 校准过的估算），"
-                  "两点（稠密 layer-major，批大小使每层约 32 与 128 轮）拟合 layer_ns、round_ns（截距为负时固定为 4,000 ns 只拟合斜率）；策略快照（`--alloc`）给出均衡系数 κ"
-                  "（实测轮数 / 理想轮数）和稀疏读取相对稠密的需求比例。", "",
-                  "| 模型 | 格式 | 负载 | 拟合批 | layer_ns | round_ns | 快照批 | κ | 读比例 | 单步热度 | 快照 phase A TPOT ms |",
-                  "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
-        for c in calibrations:
-            tpot = c["snapshot"]["tpot_ns"]
-            lines.append(f"| {c['model']} | {c['format']} | {c['workload']} | {c['batches']} | {c['layer_ns']:.0f} | "
-                         f"{c['round_ns']:.1f} | {c['snapshot']['batch']} | {c['balance']:.4f} | {c['read_share']:.4f} | "
-                         f"{c['hot_step']:.2f} | "
-                         f"{_fmt(tpot / 1e6 if tpot else None, 3)} |")
+    lines += _calibration_lines(calibrations)
     lines += ["", "## 结论要点", "",
               "- 稠密读取时，一个装满的块每步被读 ppb 次，所以读扰阈值 = X / ppb 步，与 TPOT 和压缩格式无关"
               "（X = 1e5 / 1e6 / 1e7、ppb = 256 时为 390.6 / 3,906 / 39,063 步）。只有活得比这更久的数据（长输出、"
@@ -2089,8 +2188,140 @@ def report_lines(rows, config, calibrations=()):
     return lines
 
 
+def _calibration_lines(calibrations):
+    if not calibrations:
+        return []
+    lines = ["", "## 时钟校准", "",
+             "时钟按 phase A 的每层估算 est = layer_ns + round_ns × 轮数（对 MQSim 校准过的估算），"
+             "两点（稠密 layer-major，批大小使每层约 32 与 128 轮）拟合 layer_ns、round_ns（截距为负时固定为 4,000 ns 只拟合斜率）；策略快照（`--alloc`）给出均衡系数 κ"
+             "（实测轮数 / 理想轮数）和稀疏读取相对稠密的需求比例。", "",
+             "| 模型 | 格式 | 负载 | 拟合批 | layer_ns | round_ns | 快照批 | κ | 读比例 | 单步热度 | 快照 phase A TPOT ms |",
+             "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for c in calibrations:
+        tpot = c["snapshot"]["tpot_ns"]
+        lines.append(f"| {c['model']} | {c['format']} | {c['workload']} | {c['batches']} | {c['layer_ns']:.0f} | "
+                     f"{c['round_ns']:.1f} | {c['snapshot']['batch']} | {c['balance']:.4f} | {c['read_share']:.4f} | "
+                     f"{c['hot_step']:.2f} | "
+                     f"{_fmt(tpot / 1e6 if tpot else None, 3)} |")
+    return lines
+
+
+SIM_NAMES = {"packed": "紧凑追加（packed）", "dedicated": "每请求独占段（dedicated）",
+             "layer_major": "静态批次波（layer_major）", "hbm_decode": "生成的 KV 留在 HBM（hbm_decode）"}
+
+
+def sim_report_lines(rows, config, calibrations=()):
+    """Chinese report section 寿命评估 of an event simulation, with every assumption and its source tag."""
+    limits = config["pe_limits"]
+    lines = ["# 寿命评估（事件模拟）", "",
+             f"分配方式：{SIM_NAMES[config['policy']]}，分区 `{config['partition']}`；读取方式 `{config['mode']}`；"
+             f"每个 stack 容量 {config['capacity_gib']:g} GiB，{config['stacks']} 个 stack 分担请求（模拟其中一个）；"
+             f"tPROG {config['t_prog'] / 1e3:g} µs，tBERS {config['t_bers'] / 1e3:g} µs；"
+             f"保持刷新间隔 {config['retention_s'] / 3600:g} h（0 表示关闭），持续读偏斜 h = {config['hot']:g}；"
+             f"模拟 {config['hours']:g} h，前 {config['warmup_h']:g} h 预热不计入速率；"
+             f"磨损分配 `{config['wear']}`，刷新 `{config['refresh']}`，空闲条目刷新时 `{config['refresh_idle']}`，"
+             f"回收 `{config['reclaim']}`，写入干扰 `{config['m5']}`（以 {config['block_unit']} 为阻塞单位）。", ""]
+    for w in config["workloads"]:
+        lines.append(f"- 负载 {w.describe()}。来源：{w.source}")
+    lines += ["", "下表每行是一次模拟（一个 stack，预热之后的速率）。P/E 每天取各段 PEC 的增量：平均即 AVGPEC，"
+              "最大即 MAXPEC（第 5.9.2.17–18 节）；“到 N 的天数”= N_PE / 每天 P/E。写放大 = 编程页 / 主机 KV 页；"
+              "擦除放大 = 擦除的页 / 主机 KV 页。TPOT′ 含写入干扰（M5，滞后一个量子反馈到步时）。"
+              "“解析”两列是同一设置下 `--analytic` 的值，用来对照。", "",
+              "| 模型 | 格式 | 负载 | ppb | X | 批 | TPOT ms | TPOT′ ms | 最大单步拖慢 ms | KV 写 GB/s | 读扰刷新 GB/s "
+              "| 保持刷新 GB/s | 搬移 GB/s | 重放 GB/s | 编程 GB/s | 刷新/KV | 写放大 | 擦除放大 | P/E 每天（平均） "
+              "| P/E 每天（最大） | " + " | ".join(f"到 {sci(limit)} 天（最大）" for limit in limits)
+              + " | 驱逐 GB | 解析 P/E 每天 | 解析 刷新/KV |",
+              "|" + "---|" * 3 + "---:|" * (20 + len(limits))]
+    for row in rows:
+        cells = [row["model"], row["format"], row["workload"], str(row["pages_per_block"]), sci(row["x"]),
+                 _fmt(row["mean_batch"]), _fmt(row["mean_tpot_ms"]), _fmt(row["tpot_m5_ms"]),
+                 _fmt(row["max_step_extra_ms"]), _fmt(row["kv_write_gb_s"], 3), _fmt(row["refresh_rd_gb_s"], 3),
+                 _fmt(row["refresh_ret_gb_s"], 3), _fmt(row["compaction_gb_s"], 3), _fmt(row["replay_gb_s"], 3),
+                 _fmt(row["program_gb_s"], 3), _fmt(row["refresh_to_kv"]), _fmt(row["wa"]), _fmt(row["erase_wa"]),
+                 _fmt(row["avg_pec_per_day"], 1), _fmt(row["max_pec_per_day"], 1)]
+        cells += [_fmt(row[f"days_to_limit_max@{sci(limit)}"], 1) for limit in limits]
+        cells += [_fmt(row["evicted_gb"], 1), _fmt(row["analytic_avg_pec_per_day"], 1),
+                  _fmt(row["analytic_refresh_to_kv"])]
+        lines.append("| " + " | ".join(cells) + " |")
+    first = rows[0] if rows else None
+    if first:
+        lines += ["", f"每次模拟 {first['segments']} 个段（每段 {first['segment_pages']} 页），回收低水位 "
+                  f"{first['low_watermark']} 段；第一行用了 {first['quanta']} 个量子、{first['wall_s']:.1f} s。"
+                  "时间序列（每 --report-s 一行：运行与排队请求、TPOT、各原因累计写入与擦除、空闲段、有效页、平均与最大 PEC、"
+                  "最大读次数 / X）在 endurance_timeseries.csv，每段的 PEC、各原因擦除次数和有效页在 endurance_segments.csv。"
+                  f"HBM 暂存峰值 {first['staging_peak_mib']:.1f} MiB。"]
+    lines += ["", "## 与解析模型的差别", "",
+              "- 解析模型把生成的页当作从第一步起就在、每页按请求的全部解码步数计读次数；模拟按页的实际写入时间计，"
+              "所以长输出（reasoning）的读扰刷新低于解析值。",
+              "- 模拟按块计读：被搬移的数据落在正在填充的前沿段里，块中页少、每步读次数少，到 X 的时间更长；"
+              "数据在到 X 前死去时它积累的读次数作废。整段由一个条目占满时两者一致（见 tests/test_endurance.py）。",
+              "- 模拟里写入干扰会拖慢步时、降低请求速率；批大小和上下文随时间波动，TPOT 随批增大，"
+              "所以按请求平均的步时高于平均批下的 TPOT（会话负载约低 10–15 % 的请求速率）。",
+              "- 只在空闲段之间做磨损均衡：容量被空闲缓存占满时只有少数空闲段在轮转，最大 PEC 可以远高于平均值。"]
+    lines += _calibration_lines(calibrations)
+    lines += ["", "## 假设", ""]
+    lines += [f"- {item}" for item in assumptions(config)]
+    return lines
+
+
 def assumptions(config):
-    """Assumption list of the endurance model, each with its source tag (params.md tags in brackets)."""
+    """Assumption list of the endurance model, each with its source tag (params.md tags in brackets).
+
+    The closed form's list is unchanged; for an event simulation (``analytic`` false) the items that
+    describe the closed form's shortcuts are replaced and the simulation's own items are appended.
+    """
+    items = _analytic_assumptions()
+    if config.get("analytic", True):
+        return items
+    replace_items = {
+        "一个请求的所有页": "读扰按块计：一个段（分区内所有 bank 的同一块号）里的条目每步各读一次自己的页，块读次数 = "
+                    "Σ 条目页数 × 读比例 × h / 段的 bank 数；块读次数达到 X 时刷新整段。命中共享前缀或会话历史时，"
+                    "缓存的每页在 prefill 读一次（不乘读比例和 h，与解析模型一致）。",
+        "每天 P/E = 编程页数": "每天 P/E 取预热后各段 PEC 的增量除以天数：平均即理想磨损均衡下的 AVGPEC，"
+                         "最大即 MAXPEC（第 5.9.2.17–18 节）；wear ideal 时最大按平均报告。",
+        "packed：每个新条目": "packed：每个新条目（请求、前缀或会话）的 prompt 从前沿的下一行起点开始（--align row，填充按实际计）；"
+                         "解码页先在 HBM 暂存，每个量子结束时按分区攒成整行写入；请求结束时剩下的整页一起写入"
+                         "（与解析模型的每请求页数一致），只有每 (层, head, 张量) 最后不满的一页留在 HBM 丢弃。",
+        "闭环：每个 stack": "闭环：每个 stack 保持 round(concurrency / stacks) 个请求（会话负载为会话数）；"
+                       "请求在准确的解码步完成并立即补上，prefill 分离，KV 写入完成后开始解码。启动时前 B 个请求的输出依次缩短"
+                       "（第 i 个解码 out − round(i·out/B) 个 token），会话从第 ⌊i·calls/B⌋ 次调用开始，使完成时间错开；"
+                       "预热时间不计入速率（假设）。TPOT 每个量子按当时运行请求的上下文计算。",
+        "写入干扰（M5）": "写入干扰（M5）：默认 gaps 模式（主机把编程、擦除放进 HBF 空闲间隙，符合第 11.5 节“刷新与读不同时发往同一 die”），"
+                     "以 die 为阻塞单位；OCP v0.7.0 没有挂起（suspend）。每个量子按该量子的编程页数和块擦除数（每步平均）计算一次，"
+                     "加到下一个量子的步时上（滞后一个量子），所以会降低请求速率；最大单步拖慢取预热后各量子的最大值。",
+        "速率按每个 stack 计": "速率按每个 stack 计；N 个 stack 时只模拟一个 stack（并发 round(C/N) 或到达率 λ/N），GPU 计算批为 b × N。",
+        "vllm_pool：": None,
+    }
+    out = []
+    for item in items:
+        prefix = next((key for key in replace_items if item.startswith(key)), None)
+        if prefix is None:
+            out.append(item)
+        elif replace_items[prefix] is not None:
+            out.append(replace_items[prefix])
+    out += [
+        "段级状态（设计 B 第 4.1 节）：段 = 分区内所有 bank 的同一块号（ppb 256 时超级块 1 GiB、通道块 64 MiB、die 块 16 MiB）；"
+        "按行对齐放置时一个条目在段内每个块里的页数相同，所以按段计数是精确的（假设：主机按行写入）。",
+        f"量子：每个量子至多 {config.get('quantum_s', 1.0):g} s，在最早的预计读扰阈值或保持到期处截断，但不短于最快的段阈值步数的 "
+        f"{config.get('rd_slack', .01):g}（刷新最多晚这么多的 X，计数偏差不超过这个比例）；量子内步时不变，"
+        "请求在准确的步完成和到达。暂存在 HBM 的页不计 HBF 读次数，量子内新写入的页从下一个量子开始计读。",
+        "读扰与保持刷新：relocate（日志式分配的默认）把段内有效页写到前沿（dedicated 写到条目自己的新段），旧段在下次写第 0 行时才擦除；"
+        "replay（layer_major 默认，第 5.7 节）原地重写第 0 行到最后写入的行，包括无效页和填充页（不得跳跃），需要一段的 HBM 副本。"
+        "--refresh-idle evict 时段内的空闲缓存条目直接丢弃（以后重算）。",
+        "回收：某分区空闲段少于低水位（默认 2 段 + 一个最大请求的段数）时，选需要搬移的页最少的段（贪心；相同时选数据最老的），"
+        "先驱逐其中的空闲条目（整条丢弃，记为重算 token），再把活跃页搬到前沿（compaction）；--reclaim compact 时空闲条目也搬移。"
+        "准入时为请求预留全部预计页数（prefill + 解码）和低水位减一段；做不到时先强制回收，仍放不下就排队。",
+        "磨损分配：none 取编号最小的空闲段，dynamic 取 PEC 最小的空闲段，ideal 同 dynamic。只在空闲段之间均衡，"
+        "不搬移冷数据（没有静态磨损均衡），所以容量被空闲缓存占满时最大 PEC 会远高于平均。"
+        "新条目放在有效页最少的分区，相同时选磨损最少的分区（wear none 时选编号最小的）。",
+        "hbm_decode 的会话：上一次调用生成的 KV 不写入 HBF，由下一次调用的 prompt 一起写入（偏保守）。"
+        "被驱逐的会话历史在下一次调用时整段重算并重写。",
+        "vllm_pool 只有解析模式（--analytic）；事件模拟不支持。",
+    ]
+    return out
+
+
+def _analytic_assumptions():
     items = [
         "写入顺序：NAND 块内地址连续、不得跳跃，写页 0（WL-0、STR-0）时自动擦除该块（OCP v0.7.0 第 5.4.1 节第 4、5、9 条）。"
         "第 4 条的“主机通道分配的全局地址范围内不得跳跃”按每个 NAND 块理解（与第 9 条和第 11.5.2.6 节一致）；"
@@ -2144,7 +2375,7 @@ def main(argv=None):
     try:
         config = configure(args)
         run(directory, **config)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, CapacityError) as error:
         parser.error(str(error))
     print(Path(directory).resolve())
 
