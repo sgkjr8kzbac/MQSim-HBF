@@ -498,58 +498,20 @@ class GroupedLayout(Layout):
                 "hbm_tier_bytes_per_request": round((hbm_stored + hbm_copies) / self.requests)}
 
 
+def layer_head_specs(layout, layer):
+    """Per-head tensor specs read in ``layer`` of a ``GroupedLayout``, in sorted head order."""
+    by_head = {}
+    for spec, heads in layout.layer_reads[layer]:
+        for head in heads:
+            by_head.setdefault(head, []).append(spec)
+    return [(head, by_head[head]) for head in sorted(by_head)]
+
+
 def generate_grouped(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, select_tokens=16):
-    """Accesses of a grouped layout: ``dense``, ``uniform_tokens`` or ``sink_recent`` (as ``access.generate``).
-
-    Selection modes clip each head's selected tokens to every tensor's window and read meta and
-    HBM-tier tensors whole, so a local window under ``uniform_tokens`` is read sparsely too.
-    """
-    if mode not in GROUP_MODES:
-        raise ValueError(f"--kv-spec supports the modes {', '.join(GROUP_MODES)}")
-    shape = layout.shape
-    if steps <= 0 or not 0 < fraction <= 1 or count <= 0 or type(select_tokens) is not int or select_tokens <= 0:
-        raise ValueError("Invalid generator parameters")
-    rng, windows = Random(seed), layout.windows
-
-    def whole(step, layer, head, spec):
-        return Access(step, layer, head, spec.name, "R", *windows[spec.name], spec.bits)
-
-    def clipped(step, layer, head, spec, lo, hi):
-        lo, hi = max(lo, windows[spec.name][0]), min(hi, windows[spec.name][1])
-        return [Access(step, layer, head, spec.name, "R", lo, hi, spec.bits)] if lo < hi else []
-
-    for step in range(steps):
-        for layer in range(shape.layers):
-            by_head = {}
-            for spec, heads in layout.layer_reads[layer]:
-                for head in heads:
-                    by_head.setdefault(head, []).append(spec)
-            for head in sorted(by_head):
-                specs = by_head[head]
-                always = [s for s in specs if s.role == "meta" or s.tier == "hbm"]
-                if mode == "dense":
-                    for spec in specs:
-                        yield whole(step, layer, head, spec)
-                    continue
-                if mode == "uniform_tokens":
-                    blocks = -(-shape.context // select_tokens)
-                    picked = sorted(rng.sample(range(blocks), share(blocks, fraction)))
-                    for block in picked:
-                        lo, hi = block * select_tokens, min((block + 1) * select_tokens, shape.context)
-                        for spec in specs:
-                            if spec not in always:
-                                yield from clipped(step, layer, head, spec, lo, hi)
-                else:  # sink_recent
-                    recent = max(1, round(shape.context * fraction))
-                    sink = min(count, shape.context - recent)
-                    for spec in specs:
-                        if spec in always:
-                            continue
-                        if sink > 0:
-                            yield from clipped(step, layer, head, spec, 0, sink)
-                        yield from clipped(step, layer, head, spec, shape.context - recent, shape.context)
-                for spec in always:
-                    yield whole(step, layer, head, spec)
+    """Delegate grouped access generation to the unified core ``synthetic.generate``."""
+    from ...frontend.trace.synthetic import generate
+    return generate(cfg, layout, mode, steps=steps, seed=seed, fraction=fraction,
+                    count=count, select_tokens=select_tokens)
 
 
 def spec_meta(spec):

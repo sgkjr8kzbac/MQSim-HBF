@@ -265,7 +265,7 @@ def phase_a(directory, model, gpu, kv_format, batch, context, *, mode="dense", g
     elif kv_spec_obj is not None:
         layout = kvspec_hook.GroupedLayout(cfg, shape, kv_spec_obj, tensors or default_tensors(shape),
                                            requests=batch, intra="striped")
-        accesses = list(kvspec_hook.generate_grouped(cfg, layout, mode, **{key: gen[key] for key in (
+        accesses = list(generate(cfg, layout, mode, **{key: gen[key] for key in (
             "steps", "seed", "fraction", "count", "select_tokens")}))
     else:
         layout = LAYOUTS["striped_contiguous"](cfg, shape, tensors=tensors)

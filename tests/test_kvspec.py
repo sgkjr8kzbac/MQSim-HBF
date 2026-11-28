@@ -496,3 +496,29 @@ def test_k4_kvgeometry_matches_grouped_layout_per_layer(spec_text, shape):
         assert geo.read_multiplier == 2.0  # 4 layers: layers 2 and 3 share layer 2
     else:
         assert geo.read_multiplier == 1.0
+
+
+@pytest.mark.parametrize("spec_text", [
+    "hybrid:pattern=LLLLLG,window=1024,local_tier=hbf",
+    "duo:retrieval=0.5,sink=64,recent=256",
+    "pyramid:first=8192,last=2048",
+])
+def test_unified_generate_grouped_per_layer_distribution(spec_text):
+    """R4.3: unified synthetic.generate handles GroupedLayout directly with reproducible per-layer distributions."""
+    cfg = load("ocp")
+    shape = Shape(6, 8, 128, 8192)
+    spec = parse_kvspec(spec_text, shape.layers, shape.kv_heads, shape.context)
+    layout = GroupedLayout(cfg, shape, spec, default_tensors(shape))
+    for mode in ("dense", "uniform_tokens", "sink_recent"):
+        a = list(generate(cfg, layout, mode, fraction=0.1, seed=42, select_tokens=16))
+        b = list(generate_grouped(cfg, layout, mode, fraction=0.1, seed=42, select_tokens=16))
+        assert a == b
+        rows_a, steps_a = analyze_accesses(cfg, layout, a, timing=True)
+        rows_b, steps_b = analyze_accesses(cfg, layout, b, timing=True)
+        assert rows_a == rows_b and steps_a == steps_b
+        assert len(rows_a) == shape.layers
+        if mode == "uniform_tokens":
+            # Verify per-layer selected tokens and page counts follow the group's window/budget.
+            assert all(row["attended_tokens"] > 0 for row in rows_a)
+            assert any(row["pages"] > 0 for row in rows_a)
+

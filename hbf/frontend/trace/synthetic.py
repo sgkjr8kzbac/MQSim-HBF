@@ -1,4 +1,4 @@
-"""Seeded synthetic access generators (dense, sparse selection, stage-0 probes, registered modes)."""
+"""Seeded synthetic access generators (dense, sparse selection, stage-0 probes, grouped & registered modes)."""
 from math import ceil
 from random import Random
 
@@ -24,9 +24,13 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
              hot_fraction=.5, hot_units=1, select_tokens=16,
              select_static=False, reuse=0.0, query_groups=1, full_tensors=(),
              channels=None, channel_groups=()):
-    """Seeded accesses of one workload mode (built-in or extension-registered)."""
+    """Seeded accesses of one workload mode (plain or grouped layout, built-in or registered mode)."""
     from ...registry import REGISTRY, ensure_loaded
     ensure_loaded()
+    grouped_hook = REGISTRY.get_hook("grouped_access")
+    is_grouped = grouped_hook is not None and grouped_hook.is_grouped(layout)
+    if is_grouped and mode not in grouped_hook.supported_modes:
+        raise ValueError(f"--kv-spec supports the modes {', '.join(grouped_hook.supported_modes)}")
     if mode not in REGISTRY.modes:
         if mode in ("channel_select",):
             raise REGISTRY.missing_error("mode", mode)
@@ -62,7 +66,11 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
         return
 
     windows = layout.windows
-    always = [spec for spec in layout.all_tensors if spec.role == "meta" or spec.tier == "hbm" or spec.name in full]
+
+    def iter_head_specs(layer):
+        if is_grouped:
+            return grouped_hook.layer_head_specs(layout, layer)
+        return ((head, layout.all_tensors) for head in range(shape.kv_heads))
 
     def pick_blocks(blocks, pick_n, step, key, prev):
         if k5 is not None:
@@ -79,11 +87,13 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
     if mode == "uniform_tokens":
         blocks = -(-shape.context // select_tokens)
         pick_n = share(blocks, eff_fraction)
-        selective = [spec for spec in layout.tensors if spec.role != "meta" and spec.name not in full]
         prev = {}
         for step in range(steps):
             for layer in range(shape.layers):
-                for head in range(shape.kv_heads):
+                for head, specs in iter_head_specs(layer):
+                    always = [s for s in specs if s.role == "meta" or s.tier == "hbm" or s.name in full]
+                    always_set = set(always)
+                    selective = [s for s in specs if s not in always_set]
                     picked, reused = pick_blocks(blocks, pick_n, step, (layer, head), prev)
                     for block in picked:
                         lo, hi = block * select_tokens, min((block + 1) * select_tokens, shape.context)
@@ -93,29 +103,37 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
                     for spec in always:
                         yield whole(step, layer, head, spec)
         return
+
     if mode == "sink_recent":
         recent = max(1, round(shape.context * fraction))
         for step in range(steps):
             for layer in range(shape.layers):
-                for head in range(shape.kv_heads):
-                    for spec in layout.all_tensors:
-                        if spec in always:
+                for head, specs in iter_head_specs(layer):
+                    always = [s for s in specs if s.role == "meta" or s.tier == "hbm" or s.name in full]
+                    always_set = set(always)
+                    sink = min(count, shape.context - recent)
+                    for spec in specs:
+                        if spec in always_set:
                             yield whole(step, layer, head, spec)
                             continue
-                        sink = min(count, shape.context - recent)
                         if sink > 0:
                             yield from clipped(step, layer, head, spec, 0, sink)
                         yield from clipped(step, layer, head, spec, shape.context - recent, shape.context)
         return
-    if mode in {"dense", "uniform_pages"}:
+
+    if mode == "dense":
+        for step in range(steps):
+            for layer in range(shape.layers):
+                for head, specs in iter_head_specs(layer):
+                    for spec in specs:
+                        yield whole(step, layer, head, spec)
+        return
+
+    if mode == "uniform_pages":
         prev = {}
         for step in range(steps):
             for layer in range(shape.layers):
                 for head in range(shape.kv_heads):
-                    if mode == "dense":
-                        for spec in layout.all_tensors:
-                            yield whole(step, layer, head, spec)
-                        continue
                     for t, spec in enumerate(layout.tensors):
                         if spec.role == "meta" or spec.name in full:
                             yield whole(step, layer, head, spec)

@@ -191,7 +191,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         layout = kvspec_hook.GroupedLayout(cfg, shape, kv_spec, tensors or default_tensors(shape),
                                            requests=requests[0] if isinstance(requests, tuple) else 1,
                                            intra="striped" if layout_name == "striped_contiguous" else "contiguous")
-        accesses = list(kvspec_hook.generate_grouped(cfg, layout, mode, **{key: generation[key] for key in (
+        accesses = list(generate(cfg, layout, mode, **{key: generation[key] for key in (
             "steps", "seed", "fraction", "count", "select_tokens")}))
     else:
         layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
