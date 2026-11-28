@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from .access import LAYOUTS, MODES, Shape, generate, parse_tensors, read_access, tensors_meta, write_access
+from .access import (LAYOUTS, MODES, Shape, default_tensors, generate, parse_tensors, read_access, tensors_meta,
+                     write_access)
 from .analysis import ENGINES, GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule_run, unwritten_reads
@@ -138,7 +139,7 @@ def subbatch_count(layer_rows, plane_groups):
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
              placement="static", protocol=None, engine="auto", timing=False, system=None, kv_format=None,
-             requests=None, check_writes=False):
+             requests=None, check_writes=False, kv_spec=None):
     """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None.
 
     Without MQSim and with static placement the analysis needs no request schedule, so the numpy
@@ -152,7 +153,13 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     } | (generation or {})
     from .batch import BatchSpec, PageTableLayout, check_write_order, generate_batch, place_batch
     placed = isinstance(requests, BatchSpec) and not requests.default
-    if placed:
+    if kv_spec is not None:  # layer and head groups (hbf/kvspec.py)
+        from .kvspec import GroupedLayout, generate_grouped, spec_meta
+        layout = GroupedLayout(cfg, shape, kv_spec, tensors or default_tensors(shape),
+                               requests=requests[0] if isinstance(requests, tuple) else 1,
+                               intra="striped" if layout_name == "striped_contiguous" else "contiguous")
+        accesses = list(generate_grouped(cfg, layout, mode, **generation))
+    elif placed:
         per_request = Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context)
         layout = PageTableLayout(cfg, per_request, requests, tensors=tensors)
         accesses = list(generate_batch(cfg, layout, mode, **{key: generation[key] for key in (
@@ -177,7 +184,9 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     system_meta = None
     if system is not None:
         contexts = [r.context for r in requests.requests] if isinstance(requests, BatchSpec) else None
-        system_meta = request_bytes(cfg, layout, system["heads"], contexts) | {
+        stored = layout.request_bytes(cfg) if kv_spec is not None else request_bytes(cfg, layout, system["heads"],
+                                                                                         contexts)
+        system_meta = stored | {
             "model": system["model"].name, "gpu": system["gpu"].name, "batch": system["batch"],
             "stacks": system["stacks"], "analysis_batch": system["analysis_batch"], "selection": system["selection"],
             "kv_format": kv_format.name if kv_format else "tensors" if tensors else "bf16",
@@ -201,7 +210,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                    f"every LPA in [{layout.base}, {layout.base + layout.span}) in order",
                                    "placement": placement,
                                    "protocol": None if protocol is None else asdict(protocol),
-                                   "argv": sys.argv})
+                                   "argv": sys.argv} | ({} if kv_spec is None else {"kv_spec": spec_meta(kv_spec)}))
     if prefill_layout and any(access.op == "W" for access in accesses):
         raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
     needs_schedule = (binary is not None or placement == "mqsim" or engine == "python" or prefill_layout
@@ -250,6 +259,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         report += report_lines(outcome) + [""]
         if fmt and fmt.notes:
             report += ["KV 格式假设：", ""] + [f"- {note}" for note in fmt.notes] + [""]
+    if kv_spec is not None:
+        report += [f"KV 分组 `{kv_spec.name}` 的假设：", ""] + [f"- {note}" for note in kv_spec.notes] + [""]
     result = None
     if binary is not None:
         result = simulate(cfg, batches, directory, binary, physical=physical)
@@ -295,6 +306,8 @@ def build_parser():
     parser.add_argument("--format", dest="kv_format",
                         help="named KV storage format NAME[:key=value,...]: bf16, fp8, int4, int2, kivi4, kivi2 "
                              "(group, residual, think), think (ratio), quest (page); see hbf/formats.py")
+    parser.add_argument("--kv-spec", help="layer and head groups PRESET[:key=value,...]: hybrid, ssm, cla, yoco, duo, "
+                        "pyramid (see hbf/kvspec.py); generated modes dense, uniform_tokens, sink_recent only")
     parser.add_argument("--tensors", help="JSON list or file of stored tensor formats, "
                         'e.g. \'[{"name":"K","bits":2,"dims":128},{"name":"V","bits":16,"dims":128}]\'; '
                         "default BF16 K and V with head_dim channels")
@@ -490,6 +503,15 @@ def configure(args):
     spec, context = batch_spec(args, per_stack)
     if context != shape.context:  # --contexts sets the stored context (equal prompts keep phase A's path)
         shape = Shape(shape.layers, shape.kv_heads, shape.head_dim, context)
+    kv_spec = None
+    if args.kv_spec is not None:
+        from .kvspec import GROUP_MODES, parse_kvspec
+        if (spec is not None or args.access_csv is not None or args.mode not in GROUP_MODES
+                or args.layout not in ("layer_contiguous", "striped_contiguous")):
+            raise ValueError("--kv-spec works with generated modes dense, uniform_tokens and sink_recent, the "
+                             "layer_contiguous or striped_contiguous layout, and without request placement or "
+                             "--access-csv")
+        kv_spec = parse_kvspec(args.kv_spec, layers, heads, shape.context)
     if spec is not None:
         if not args.analysis_only or args.access_csv is not None or args.prefill:
             raise ValueError("Request placement (--alloc, --contexts, --generated, --check-writes) is analysis only, "
@@ -500,7 +522,7 @@ def configure(args):
             "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": args.prefill,
             "placement": args.placement, "protocol": protocol, "engine": args.engine,
             "timing": args.timing or system is not None, "system": system, "kv_format": kv_format,
-            "requests": requests, "check_writes": args.check_writes}
+            "requests": requests, "check_writes": args.check_writes, "kv_spec": kv_spec}
 
 
 def main(argv=None):

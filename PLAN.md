@@ -29,7 +29,7 @@
 | 2A | 读路径：numpy 分析引擎（M7）、读时间估计（M0）、压缩格式（M3）、GPU 与系统模型（M1）、扫描脚本；第 1、2 项实验与第 5 项读路径 | ✅ 完成 |
 | 2B | 写路径与寿命：请求放置与写顺序检查（M2）、写入与刷新对读的干扰（M5）、寿命模型（M4）；第 3、4 项实验与第 5 项写路径 | 🔄 进行中 |
 | 2C | 真实访问轨迹：真实模型导出（M6）与方法适配器 | ⏳ 未开始（需要 GPU） |
-| 3 | 按 KV 大小公式逐项压缩：页格式（MLA、DSA、量化参数同页）、按层/按头分组（混合注意力、跨层共享、DuoAttention、PyramidKV）、模型预设、token 淘汰与写入流、部分通道读、前缀共享；分支 `claude/hbf-kv-terms` | 🔄 设计已定，K1 开发中 |
+| 3 | 按 KV 大小公式逐项压缩：页格式（MLA、DSA、量化参数同页）、按层/按头分组（混合注意力、跨层共享、DuoAttention、PyramidKV）、模型预设、token 淘汰与写入流、部分通道读、前缀共享；分支 `claude/hbf-kv-terms` | 🔄 K1、K2 完成；接手说明见 [docs/handoff.md](docs/handoff.md) |
 
 ### 第 2 阶段 B 的进度
 
@@ -109,7 +109,7 @@ KV 大小 = 2（K、V）× 层数 × KV 头数 × head_dim × token 数 × 每�
 | T-C2 | KIVI、StreamingLLM 的确定性适配器 | 新文件 | — | 与 `--format kivi2`、`--mode sink_recent` 的结果一致 | ⏳ 可认领 |
 | T-3a | 量化参数与数据同页的布局 | 并入 T-K1 | — | — | ➡️ T-K1 |
 | T-K1 | 页格式：`TensorSpec` 加 `attn_dims`、`logical_dims`；预设 `mla[:split,indexer]`、`mla_fp8`，int/kivi 的 `fused=1[,pow2=1]` | `hbf/access.py`（TensorSpec）、`hbf/formats.py`、`hbf/pages.py`、`tests/test_formats.py` | — | 设计 §3 K1 的手算值；黄金文件和引擎对照不变 | ✅ 主代理完成，待子代理审查 |
-| T-K2 | KV 分组：`hbf/kvspec.py`、`GroupedLayout`、`--kv-spec`（hybrid、ssm、cla、yoco、duo、pyramid）、无读层补零行 | `hbf/kvspec.py`（新）、`hbf/cli.py`、`tests/test_kvspec.py` | — | 设计 §3 K2 的手算值；不加 `--kv-spec` 时逐位不变 | ⏳ 可认领 |
+| T-K2 | KV 分组：`hbf/kvspec.py`、`GroupedLayout`、`--kv-spec`（hybrid、ssm、cla、yoco、duo、pyramid）、无读层补零行 | `hbf/kvspec.py`（新）、`hbf/cli.py`、`tests/test_kvspec.py` | — | 设计 §3 K2 的手算值；不加 `--kv-spec` 时逐位不变 | ✅ 主代理完成，待子代理审查 |
 | T-K3 | 模型预设：MLA、混合注意力、MoE（只计线性层时间） | `hbf/model.py`、`hbf/system.py`、`hbf/configs/models.json` | T-K2 的 `from_model` 接口 | 参数总量与公开值相差 < 1%，出处写进 params.md；现有预设的 TPOT 不变 | ⏳ |
 | T-K5 | 选择的真实性：存储密度、静态选择、相邻步复用、GQA 并集 | `hbf/access.py`（generate）、`hbf/pages.py`、`hbf/controller.py`（拒绝） | T-K1 | 设计 §3 K5 的手算值 | ⏳ |
 | T-K4 | token 流（写入、死亡、重写）与寿命模型接口 | `hbf/kvspec.py`；事件模拟合并后改 `hbf/endurance.py` | T-K2、T-B1d | 设计 §3 K4 的手算值；现有寿命结果不变 | ⏳ |

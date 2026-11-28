@@ -153,7 +153,7 @@ class Access:
             0 <= self.kv_head < shape.kv_heads and
             self.op in {"R", "W"} and layout.windows[self.kind][0] <= self.token_start < self.token_end
             <= layout.windows[self.kind][1] and self.bits == spec.bits
-        ):
+        ) or (hasattr(layout, "reads") and not layout.reads(self.layer, self.kind, self.kv_head)):
             raise ValueError(f"Invalid logical access: {self}")
 
 
