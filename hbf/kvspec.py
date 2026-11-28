@@ -68,12 +68,42 @@ class KVGroup:
             raise ValueError(f"Group {self.name}: an alias maps a consumer layer to an owner layer of the group")
 
 
+def _scales_with_context(window):
+    """True if ``window`` grows linearly with context length (unbounded or [0, ctx - R))."""
+    lo, hi = window or (None, None)
+    return (lo is None or lo >= 0) and (hi is None or hi < 0)
+
+
 @dataclass(frozen=True)
 class KVSpec:
     name: str
     params: dict
     groups: tuple
     notes: tuple = field(default_factory=tuple)
+
+    def bytes_per_token(self, heads, tensors=None, *, tier=None, include_windowed=False):
+        """Stored KV bytes per token across owner layers for context-scaling groups/tensors.
+
+        Fixed-size tensors (SSM state ``(0, 1)``, sliding-window local layers ``(-W, None)``,
+        bounded budgets, KIVI HBM residuals) are excluded unless ``include_windowed=True``.
+        """
+        total = 0
+        for group in self.groups:
+            if not include_windowed and (group.budget is not None or not _scales_with_context(group.window)):
+                continue
+            group_tensors = group.tensors if group.tensors is not None else tensors
+            if group_tensors is None:
+                raise ValueError(f"Group {group.name} has no tensors; pass tensors or build the spec with from_model")
+            owners = len(group.layers) - len(group.alias)
+            g_heads = (group.heads[1] - group.heads[0]) if group.heads is not None else heads
+            for spec in group_tensors:
+                effective_tier = group.tier or spec.tier
+                if tier is not None and effective_tier != tier:
+                    continue
+                if not include_windowed and not _scales_with_context(spec.window):
+                    continue
+                total += owners * g_heads * spec.token_bytes
+        return total
 
 
 def parse_params(text):
@@ -186,6 +216,96 @@ def parse_kvspec(text, layers, heads, context):
     return KVSpec(name, p, tuple(groups), tuple(notes))
 
 
+def resolve_format(model, fmt):
+    """Resolve ``fmt`` (None, format string or KVFormat) for ``model``."""
+    from .formats import KVFormat, parse_format, parse_params as parse_fmt_params
+    if isinstance(fmt, KVFormat):
+        return fmt
+    q_heads = model.q_heads // model.kv_heads
+    if model.attention == "mla":
+        if fmt is None or fmt == "bf16":
+            name, given = "mla", {}
+        elif fmt == "fp8":
+            name, given = "mla_fp8", {}
+        elif isinstance(fmt, str):
+            name, _, rest = fmt.partition(":")
+            if name not in ("mla", "mla_fp8"):
+                raise ValueError(f"MLA model {model.name} requires bf16, fp8, mla or mla_fp8 format, not {fmt!r}")
+            given = parse_fmt_params(rest)
+        else:
+            raise ValueError(f"Invalid KV format {fmt!r}")
+        params = {"lora": model.kv_lora_rank, "rope": model.rope_dim} | given
+        text = f"{name}:" + ",".join(f"{key}={value}" for key, value in params.items())
+        return parse_format(text, model.head_dim, q_heads)
+    if fmt is None:
+        fmt = "bf16"
+    if not isinstance(fmt, str):
+        raise ValueError(f"Invalid KV format {fmt!r}")
+    return parse_format(fmt, model.head_dim, q_heads)
+
+
+_resolve_format = resolve_format
+
+
+def from_model(model, fmt="bf16", local_tier="hbm", *, tensors=None):
+    """Build a self-contained ``KVSpec`` from a ``ModelSpec`` (or preset name) and KV format.
+
+    Sliding-window local KV defaults to HBM (``local_tier="hbm"``; pass ``"hbf"`` as an
+    experiment variant). MLA models default to the latent format matching ``kv_lora_rank`` and
+    ``rope_dim``; SSM hybrid models emit fixed HBM state groups on ``S`` layers. When ``tensors``
+    is provided, attention groups use those tensor specs directly instead of resolving ``fmt``.
+    """
+    if isinstance(model, str):
+        from .model import load_model
+        model = load_model(model)
+    tier = _tier(local_tier, "local_tier")
+    if tensors is not None:
+        group_tensors = tuple(tensors)
+        if not group_tensors:
+            raise ValueError("tensors must be nonempty")
+        fmt_name = "tensors"
+        notes = []
+    else:
+        kv_fmt = resolve_format(model, fmt)
+        group_tensors = kv_fmt.tensors
+        fmt_name = kv_fmt.name
+        notes = list(kv_fmt.notes)
+    every = tuple(range(model.layers))
+    if not model.layer_pattern:
+        name = "mla" if model.attention == "mla" else "model"
+        params = {"model": model.name, "format": fmt_name}
+        groups = (KVGroup("kv", every, tensors=group_tensors),)
+        return KVSpec(name, params, groups, tuple(notes))
+    letters = set(model.layer_pattern)
+    if letters <= {"L", "G"}:
+        kinds = _pattern(model.layer_pattern, "LG", model.layers)
+        local = tuple(l for l in every if kinds[l] == "L")
+        full = tuple(l for l in every if kinds[l] == "G")
+        groups = []
+        if local:
+            groups.append(KVGroup("local", local, tensors=group_tensors,
+                                  window=(-model.window, None), tier=tier))
+        if full:
+            groups.append(KVGroup("global", full, tensors=group_tensors))
+        notes.append(f"局部层（{len(local)} 层）只保留最近 {model.window} 个 token，放在 {'HBM' if tier else 'HBF'}")
+        return KVSpec("hybrid", {"pattern": model.layer_pattern, "window": model.window, "local_tier": local_tier},
+                      tuple(groups), tuple(notes))
+    if letters <= {"S", "A"}:
+        kinds = _pattern(model.layer_pattern, "SA", model.layers)
+        attention = tuple(l for l in every if kinds[l] == "A")
+        recurrent = tuple(l for l in every if kinds[l] == "S")
+        groups = []
+        if attention:
+            groups.append(KVGroup("attn", attention, tensors=group_tensors))
+        if recurrent:
+            groups.append(KVGroup("ssm", recurrent, heads=(0, 1),
+                                  tensors=(TensorSpec("state", 8, model.ssm_state_bytes, (0, 1), "hbm", "aux"),)))
+        notes.append(f"SSM/线性注意力层（{len(recurrent)} 层）每个请求每层读 {model.ssm_state_bytes} B 固定状态（HBM），不存 KV")
+        return KVSpec("ssm", {"pattern": model.layer_pattern, "state": model.ssm_state_bytes},
+                      tuple(groups), tuple(notes))
+    raise ValueError(f"Unsupported layer_pattern {model.layer_pattern!r} on model {model.name}")
+
+
 def _absolute(window, context):
     lo, hi = window or (None, None)
     lo = 0 if lo is None else max(0, lo + context) if lo < 0 else min(lo, context)
@@ -289,6 +409,8 @@ class GroupedLayout(Layout):
         names = [s.name for s in flat]
         if not flat or len(set(names)) != len(names):
             raise ValueError("A KV spec needs uniquely named tensors")
+        if any(s.density != 1 for s in flat):
+            raise ValueError("GroupedLayout does not yet support tensor density < 1")
         self.all_tensors = tuple(flat)
         self.tensors = tuple(s for s in flat if s.tier == "hbf")
         self.hbm_tensors = tuple(s for s in flat if s.tier == "hbm")
@@ -369,7 +491,7 @@ class GroupedLayout(Layout):
                 "hbm_tier_bytes_per_request": round((hbm_stored + hbm_copies) / self.requests)}
 
 
-def generate_grouped(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, select_tokens=16, **_):
+def generate_grouped(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, select_tokens=16):
     """Accesses of a grouped layout: ``dense``, ``uniform_tokens`` or ``sink_recent`` (as ``access.generate``).
 
     Selection modes clip each head's selected tokens to every tensor's window and read meta and

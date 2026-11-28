@@ -150,9 +150,14 @@ def _steps(layer_rows, layers):
     return {step: [steps[step][layer] for layer in range(layers)] for step in sorted(steps)}
 
 
-def linear_ns(params, batch, model, gpu):
-    """Roofline time of a weight-stationary matrix product over the batch: max(compute, weight bytes)."""
-    return max(2 * batch * params / gpu.flops, params * model.weight_bytes / gpu.bandwidth) * NS
+def linear_ns(params, batch, model, gpu, byte_params=None):
+    """Roofline time of a weight-stationary matrix product over the batch: max(compute, weight bytes).
+
+    For MoE layers ``params`` is the active parameter count (per-token FLOPs) and ``byte_params``
+    is the expected parameter count touched across the batch (weight bytes read from HBM).
+    """
+    bytes_ = params if byte_params is None else byte_params
+    return max(2 * batch * params / gpu.flops, bytes_ * model.weight_bytes / gpu.bandwidth) * NS
 
 
 def lm_head_ns(model, gpu, batch):
@@ -199,7 +204,9 @@ def evaluate(layer_rows, model, gpu, options, meta):
                          f"selection is {meta['selection'] or 'not given'}")
     batch, scale = meta["batch"], meta["batch"] / meta["analysis_batch"]
     flops, vector, bandwidth = gpu.flops, gpu.vector, gpu.bandwidth
-    pre, post = linear_ns(model.pre_params, batch, model, gpu), linear_ns(model.post_params, batch, model, gpu)
+    pre = [linear_ns(model.layer_pre_params(layer), batch, model, gpu) for layer in range(model.layers)]
+    post = [linear_ns(model.layer_post_active_params(layer), batch, model, gpu,
+                      model.layer_post_touched_params(layer, batch)) for layer in range(model.layers)]
     head = lm_head_ns(model, gpu, batch)
     extra = head + model.layers * gpu.layer_overhead_ns
     group = model.q_heads // model.kv_heads
@@ -210,7 +217,7 @@ def evaluate(layer_rows, model, gpu, options, meta):
         for row in rows:
             elements = row["attended_elements"]
             if elements is None:
-                elements = (row["attn_dims"] or 2 * model.head_dim) * row["attended_tokens"]
+                elements = (row["attn_dims"] or model.default_attn_dims) * row["attended_tokens"]
             attn_flops = 2 * group * elements * scale
             dequant = row["dequant_ops"] * scale / vector * NS
             compute = attn_flops / flops * NS + dequant
@@ -221,26 +228,25 @@ def evaluate(layer_rows, model, gpu, options, meta):
                 "attn_flops": attn_flops,
             })
         attn = [term["attn_staged_ns" if options.staged else "attn_ns"] for term in terms]
-        work = sum(pre + a + post for a in attn)
+        work = sum(p + a + q for p, a, q in zip(pre, attn, post))
         tpot, waits, wait_share = {}, {}, {}
         for kind in ("est", "bound"):
             h = [row[f"{kind}_ns"] for row in rows]
             if any(value is None for value in h):
                 tpot[kind], waits[kind], wait_share[kind] = None, [None] * len(rows), None
                 continue
-            total, wait, per_layer = timeline(h, [pre] * len(h), attn, [post] * len(h), options.overlap,
-                                              options.staged)
+            total, wait, per_layer = timeline(h, pre, attn, post, options.overlap, options.staged)
             tpot[kind] = total + extra
             waits[kind] = per_layer or [None] * len(rows)
             wait_share[kind] = wait / total if total else 0.0
         # HBM baseline: the same compute with all KV bytes read from HBM (= a_l_staged).
-        hbm_tpot = sum(pre + term["attn_staged_ns"] + post for term in terms) + extra
+        hbm_tpot = sum(p + term["attn_staged_ns"] + q for p, term, q in zip(pre, terms, post)) + extra
         for layer, (row, term) in enumerate(zip(rows, terms)):
             layer_out.append({
                 "step": step, "layer": layer, "hbf_est_ns": row["est_ns"], "hbf_bound_ns": row["bound_ns"],
-                "pre_ns": pre, "attn_compute_ns": term["attn_compute_ns"], "dequant_ns": term["dequant_ns"],
-                "attn_ns": term["attn_ns"], "attn_staged_ns": term["attn_staged_ns"], "post_ns": post,
-                "hbm_layer_ns": pre + term["attn_staged_ns"] + post, "attn_flops": term["attn_flops"],
+                "pre_ns": pre[layer], "attn_compute_ns": term["attn_compute_ns"], "dequant_ns": term["dequant_ns"],
+                "attn_ns": term["attn_ns"], "attn_staged_ns": term["attn_staged_ns"], "post_ns": post[layer],
+                "hbm_layer_ns": pre[layer] + term["attn_staged_ns"] + post[layer], "attn_flops": term["attn_flops"],
                 "wait_est_ns": waits["est"][layer], "wait_bound_ns": waits["bound"][layer],
             })
         buffer = ((options.depth + 1) * max(row["burst_bytes"] for row in rows) * scale
@@ -261,8 +267,11 @@ def evaluate(layer_rows, model, gpu, options, meta):
             "hbm_fits": None if kv is None else weights + batch * kv <= gpu.hbm_capacity,
             "hbm_fits_hbf": weights + batch * meta["hbm_tier_bytes_per_request"] + buffer <= gpu.hbm_capacity,
         })
+    pre_avg = pre[0] if len(set(pre)) == 1 else sum(pre) / len(pre)
+    post_avg = post[0] if len(set(post)) == 1 else sum(post) / len(post)
     context = {"model": model, "gpu": gpu, "options": options, "meta": meta, "scale": scale,
-               "pre_ns": pre, "post_ns": post, "lm_head_ns": head, "weights_bytes": weights,
+               "pre_ns": pre_avg, "post_ns": post_avg, "pre_layer_ns": pre, "post_layer_ns": post,
+               "lm_head_ns": head, "weights_bytes": weights,
                "ridge_batch": model.weight_bytes * flops / (2 * bandwidth)}
     return SystemResult(layer_out, step_out, assumptions(context), context)
 
@@ -303,6 +312,14 @@ def assumptions(context):
         "未给 --ucie-grade 时不计主机链路。",
         "decode 追加写（新 token 的 KV 写入 HBF）以及 HBF 编程、擦除对读的干扰不计。",
     ]
+    if model.attention == "mla":
+        lines.append(f"MLA 吸收式解码：kv_lora_rank = {model.kv_lora_rank}、rope_dim = {model.rope_dim}，"
+                     f"每 token 每查询头注意 {model.default_attn_dims} 个元素；W_UK 计入 pre，W_UV 计入 post。")
+    if model.experts:
+        touched = model.experts_touched(batch)
+        lines.append(f"MoE（{model.experts} 路由专家 + {model.shared_experts} 共享专家，每 token 激活 {model.top_k} 个）："
+                     f"计算按每 token 激活专家计，权重读取按批内期望触达专家数 E(1−(1−k/E)^B) = {touched:.2f} "
+                     "加共享专家计；采用 DP-attention 设定（单卡持有所属请求的 KV，不计专家并行通信）。")
     if batch % stacks:
         lines.append(f"B mod N = {batch % stacks} ≠ 0：B/b 是平均近似，而 h 是最忙的 stack（b 个请求）的时间。")
     if options.mode == "serial" and not options.staged:

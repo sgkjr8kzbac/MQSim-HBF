@@ -114,38 +114,74 @@ def _union(group, lo, hi, scale):
     return length.astype(np.int64), runs.astype(np.int64)
 
 
-def layer_pages(cfg, layout, step, layer, rows):
+def layer_pages(cfg, layout, step, layer, rows, cached=None):
     """Pages of one (step, layer) from an (n, 4) int64 array of (head, tensor, token_start, token_end),
-    where tensor indexes ``layout.all_tensors``. HBM-tier rows become ``hbm_bytes``; every row counts
-    towards the tokens read per tensor (``tensor_tokens``, for dequantization) and data rows towards
-    ``attended_tokens``. ``attended_elements`` sums tokens x ``attended_dims`` (data tensors and any
-    tensor with ``attn_dims``), ``hbf_elements`` tokens x ``logical`` of HBF data tensors."""
+    where tensor indexes ``layout.all_tensors``. HBM-tier rows (and HBM-cached hits flagged by
+    ``cached``) become ``hbm_bytes``; every row counts towards the tokens read per tensor
+    (``tensor_tokens``, for dequantization) and data rows towards ``attended_tokens``.
+    ``attended_elements`` sums tokens x ``attended_dims`` (data tensors and any tensor with
+    ``attn_dims``), ``hbf_elements`` tokens x ``logical`` of HBF data tensors read from HBF.
+    Tensors with ``density < 1`` map logical tokens into compacted storage coordinates."""
     specs = layout.all_tensors
     head, g, lo, hi = rows.T
+    has_density = any(spec.density != 1 for spec in specs)
+    if has_density:
+        w_lo = np.asarray([layout.windows[spec.name][0] for spec in specs], dtype=np.int64)[g]
+        num = np.asarray([spec.density.numerator for spec in specs], dtype=np.int64)[g]
+        den = np.asarray([spec.density.denominator for spec in specs], dtype=np.int64)[g]
+        # Combining density < 1 with select_tokens=1 aliases 1/density logical tokens per compacted token.
+        c_lo = ((lo - w_lo) * num) // den
+        c_hi = ((hi - 1 - w_lo) * num) // den + 1
+        eff_lo, eff_hi = w_lo + c_lo, w_lo + c_hi
+    else:
+        eff_lo, eff_hi = lo, hi
     data = np.asarray([spec.role == "data" for spec in specs])[g]
-    attended = attended_tokens(head[data], lo[data], hi[data], layout.shape.context)
-    tensor_tokens = per_tensor_tokens(head, g, lo, hi, layout.shape.context, len(specs))
+    # attended_tokens assumes uniform density across data tensors on the same window;
+    # attended_elements uses per-tensor counts and is authoritative for system.py.
+    attended = attended_tokens(head[data], eff_lo[data], eff_hi[data], layout.shape.context)
+    tensor_tokens = per_tensor_tokens(head, g, eff_lo, eff_hi, layout.shape.context, len(specs))
     hbm = np.asarray([spec.tier == "hbm" for spec in specs])
-    hbm_bytes = sum(tensor_tokens[i] * specs[i].token_bytes for i in np.flatnonzero(hbm).tolist())
+    is_cached = None if cached is None else np.asarray(cached, dtype=bool)
+    hbf_cached = None if is_cached is None else (is_cached & ~hbm[g])
+    if hbf_cached is not None and hbf_cached.any():
+        hbf_read = ~hbm[g] & ~is_cached
+        hbf_tokens = per_tensor_tokens(head[hbf_read], g[hbf_read], eff_lo[hbf_read], eff_hi[hbf_read],
+                                       layout.shape.context, len(specs))
+        cached_tokens = tensor_tokens - hbf_tokens
+        hbm_bytes = (sum(tensor_tokens[i] * specs[i].token_bytes for i in np.flatnonzero(hbm).tolist())
+                     + sum(cached_tokens[i] * specs[i].token_bytes for i in np.flatnonzero(~hbm).tolist()))
+    else:
+        hbm_bytes = sum(tensor_tokens[i] * specs[i].token_bytes for i in np.flatnonzero(hbm).tolist())
+        hbf_tokens = tensor_tokens
     dequant = sum(tensor_tokens[i] * specs[i].logical * specs[i].dequant_ops for i in range(len(specs)))
     elements = sum(int(tensor_tokens[i]) * specs[i].attended_dims for i in range(len(specs))
                    if specs[i].attended_dims)
-    hbf_elements = sum(int(tensor_tokens[i]) * specs[i].logical for i in range(len(specs))
+    hbf_elements = sum(int(hbf_tokens[i]) * specs[i].logical for i in range(len(specs))
                        if specs[i].role == "data" and specs[i].tier == "hbf")
     hbf_index = np.asarray([layout.index.get(spec.name, -1) for spec in specs], dtype=np.int64)
-    keep = ~hbm[g]
-    head, t, lo, hi = head[keep], hbf_index[g[keep]], lo[keep], hi[keep]
+    keep = ~hbm[g] if is_cached is None else (~hbm[g] & ~is_cached)
+    head, t = head[keep], hbf_index[g[keep]]
     tpp = np.asarray(layout.tokens_per_page, dtype=np.int64)[t]
     origin = np.asarray(layout.window_starts, dtype=np.int64)[t]
-    first, last = (lo - origin) // tpp, (hi - 1 - origin) // tpp
+    if has_density:
+        rel_lo, rel_hi = c_lo[keep], c_hi[keep]
+        first, last = rel_lo // tpp, (rel_hi - 1) // tpp
+    else:
+        lo_h, hi_h = lo[keep], hi[keep]
+        first, last = (lo_h - origin) // tpp, (hi_h - 1 - origin) // tpp
     count = last - first + 1
     index = np.repeat(np.arange(len(t)), count)
     within = np.arange(int(count.sum()), dtype=np.int64) - np.repeat(np.cumsum(count) - count, count)
     block = first[index] + within
     tpp = tpp[index]
-    start = origin[index] + block * tpp
-    lo = np.maximum(lo[index], start) - start
-    hi = np.minimum(hi[index], start + tpp) - start
+    if has_density:
+        start = block * tpp
+        lo = np.maximum(rel_lo[index], start) - start
+        hi = np.minimum(rel_hi[index], start + tpp) - start
+    else:
+        start = origin[index] + block * tpp
+        lo = np.maximum(lo_h[index], start) - start
+        hi = np.minimum(hi_h[index], start + tpp) - start
     t, head = t[index], head[index]
     lpa = layout.lpa_array(layer, head, t, block)
     order = np.lexsort((lo, lpa))
@@ -199,6 +235,8 @@ def iter_layer_pages(cfg, layout, accesses):
     (its prefill and partial-page checks) and are not part of the read pages.
     """
     groups = defaultdict(lambda: array("q"))
+    cached_groups = defaultdict(lambda: array("b"))
+    has_cached = False
     writes = []
     index = {spec.name: g for g, spec in enumerate(layout.all_tensors)}
     for access in accesses:
@@ -206,10 +244,15 @@ def iter_layer_pages(cfg, layout, accesses):
         if access.op == "W":
             writes.append(access)
             continue
-        groups[access.step, access.layer].extend(
-            (access.kv_head, index[access.kind], access.token_start, access.token_end))
+        key = (access.step, access.layer)
+        groups[key].extend((access.kv_head, index[access.kind], access.token_start, access.token_end))
+        is_cached = access.op == "H"
+        if is_cached:
+            has_cached = True
+        cached_groups[key].append(is_cached)
     if writes:
         schedule(cfg, layout, writes)
     for step, layer in sorted(groups):
         rows = np.frombuffer(groups.pop((step, layer)), dtype=np.int64).reshape(-1, 4)
-        yield layer_pages(cfg, layout, step, layer, rows)
+        cached = np.frombuffer(cached_groups.pop((step, layer)), dtype=bool) if has_cached else None
+        yield layer_pages(cfg, layout, step, layer, rows, cached=cached)

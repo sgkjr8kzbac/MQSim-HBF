@@ -8,7 +8,7 @@ from hbf.access import LAYOUTS, Access, Shape, default_tensors, generate
 from hbf.analysis import analyze_accesses
 from hbf.cli import main
 from hbf.config import load
-from hbf.kvspec import GroupedLayout, KVGroup, KVSpec, generate_grouped, parse_kvspec
+from hbf.kvspec import GroupedLayout, KVGroup, KVSpec, from_model, generate_grouped, parse_kvspec
 from hbf.pages import iter_layer_pages
 
 HBF_FLAGS = ["--analysis-only", "--topology", "ocp", "--read-plane-ns", "0", "--coalesce-ns", "1", "--cache-read"]
@@ -215,3 +215,135 @@ def test_grouped_layout_engine_parity(spec_text, intra):
         expected = analyze(cfg, schedule(cfg, layout, accesses), (1, 16), protocol=protocol)
         actual = analyze_accesses(cfg, layout, accesses, (1, 16), protocol=protocol, engine="numpy")
         assert actual == expected
+
+
+# ---------------------------------------------------------------------------------------------
+# T-K3 from_model: exact KV bytes/token and GroupedLayout integration for MLA, hybrid, SSM.
+
+@pytest.mark.parametrize("name,expected_bpt", [
+    ("deepseek-v2-lite", 27 * 1152),              # 31,104 B (27 MLA layers x 576 BF16 dims)
+    ("qwen3-next-80b-a3b", 12 * 2 * 2 * 256 * 2), # 24,576 B (12 full-attn layers, 2 KV heads, d=256)
+    ("gpt-oss-120b", 18 * 8 * 2 * 64 * 2),        # 36,864 B (18 global layers, 8 KV heads, d=64)
+    ("gpt-oss-20b", 12 * 8 * 2 * 64 * 2),         # 24,576 B (12 global layers, 8 KV heads, d=64)
+    ("gemma-3-27b", 10 * 16 * 2 * 128 * 2),       # 81,920 B (10 global layers, 16 KV heads, d=128)
+    ("llama-3.1-8b", 32 * 8 * 2 * 128 * 2),       # 131,072 B (32 uniform layers)
+])
+def test_from_model_kv_bytes_per_token(name, expected_bpt):
+    from hbf.model import load_model
+    model = load_model(name)
+    spec = from_model(model)
+    assert spec.bytes_per_token(model.kv_heads) == expected_bpt
+    assert from_model(name).bytes_per_token(model.kv_heads) == expected_bpt
+
+
+def test_from_model_mla_formats_and_layout():
+    from hbf.model import load_model
+    cfg = load("ocp")
+    ds = load_model("deepseek-v2-lite")
+    bf16 = from_model(ds)
+    fp8 = from_model(ds, "fp8")
+    split = from_model(ds, "mla:split=1")
+    idx = from_model(ds, "mla:indexer=1")
+    assert bf16.bytes_per_token(ds.kv_heads) == 31_104
+    assert fp8.bytes_per_token(ds.kv_heads) == 27 * 656
+    assert split.bytes_per_token(ds.kv_heads) == 31_104
+    assert idx.bytes_per_token(ds.kv_heads) == 27 * (1152 + 132)
+    shape = Shape(ds.layers, ds.kv_heads, ds.head_dim, 3072)
+    layout = GroupedLayout(cfg, shape, bf16, default_tensors(shape))
+    rows, _ = analyze_accesses(cfg, layout, list(generate_grouped(cfg, layout, "dense")), timing=True)
+    assert len(rows) == 27 and layout.tokens_per_page == (3,)
+    assert all(row["pages"] == 1024 and row["attended_elements"] == 3072 * 1088 for row in rows)
+    with pytest.raises(ValueError, match="MLA model"):
+        from_model(ds, "kivi2")
+
+
+def test_from_model_hybrid_default_hbm_and_hbf_variant():
+    from hbf.model import load_model
+    cfg = load("ocp")
+    gpt = load_model("gpt-oss-120b")
+    spec_hbm = from_model(gpt)  # default local_tier="hbm"
+    spec_hbf = from_model(gpt, local_tier="hbf")
+    assert spec_hbm.params["local_tier"] == "hbm" and spec_hbf.params["local_tier"] == "hbf"
+    assert spec_hbm.bytes_per_token(gpt.kv_heads) == spec_hbf.bytes_per_token(gpt.kv_heads) == 36_864
+    shape = Shape(gpt.layers, gpt.kv_heads, gpt.head_dim, 4096)
+    lay_hbm = GroupedLayout(cfg, shape, spec_hbm, default_tensors(shape))
+    rows_hbm, _ = analyze_accesses(cfg, lay_hbm, list(generate_grouped(cfg, lay_hbm, "dense")), timing=True)
+    assert [row["pages"] for row in rows_hbm[:4]] == [0, 8 * 2 * 128, 0, 8 * 2 * 128]
+    assert [row["hbm_bytes"] for row in rows_hbm[:4]] == [8 * 2 * 128 * 128, 0, 8 * 2 * 128 * 128, 0]
+    lay_hbf = GroupedLayout(cfg, shape, spec_hbf, default_tensors(shape))
+    rows_hbf, _ = analyze_accesses(cfg, lay_hbf, list(generate_grouped(cfg, lay_hbf, "dense")), timing=True)
+    assert [row["pages"] for row in rows_hbf[:4]] == [8 * 2 * 4, 8 * 2 * 128, 8 * 2 * 4, 8 * 2 * 128]
+    assert all(row["hbm_bytes"] == 0 for row in rows_hbf)
+    # Gemma-3-27B: 52 local (W=1,024) + 10 global layers.
+    gemma = load_model("gemma-3-27b")
+    g_spec = from_model(gemma)
+    assert len(g_spec.groups[0].layers) == 52 and len(g_spec.groups[1].layers) == 10
+    assert g_spec.groups[0].tier == "hbm" and g_spec.groups[0].window == (-1024, None)
+    with pytest.raises(ValueError, match="local_tier"):
+        from_model(gpt, local_tier="ssd")
+
+
+def test_from_model_ssm_emits_state_and_attention_groups():
+    from hbf.model import load_model
+    cfg = load("ocp")
+    qn = load_model("qwen3-next-80b-a3b")
+    spec = from_model(qn)
+    assert spec.name == "ssm" and spec.bytes_per_token(qn.kv_heads) == 24_576
+    shape = Shape(qn.layers, qn.kv_heads, qn.head_dim, 2048)
+    layout = GroupedLayout(cfg, shape, spec, default_tensors(shape))
+    rows, _ = analyze_accesses(cfg, layout, list(generate_grouped(cfg, layout, "dense")), timing=True)
+    assert len(rows) == 48
+    # Pattern SSSA: layers 0,1,2 are SSM (0 HBF pages, 2 MiB HBM state), layer 3 is full attention (2*2*256 pages).
+    assert [row["pages"] for row in rows[:4]] == [0, 0, 0, 2 * 2 * 256]
+    assert [row["hbm_bytes"] for row in rows[:4]] == [2_097_152, 2_097_152, 2_097_152, 0]
+    assert [row["attended_elements"] for row in rows[:4]] == [0, 0, 0, 2 * 2048 * 512]
+
+
+def test_cli_mla_format_and_hybrid_tensors_integration(tmp_path):
+    from fractions import Fraction
+    from hbf.access import TensorSpec
+    from hbf.kvspec import resolve_format
+    from hbf.model import load_model
+
+    # MLA --model with --format fp8 / bf16 resolves through resolve_format; incompatible formats raise.
+    ds = load_model("deepseek-v2-lite")
+    assert resolve_format(ds, "fp8").name == "mla_fp8"
+    assert resolve_format(ds, "bf16").name == "mla"
+    for fmt, expected_tpp, expected_name in (("fp8", 6, "mla_fp8"), ("bf16", 3, "mla")):
+        out = tmp_path / f"ds-{fmt}"
+        main(HBF_FLAGS + ["--model", "deepseek-v2-lite", "--format", fmt, "--context", "1024",
+                          "--output", str(out)])
+        meta = json.loads((out / "meta.json").read_text())
+        assert meta["format"]["name"] == expected_name
+        (first, *_) = csv.DictReader((out / "analysis_layers.csv").open())
+        assert int(first["pages"]) == -(-1024 // expected_tpp)
+    bad_mla = tmp_path / "ds-kivi2"
+    with pytest.raises(SystemExit):
+        main(HBF_FLAGS + ["--model", "deepseek-v2-lite", "--format", "kivi2", "--context", "1024",
+                          "--output", str(bad_mla)])
+    assert not bad_mla.exists()
+
+    # Hybrid --model with --tensors applies custom tensors instead of silently using BF16.
+    fp8_tensors = (TensorSpec("K", 8, 128), TensorSpec("V", 8, 128))
+    gemma_spec = from_model("gemma-3-27b", tensors=fp8_tensors)
+    assert all(s.bits == 8 for g in gemma_spec.groups for s in g.tensors)
+    out_gemma = tmp_path / "gemma-fp8"
+    main(HBF_FLAGS + ["--model", "gemma-3-27b", "--context", "2048",
+                      "--tensors", '[{"name":"K","bits":8,"dims":128},{"name":"V","bits":8,"dims":128}]',
+                      "--output", str(out_gemma)])
+    g_meta = json.loads((out_gemma / "meta.json").read_text())
+    assert all(t["bits"] == 8 for t in g_meta["tensors"])
+    g_rows = list(csv.DictReader((out_gemma / "analysis_layers.csv").open()))
+    # Global layer 5: 16 KV heads x 2 tensors x ceil(2048 / 32) = 2,048 FP8 pages (half of BF16's 4,096).
+    assert int(g_rows[5]["pages"]) == 16 * 2 * (2048 // 32)
+
+    # GroupedLayout rejects density < 1; generate_grouped rejects unsupported kwargs.
+    cfg = load("ocp")
+    shape = Shape(2, 4, 128, 1024)
+    spec = parse_kvspec("cla:share=2", 2, 4, 1024)
+    with pytest.raises(ValueError, match="density"):
+        GroupedLayout(cfg, shape, spec, (TensorSpec("K", 16, 128, density=Fraction(1, 4)), TensorSpec("V", 16, 128)))
+    layout = GroupedLayout(cfg, shape, spec, default_tensors(shape))
+    for bad_kw in ({"reuse": 0.8}, {"select_static": True}, {"query_groups": 4}, {"full_tensors": ("K",)}):
+        with pytest.raises(TypeError):
+            list(generate_grouped(cfg, layout, "uniform_tokens", **bad_kw))

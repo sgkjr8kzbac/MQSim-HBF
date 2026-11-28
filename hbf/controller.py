@@ -59,13 +59,15 @@ def burst_runs(intervals, start, token_bytes, burst=BURST_BYTES):
 
 
 def schedule(cfg, layout, accesses):
+    if any(spec.density != 1 for spec in layout.all_tensors):
+        raise ValueError("Tensor density < 1 is supported by the numpy analysis engine only")
     logical = defaultdict(dict)
     for access in accesses:
         access.validate(layout)
         if access.op == "W" and access.step != -1:
             raise ValueError("Phase 0 only accepts prefill writes")
-        if layout.specs[access.kind].tier != "hbf":
-            continue  # HBM-tier tensors have no HBF pages
+        if access.op == "H" or layout.specs[access.kind].tier != "hbf":
+            continue  # HBM-tier tensors and HBM-cached hits have no HBF pages
         group = logical[access.step, access.layer, access.op]
         t = layout.tensor_index(access.kind)
         tokens = layout.tokens(t)

@@ -3,6 +3,7 @@ import csv
 import json
 from bisect import bisect_right
 from dataclasses import asdict, dataclass, fields
+from fractions import Fraction
 from math import ceil
 from random import Random
 
@@ -31,6 +32,33 @@ TIERS = ("hbf", "hbm")
 ROLES = ("data", "aux", "meta")
 
 
+MAX_DENSITY_DENOM = 1_000_000
+
+
+def parse_density(value):
+    """Parse a storage density in (0, 1] from an int, float, Fraction or string (e.g. ``1/4``)."""
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid density {value!r}: must be in (0, 1]")
+    try:
+        if isinstance(value, Fraction):
+            rho = value
+        elif isinstance(value, int):
+            rho = Fraction(value)
+        elif isinstance(value, float):
+            rho = Fraction(str(value)).limit_denominator(MAX_DENSITY_DENOM)
+        elif isinstance(value, str):
+            rho = Fraction(value.strip())
+        else:
+            raise ValueError
+    except (ValueError, ZeroDivisionError):
+        raise ValueError(f"Invalid density {value!r}: must be a number or fraction in (0, 1]") from None
+    if not 0 < rho <= 1:
+        raise ValueError(f"Invalid density {value!r}: must be in (0, 1]")
+    if rho.denominator > MAX_DENSITY_DENOM:
+        raise ValueError(f"Invalid density {value!r}: denominator must be <= {MAX_DENSITY_DENOM}")
+    return 1 if rho == 1 else rho
+
+
 @dataclass(frozen=True)
 class TensorSpec:
     """Stored format of one per-head KV tensor: one row of ``dims`` elements of ``bits`` per token.
@@ -57,6 +85,8 @@ class TensorSpec:
     * ``logical_dims`` - BF16-equivalent elements stored per token (unset: ``dims``). It feeds
       ``hbf_elements`` and ``dequant_ops`` when one row packs several fields, e.g. a fused row of
       2-bit K and V plus their scales (``bits=8``, ``dims`` = bytes, ``logical_dims`` = d_k + d_v).
+    * ``density`` - share of the window's tokens stored compacted in token order, in (0, 1]
+      (default 1). Stored as ``1`` when full and a ``Fraction`` when < 1; numpy engine only.
     """
     name: str
     bits: int
@@ -67,6 +97,7 @@ class TensorSpec:
     dequant_ops: float = 0
     attn_dims: int | None = None
     logical_dims: int | None = None
+    density: Fraction | int = 1
 
     def __post_init__(self):
         if (not isinstance(self.name, str) or not self.name.isidentifier()
@@ -87,6 +118,7 @@ class TensorSpec:
             raise ValueError(f"Tensor {self.name}: attn_dims must be a nonnegative integer")
         if self.logical_dims is not None and (type(self.logical_dims) is not int or self.logical_dims <= 0):
             raise ValueError(f"Tensor {self.name}: logical_dims must be a positive integer")
+        object.__setattr__(self, "density", parse_density(self.density))
 
     @property
     def token_bytes(self):
@@ -112,6 +144,21 @@ class TensorSpec:
         if not 0 <= lo < hi <= context:
             raise ValueError(f"Window {self.window} of tensor {self.name} is empty or outside {context} tokens")
         return lo, hi
+
+    def stored_tokens(self, context):
+        """Compacted tokens stored in this tensor's window (all window tokens when density == 1)."""
+        lo, hi = self.tokens(context)
+        width = hi - lo
+        if self.density == 1:
+            return width
+        return ((width - 1) * self.density.numerator) // self.density.denominator + 1
+
+    def blocks(self, context, page_bytes):
+        """Pages (blocks) per head required to store this tensor's compacted window."""
+        tpp = page_bytes // self.token_bytes
+        if tpp <= 0:
+            raise ValueError(f"Token row of {self.name} ({self.token_bytes} B) exceeds page size {page_bytes} B")
+        return -(-self.stored_tokens(context) // tpp)
 
 
 def default_tensors(shape):
@@ -151,7 +198,7 @@ class Access:
         if any(type(n) is not int for n in numbers) or spec is None or not (
             self.step >= -1 and 0 <= self.layer < shape.layers and
             0 <= self.kv_head < shape.kv_heads and
-            self.op in {"R", "W"} and layout.windows[self.kind][0] <= self.token_start < self.token_end
+            self.op in {"R", "W", "H"} and layout.windows[self.kind][0] <= self.token_start < self.token_end
             <= layout.windows[self.kind][1] and self.bits == spec.bits
         ) or (hasattr(layout, "reads") and not layout.reads(self.layer, self.kind, self.kv_head)):
             raise ValueError(f"Invalid logical access: {self}")
@@ -167,9 +214,21 @@ def write_access(path, accesses):
 OPTIONAL_FIELDS = ("attn_dims", "logical_dims")  # left out of meta.json while unset, so older runs compare equal
 
 
+def _tensor_meta(spec):
+    item = {}
+    for key, value in asdict(spec).items():
+        if key in OPTIONAL_FIELDS and value is None:
+            continue
+        if key == "density":
+            if value == 1:
+                continue
+            value = str(value)
+        item[key] = value
+    return item
+
+
 def tensors_meta(layout):
-    return [{key: value for key, value in asdict(spec).items() if key not in OPTIONAL_FIELDS or value is not None}
-            for spec in layout.all_tensors]
+    return [_tensor_meta(spec) for spec in layout.all_tensors]
 
 
 def read_access(path):
@@ -208,8 +267,7 @@ class Layout:
         if base < 0 or 0 in self.tokens_per_page:
             raise ValueError("A token row must fit in one page and base must be nonnegative")
         self.window_starts = tuple(self.windows[spec.name][0] for spec in self.tensors)
-        self.block_counts = tuple(-(-(self.windows[spec.name][1] - self.windows[spec.name][0]) // tokens)
-                                  for spec, tokens in zip(self.tensors, self.tokens_per_page))
+        self.block_counts = tuple(spec.blocks(shape.context, cfg.page_bytes) for spec in self.tensors)
         self.pages = shape.layers * shape.kv_heads * sum(self.block_counts)
         self.span = self.pages  # LPAs [base, base + span) belong to the layout, padding included
         cfg.lba(base + self.pages - 1)
@@ -235,9 +293,17 @@ class Layout:
     def page_access(self, lpa, step=0, op="R"):
         layer, head, t, block = self.decode(lpa)
         spec = self.tensors[t]
-        lo = self.window_starts[t] + block * self.tokens(t)
-        return Access(step, layer, head, spec.name, op, lo, min(lo + self.tokens(t), self.windows[spec.name][1]),
-                      spec.bits)
+        tpp = self.tokens(t)
+        origin = self.window_starts[t]
+        end = self.windows[spec.name][1]
+        if spec.density == 1:
+            lo = origin + block * tpp
+            hi = min(lo + tpp, end)
+        else:
+            num, den = spec.density.numerator, spec.density.denominator
+            lo = origin + -(-(block * tpp * den) // num)
+            hi = min(origin + -(-((block + 1) * tpp * den) // num), end)
+        return Access(step, layer, head, spec.name, op, lo, hi, spec.bits)
 
     def token_blocks(self, t, lo, hi):
         """Blocks of HBF tensor ``t`` that hold tokens [lo, hi), and the first token of block 0."""
@@ -285,8 +351,9 @@ class VllmInterleaved(Layout):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if len(set(self.tokens_per_page)) != 1 or len({self.windows[spec.name] for spec in self.tensors}) != 1:
-            raise ValueError("vllm_interleaved requires the same tokens per page and window for every tensor")
+        if (len(set(self.tokens_per_page)) != 1
+                or len({(self.windows[spec.name], spec.density) for spec in self.tensors}) != 1):
+            raise ValueError("vllm_interleaved requires the same tokens per page, window and density for every tensor")
 
     def lpa(self, layer, head, t, block):
         if not 0 <= block < self.block_counts[t]:
@@ -387,49 +454,128 @@ def share(count, fraction):
     return ceil(round(count * fraction, 9))
 
 
+def _sample_excluding(rng, total, excluded, count):
+    """Sample ``count`` distinct integers uniformly from ``range(total) \\ excluded``."""
+    if count == 0:
+        return []
+    avail = total - len(excluded)
+    if count >= avail:
+        return [b for b in range(total) if b not in excluded]
+    if len(excluded) * 2 <= total:
+        picked = set()
+        while len(picked) < count:
+            need = count - len(picked)
+            for b in rng.sample(range(total), min(total, need * 2)):
+                if b not in excluded and b not in picked:
+                    picked.add(b)
+                    if len(picked) == count:
+                        break
+        return list(picked)
+    pool = [b for b in range(total) if b not in excluded]
+    return rng.sample(pool, count)
+
+
+def _select_blocks(rng, blocks, pick_n, step, key, prev, select_static, reuse):
+    """Return ``(ordered_blocks, reused_set)`` for one (step, selection key).
+
+    On the default path (``select_static=False, reuse=0.0``) this performs a single
+    ``rng.sample(range(blocks), pick_n)`` with zero extra draws.
+    """
+    if not select_static and not reuse:
+        return sorted(rng.sample(range(blocks), pick_n)), ()
+    if step == 0:
+        picked = sorted(rng.sample(range(blocks), pick_n))
+        prev[key] = picked
+        return picked, ()
+    prev_list = prev[key]
+    if select_static:
+        if not reuse:
+            return prev_list, ()
+        n_reused = min(len(prev_list), round(len(prev_list) * reuse))
+        reused = set(rng.sample(prev_list, n_reused)) if n_reused else set()
+        return prev_list, reused
+    # Dynamic selection with temporal reuse: fraction ``reuse`` carries over from the prior step
+    # and is served from the HBM cache, while the rest are freshly selected from HBF.
+    n_reused = min(len(prev_list), round(pick_n * reuse))
+    reused = set(rng.sample(prev_list, n_reused)) if n_reused else set()
+    n_miss = pick_n - n_reused
+    prev_set = set(prev_list)
+    avail = blocks - len(prev_set)
+    if n_miss <= avail:
+        fresh = _sample_excluding(rng, blocks, prev_set, n_miss)
+    else:
+        fresh = [b for b in range(blocks) if b not in prev_set]
+        fresh.extend(rng.sample([b for b in prev_list if b not in reused], n_miss - avail))
+    picked = sorted(reused | set(fresh))
+    prev[key] = picked
+    return picked, reused
+
+
 def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0,
-             hot_fraction=.5, hot_units=1, select_tokens=16):
+             hot_fraction=.5, hot_units=1, select_tokens=16,
+             select_static=False, reuse=0.0, query_groups=1, full_tensors=()):
     """Seeded accesses of one workload mode.
 
     Every mode reads ``meta`` tensors (selection metadata) in full every (step, layer, head);
-    selection modes also read HBM-tier tensors (hot windows) in full and clip the selected tokens
-    to each tensor's window; with the default tensors this changes nothing. ``uniform_pages``
-    samples each tensor's pages independently, so K and V (and scales) cover different tokens.
+    selection modes also read HBM-tier tensors (hot windows) and any tensors named in
+    ``full_tensors`` in full and clip the selected tokens to each tensor's window; with the
+    default tensors and options this changes nothing. ``uniform_pages`` samples each tensor's
+    pages independently, so K and V (and scales) cover different tokens.
 
     ``uniform_pages`` picks ``fraction`` of each tensor's storage pages, independently per tensor, so
     the selection unit grows with compression (a 2-bit page holds 128 tokens, a BF16 page 16) and K
     and V pages of one head cover different tokens. ``uniform_tokens`` picks ``fraction`` of the
     blocks of ``select_tokens`` tokens per (step, layer, KV head), as Quest-style methods do, and
-    reads every tensor of the head for the same tokens. Quest selects per query head; under GQA a
-    KV head serves the union of its query heads' blocks, which this mode does not model (use a
-    higher fraction).
+    reads every tensor of the head for the same tokens.
+
+    Selection realism options (all off by default, preserving exact RNG draw order):
+    * ``select_static`` - keep the step-0 selection across all steps (eviction state).
+    * ``reuse`` - fraction in [0, 1] of blocks carried over from the previous step on step >= 1
+      and served from an HBM cache (emitted with ``op="H"``) instead of HBF.
+    * ``query_groups`` - GQA union across ``g`` query heads sharing one KV head, giving effective
+      selection fraction ``1 - (1 - fraction) ** g``.
+    * ``full_tensors`` - tensor names read over their whole window even in sparse selection modes.
     """
     shape = layout.shape
     if (mode not in MODES or steps <= 0 or not 0 < fraction <= 1 or count <= 0
             or not 0 <= hot_fraction <= 1 or not 1 <= hot_units <= cfg.units
-            or not 0 <= unit < cfg.units or type(select_tokens) is not int or select_tokens <= 0):
+            or not 0 <= unit < cfg.units or type(select_tokens) is not int or select_tokens <= 0
+            or type(select_static) is not bool
+            or isinstance(reuse, bool) or not isinstance(reuse, (int, float)) or not 0 <= reuse <= 1
+            or type(query_groups) is not int or query_groups < 1):
         raise ValueError("Invalid generator parameters")
+    if (select_static or reuse or query_groups != 1) and mode not in ("uniform_tokens", "uniform_pages"):
+        raise ValueError("select_static, reuse and query_groups apply to uniform_tokens and uniform_pages only")
+    full = frozenset(full_tensors)
+    if any(not isinstance(name, str) or name not in layout.specs for name in full):
+        raise ValueError(f"full_tensors must name tensors of the layout, not {sorted(full - set(layout.specs))}")
     rng = Random(seed)
     windows = layout.windows
-    always = [spec for spec in layout.all_tensors if spec.role == "meta" or spec.tier == "hbm"]
+    always = [spec for spec in layout.all_tensors if spec.role == "meta" or spec.tier == "hbm" or spec.name in full]
+    eff_fraction = fraction if query_groups == 1 else 1.0 - (1.0 - fraction) ** query_groups
 
     def whole(step, layer, head, spec):
         return Access(step, layer, head, spec.name, "R", *windows[spec.name], spec.bits)
 
-    def clipped(step, layer, head, spec, lo, hi):
+    def clipped(step, layer, head, spec, lo, hi, op="R"):
         lo, hi = max(lo, windows[spec.name][0]), min(hi, windows[spec.name][1])
-        return [Access(step, layer, head, spec.name, "R", lo, hi, spec.bits)] if lo < hi else []
+        return [Access(step, layer, head, spec.name, op, lo, hi, spec.bits)] if lo < hi else []
 
     if mode == "uniform_tokens":
         blocks = -(-shape.context // select_tokens)
-        selective = [spec for spec in layout.tensors if spec.role != "meta"]
+        pick_n = share(blocks, eff_fraction)
+        selective = [spec for spec in layout.tensors if spec.role != "meta" and spec.name not in full]
+        prev = {}
         for step in range(steps):
             for layer in range(shape.layers):
                 for head in range(shape.kv_heads):
-                    for block in sorted(rng.sample(range(blocks), share(blocks, fraction))):
+                    picked, reused = _select_blocks(rng, blocks, pick_n, step, (layer, head), prev,
+                                                    select_static, reuse)
+                    for block in picked:
                         lo, hi = block * select_tokens, min((block + 1) * select_tokens, shape.context)
+                        op = "H" if block in reused else "R"
                         for spec in selective:
-                            yield from clipped(step, layer, head, spec, lo, hi)
+                            yield from clipped(step, layer, head, spec, lo, hi, op)
                     for spec in always:
                         yield whole(step, layer, head, spec)
         return
@@ -449,6 +595,7 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
                         yield from clipped(step, layer, head, spec, shape.context - recent, shape.context)
         return
     if mode in {"dense", "uniform_pages"}:
+        prev = {}
         for step in range(steps):
             for layer in range(shape.layers):
                 for head in range(shape.kv_heads):
@@ -457,12 +604,16 @@ def generate(cfg, layout, mode, *, steps=1, seed=1, fraction=.1, count=4, unit=0
                             yield whole(step, layer, head, spec)
                         continue
                     for t, spec in enumerate(layout.tensors):
-                        if spec.role == "meta":
+                        if spec.role == "meta" or spec.name in full:
                             yield whole(step, layer, head, spec)
                             continue
                         blocks = layout.blocks(t)
-                        for block in sorted(rng.sample(range(blocks), share(blocks, fraction))):
-                            yield layout.page_access(layout.lpa(layer, head, t, block), step)
+                        pick_n = share(blocks, eff_fraction)
+                        picked, reused = _select_blocks(rng, blocks, pick_n, step, (layer, head, t), prev,
+                                                        select_static, reuse)
+                        for block in picked:
+                            op = "H" if block in reused else "R"
+                            yield layout.page_access(layout.lpa(layer, head, t, block), step, op)
                     for spec in layout.hbm_tensors:
                         yield whole(step, layer, head, spec)
         return

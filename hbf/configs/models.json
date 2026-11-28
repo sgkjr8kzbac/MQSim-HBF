@@ -23,5 +23,40 @@
     "layers": 64, "hidden": 5120, "q_heads": 64, "kv_heads": 8, "head_dim": 128,
     "intermediate": 25600, "vocab": 151936, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
     "source": "Qwen3 Technical Report Table 1, https://arxiv.org/abs/2505.09388 (64 layers, 64/8 heads, untied embeddings); hidden 5120, intermediate 25600 and vocab from a Qwen3-architecture config mirror, https://huggingface.co/OpenBuddy/SimpleChat-32B-V1/blob/main/config.json (secondary; check https://huggingface.co/Qwen/Qwen3-32B). q_heads x head_dim = 8192 differs from hidden. BF16 weights. Q/K norm and norm weights are not counted."
+  },
+  "deepseek-v2-lite": {
+    "layers": 27, "hidden": 2048, "q_heads": 16, "kv_heads": 1, "head_dim": 128,
+    "intermediate": 10944, "vocab": 102400, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
+    "attention": "mla", "kv_lora_rank": 512, "rope_dim": 64, "q_lora_rank": 0, "v_head_dim": 128,
+    "experts": 64, "top_k": 6, "shared_experts": 2, "expert_intermediate": 1408, "dense_layers": 1,
+    "source": "Hugging Face deepseek-ai/DeepSeek-V2-Lite config.json, https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/config.json; 15.7 B total / 2.4 B active parameters (model computes 15.71 B total, 2.45 B active incl. LM head). MLA (kv_lora_rank 512, qk_rope_head_dim 64, qk_nope_head_dim 128, v_head_dim 128, q_lora_rank null) stored as 1 KV head per layer (1,152 B/tok/layer, 31,104 B/tok across 27 layers). Layer 0 dense FFN (10,944), layers 1-26 MoE (64 routed + 2 shared, top-6, expert_intermediate 1,408). BF16 weights."
+  },
+  "gemma-3-27b": {
+    "layers": 62, "hidden": 5376, "q_heads": 32, "kv_heads": 16, "head_dim": 128,
+    "intermediate": 21504, "vocab": 262208, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": true,
+    "layer_pattern": "LLLLLG", "window": 1024,
+    "source": "Hugging Face google/gemma-3-27b-it config.json (text_config), https://huggingface.co/google/gemma-3-27b-it/blob/main/config.json; Gemma 3 Technical Report Table 1, https://arxiv.org/abs/2503.19786 (25.60 B non-embedding + 1.42 B tied embedding = 27.02 B text parameters, plus 417 M vision encoder = 27.4 B multimodal; model computes 27.01 B text). Hybrid 5:1 LLLLLG (52 local W=1,024 + 10 global layers); global KV 81,920 B/tok. BF16 weights."
+  },
+  "gpt-oss-20b": {
+    "layers": 24, "hidden": 2880, "q_heads": 64, "kv_heads": 8, "head_dim": 64,
+    "intermediate": 2880, "vocab": 201088, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
+    "layer_pattern": "LG", "window": 128,
+    "experts": 32, "top_k": 4, "shared_experts": 0, "expert_intermediate": 2880, "dense_layers": 0,
+    "source": "Hugging Face openai/gpt-oss-20b config.json, https://huggingface.co/openai/gpt-oss-20b/blob/main/config.json; OpenAI gpt-oss Model Card Table 1, https://arxiv.org/abs/2508.10925 (20.91 B total / 3.61 B active; model computes 20.91 B / 3.61 B). Hybrid 1:1 LG (12 local W=128 + 12 global layers); global KV 24,576 B/tok. Modelled at BF16 weights (native release quantizes MoE weights to MXFP4)."
+  },
+  "gpt-oss-120b": {
+    "layers": 36, "hidden": 2880, "q_heads": 64, "kv_heads": 8, "head_dim": 64,
+    "intermediate": 2880, "vocab": 201088, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
+    "layer_pattern": "LG", "window": 128,
+    "experts": 128, "top_k": 4, "shared_experts": 0, "expert_intermediate": 2880, "dense_layers": 0,
+    "source": "Hugging Face openai/gpt-oss-120b config.json, https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json; OpenAI gpt-oss Model Card Table 1, https://arxiv.org/abs/2508.10925 (116.83 B total / 5.13 B active; model computes 116.79 B / 5.13 B). Hybrid 1:1 LG (18 local W=128 + 18 global layers); global KV 36,864 B/tok. Modelled at BF16 weights (native release quantizes MoE weights to MXFP4)."
+  },
+  "qwen3-next-80b-a3b": {
+    "layers": 48, "hidden": 2048, "q_heads": 16, "kv_heads": 2, "head_dim": 256,
+    "intermediate": 512, "vocab": 151936, "weight_bits": 16, "gated_mlp": true, "tied_embeddings": false,
+    "gated_attention": true, "layer_pattern": "SSSA",
+    "ssm_state_bytes": 2097152, "ssm_pre_params": 25296896, "ssm_post_params": 8388608,
+    "experts": 512, "top_k": 10, "shared_experts": 1, "expert_intermediate": 512, "dense_layers": 0,
+    "source": "Hugging Face Qwen/Qwen3-Next-80B-A3B-Instruct config.json, https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json; 79.7 B / 80 B total (79 B non-embedding), 3.0-3.9 B active (model computes 79.67 B total, 79.05 B non-embedding, 3.56 B active incl. LM head). Hybrid 3:1 SSSA (36 Gated DeltaNet layers with 16/32 key/value heads of dim 128 and 2 MiB FP32 recurrent state + 12 full Gated Attention layers with 2 KV heads of dim 256 -> 24,576 B/tok). 512 routed + 1 shared expert, top-10, expert_intermediate 512. BF16 weights; 48 KiB conv1d state and norm weights omitted."
   }
 }

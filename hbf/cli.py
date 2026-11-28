@@ -1,13 +1,13 @@
 """Generate or import logical accesses, run MQSim, and report the results."""
 import argparse
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from .access import (LAYOUTS, MODES, Shape, default_tensors, generate, parse_tensors, read_access, tensors_meta,
-                     write_access)
+from .access import (LAYOUTS, MODES, Shape, default_tensors, generate, parse_density, parse_tensors, read_access,
+                     tensors_meta, write_access)
 from .analysis import (ENGINES, GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group,
                        plane_geometry, summarize)
 from .config import MAX_BATCH_PAGES, load
@@ -116,15 +116,15 @@ def request_bytes(cfg, layout, heads, contexts=None):
     over ``contexts`` (per-request contexts of a placed batch; default the layout's context)."""
     totals, hbm_totals = [], []
     for context in contexts or [layout.shape.context]:
-        windows = {}
+        stored = {}
         for spec in layout.all_tensors:
             try:
-                windows[spec.name] = spec.tokens(context)
+                stored[spec.name] = spec.stored_tokens(context)
             except ValueError:  # empty window at this context
-                windows[spec.name] = (0, 0)
-        per_head = sum(-(-(windows[spec.name][1] - windows[spec.name][0]) // tokens) * cfg.page_bytes
+                stored[spec.name] = 0
+        per_head = sum(-(-stored[spec.name] // tokens) * cfg.page_bytes
                        for spec, tokens in zip(layout.tensors, layout.tokens_per_page))
-        hbm = sum((windows[spec.name][1] - windows[spec.name][0]) * spec.token_bytes for spec in layout.hbm_tensors)
+        hbm = sum(stored[spec.name] * spec.token_bytes for spec in layout.hbm_tensors)
         totals.append(per_head + hbm)
         hbm_totals.append(hbm)
     scale = layout.shape.layers * heads
@@ -190,12 +190,22 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     } | (generation or {})
     from .batch import BatchSpec, PageTableLayout, check_write_order, generate_batch, place_batch
     placed = isinstance(requests, BatchSpec) and not requests.default
+    has_selection_realism = (generation.get("select_static") or generation.get("reuse", 0)
+                             or generation.get("query_groups", 1) != 1 or generation.get("full_tensors"))
+    has_density = tensors is not None and any(spec.density != 1 for spec in tensors)
+    if (kv_spec is not None or placed) and has_selection_realism:
+        raise ValueError("select_static, reuse, query_groups and full_tensors are not yet supported with "
+                         "--kv-spec (or a hybrid/SSM model) or request placement")
+    if (kv_spec is not None or placed or check_writes) and has_density:
+        raise ValueError("Tensor density < 1 is not yet supported with --kv-spec (or a hybrid/SSM model), "
+                         "request placement or --check-writes")
     if kv_spec is not None:  # layer and head groups (hbf/kvspec.py)
         from .kvspec import GroupedLayout, generate_grouped, spec_meta
         layout = GroupedLayout(cfg, shape, kv_spec, tensors or default_tensors(shape),
                                requests=requests[0] if isinstance(requests, tuple) else 1,
                                intra="striped" if layout_name == "striped_contiguous" else "contiguous")
-        accesses = list(generate_grouped(cfg, layout, mode, **generation))
+        accesses = list(generate_grouped(cfg, layout, mode, **{key: generation[key] for key in (
+            "steps", "seed", "fraction", "count", "select_tokens")}))
     elif placed:
         per_request = Shape(shape.layers, shape.kv_heads // len(requests.requests), shape.head_dim, shape.context)
         layout = PageTableLayout(cfg, per_request, requests, tensors=tensors)
@@ -204,6 +214,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
     else:
         layout = LAYOUTS[layout_name](cfg, shape, tensors=tensors)
         accesses = list(generate(cfg, layout, mode, **generation) if input_csv is None else read_access(input_csv))
+    if has_density and any(access.op == "W" for access in accesses):
+        raise ValueError("Tensor density < 1 does not support write accesses")
     write_check = None
     if isinstance(requests, BatchSpec) and check_writes:
         snapshot = layout.snapshot if placed else place_batch(
@@ -339,6 +351,16 @@ def build_parser():
     parser.add_argument("--hot-units", type=int, default=1)
     parser.add_argument("--select-tokens", type=int, default=16,
                         help="uniform_tokens: tokens per selected block (Quest's page; default 16)")
+    parser.add_argument("--select-static", action="store_true",
+                        help="keep the step-0 sparse selection across all steps (eviction state)")
+    parser.add_argument("--reuse", type=float, default=0.0,
+                        help="fraction in [0, 1] of selected blocks reused from the prior step via HBM cache")
+    parser.add_argument("--query-groups", default="1",
+                        help="GQA query heads sharing one KV head for sparse selection union (integer >= 1, "
+                             "or 'auto' with --model; default 1)")
+    parser.add_argument("--density", default="1",
+                        help="share of each HBF tensor's window tokens stored compacted (e.g. 0.25 or 1/4; "
+                             "default 1, numpy analysis engine only)")
     parser.add_argument("--batch-pages", type=int, default=MAX_BATCH_PAGES,
                         help=f"maximum pages per sub-batch (1–{MAX_BATCH_PAGES})")
     parser.add_argument("--physical", action="store_true")
@@ -496,10 +518,33 @@ def configure(args):
     if args.kv_format is not None and args.tensors is not None:
         raise ValueError("--format and --tensors are mutually exclusive")
     kv_format = None
-    if args.kv_format is not None:
+    if model is not None and args.tensors is None and (args.kv_format is not None or model.attention == "mla"):
+        from .kvspec import resolve_format
+        kv_format = resolve_format(model, args.kv_format)
+    elif args.kv_format is not None:
         from .formats import parse_format
-        kv_format = parse_format(args.kv_format, head_dim, model.q_heads // model.kv_heads if model else None)
+        kv_format = parse_format(args.kv_format, head_dim)
     tensors = kv_format.tensors if kv_format else parse_tensors(args.tensors)
+    density = parse_density(args.density)
+    if density != 1:
+        base_tensors = tensors if tensors is not None else default_tensors(Shape(layers, heads, head_dim, args.context))
+        tensors = tuple(replace(spec, density=density) if spec.tier == "hbf" else spec for spec in base_tensors)
+    if not 0 <= args.reuse <= 1:
+        raise ValueError("--reuse must be in [0, 1]")
+    if str(args.query_groups) == "auto":
+        if model is None:
+            raise ValueError("--query-groups auto needs --model")
+        query_groups = model.q_heads // model.kv_heads
+    else:
+        try:
+            query_groups = int(args.query_groups)
+        except ValueError:
+            raise ValueError("--query-groups must be a positive integer or 'auto'") from None
+        if query_groups < 1:
+            raise ValueError("--query-groups must be a positive integer or 'auto'")
+    if (args.access_csv is None and (args.select_static or args.reuse or query_groups != 1)
+            and args.mode not in ("uniform_tokens", "uniform_pages")):
+        raise ValueError("--select-static, --reuse and --query-groups apply to uniform_tokens and uniform_pages only")
     if type(args.batch) is not int or args.batch < 1 or type(args.stacks) is not int or args.stacks < 1:
         raise ValueError("--batch and --stacks must be positive")
     per_stack = -(-args.batch // args.stacks)
@@ -514,6 +559,12 @@ def configure(args):
     generation = {key: getattr(args, key) for key in (
         "steps", "seed", "fraction", "count", "unit", "hot_fraction", "hot_units", "select_tokens"
     )}
+    if args.select_static:
+        generation["select_static"] = True
+    if args.reuse:
+        generation["reuse"] = args.reuse
+    if query_groups != 1:
+        generation["query_groups"] = query_groups
     if args.placement != "static" and (args.timing or model is not None):
         raise ValueError("--timing and --model need static placement (the numpy engine)")
     if model is None and (args.gpu is not None or args.overlap != "serial" or args.kv_consume != "stream"
@@ -528,7 +579,8 @@ def configure(args):
                              f"head_dim {model.head_dim}; do not override them")
         selection = args.selection
         if selection == "auto":
-            selection = "static" if args.access_csv is None and args.mode in ("dense", "sink_recent") else "dynamic"
+            selection = ("static" if args.access_csv is None
+                         and (args.mode in ("dense", "sink_recent") or args.select_static) else "dynamic")
         options = SystemOptions(overlap=args.overlap, kv_consume=args.kv_consume)
         if options.mode == "prefetch" and selection != "static":
             raise ValueError("Prefetching the next layer's KV needs a static selection (dense or sink_recent, "
@@ -540,19 +592,29 @@ def configure(args):
                   "kv_format": kv_format, "heads": heads}
     if (args.timing or system) and args.engine == "python":
         raise ValueError("--timing needs the numpy engine")
+    if tensors is not None and any(spec.density != 1 for spec in tensors):
+        if (args.engine == "python" or args.placement != "static" or args.prefill
+                or not args.analysis_only or args.mode == "write_then_read" or args.check_writes):
+            raise ValueError("Tensor density < 1 requires --analysis-only with the numpy engine, static placement, "
+                             "and no writes or --check-writes")
     requests = (per_stack, heads)
     spec, context = batch_spec(args, per_stack)
     if context != shape.context:  # --contexts sets the stored context (equal prompts keep phase A's path)
         shape = Shape(shape.layers, shape.kv_heads, shape.head_dim, context)
     kv_spec = None
-    if args.kv_spec is not None:
-        from .kvspec import GROUP_MODES, parse_kvspec
+    if args.kv_spec is not None or (model is not None and model.layer_pattern):
+        from .kvspec import GROUP_MODES, from_model, parse_kvspec
         if (spec is not None or args.access_csv is not None or args.mode not in GROUP_MODES
                 or args.layout not in ("layer_contiguous", "striped_contiguous")):
-            raise ValueError("--kv-spec works with generated modes dense, uniform_tokens and sink_recent, the "
-                             "layer_contiguous or striped_contiguous layout, and without request placement or "
-                             "--access-csv")
-        kv_spec = parse_kvspec(args.kv_spec, layers, heads, shape.context)
+            raise ValueError("--kv-spec (or a hybrid/SSM model) works with generated modes dense, uniform_tokens and "
+                             "sink_recent, the layer_contiguous or striped_contiguous layout, and without request "
+                             "placement or --access-csv")
+        if args.kv_spec is not None:
+            kv_spec = parse_kvspec(args.kv_spec, layers, heads, shape.context)
+        elif args.tensors is not None:
+            kv_spec = from_model(model, tensors=tensors)
+        else:
+            kv_spec = from_model(model, kv_format or "bf16")
     if spec is not None:
         if not args.analysis_only or args.access_csv is not None or args.prefill:
             raise ValueError("Request placement (--alloc, --contexts, --generated, --check-writes) is analysis only, "
