@@ -441,7 +441,7 @@ def build_timeline(cfg, geometry, workload, *, steps, step_s, policy="packed",
 
     def _admit_one(req, now_s):
         nonlocal admitted
-        pre_tokens = workload.prefix_tokens if req.prefix >= 0 else 0
+        pre_tokens = (req.prefix_tokens or workload.prefix_tokens) if req.prefix >= 0 else 0
         start = pre_tokens + req.history + req.input
         end = start + req.output
         sess = session_map.get(req.session) if req.session >= 0 else None

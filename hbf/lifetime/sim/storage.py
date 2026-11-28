@@ -76,8 +76,13 @@ class _StorageMixin:
                 return 0.0
             return float(length.get("n")) if length.kind == "fixed" else float(length._grid()[-1])
         if w.arrival == "script":
-            tokens = max(int(item["input"]) + int(item["output"]) for item in w.script)
-        elif w.sessions:
+            tokens = max(
+                int(item["input"]) + int(item["output"])
+                + (int(item.get("prefix_tokens", w.prefix_tokens)) if int(item.get("prefix", -1)) >= 0 else 0)
+                for item in w.script
+            )
+            return self.pages(int(tokens))
+        if w.sessions:
             tokens = top(w.history) + w.calls * (top(w.input) + top(w.output))
         else:
             tokens = top(w.input) + top(w.output)

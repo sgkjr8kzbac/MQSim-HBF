@@ -11,7 +11,10 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..device.config import PARAMETERS
-from ..frontend.trace.requests import load_workload, per_stack, presets as workload_presets
+from ..frontend.trace.requests import (
+    PREFIX_MODES, load_requests, load_workload, per_stack, presets as workload_presets,
+    workload_from_requests,
+)
 from ..util import write_table
 from .analytic import analytic
 from .clock import ConstantClock, ReadTimeClock, calibrate, layout_rounds
@@ -72,6 +75,18 @@ def build_parser():
     workload = parser.add_argument_group("workload (presets in hbf/configs/workloads.json)")
     workload.add_argument("--workload", default="long32k", help="preset(s), comma separated: "
                           + ", ".join(workload_presets()))
+    workload.add_argument("--requests-csv", type=Path,
+                          help="import request-level trace (unified CSV or Mooncake JSONL) instead of --workload")
+    workload.add_argument("--requests-format", choices=("auto", "csv", "mooncake"), default="auto",
+                          help="format of --requests-csv (default: auto by extension)")
+    workload.add_argument("--requests-retain-s", type=float,
+                          help="idle prefix retention (s) for --requests-csv (defaults to --retain-s or 0)")
+    workload.add_argument("--requests-prefix-mode", choices=PREFIX_MODES, default="conversation",
+                          help="Mooncake hash_ids prefix grouping mode (default: conversation)")
+    workload.add_argument("--requests-max", type=int,
+                          help="optional maximum number of requests to load from --requests-csv")
+    workload.add_argument("--requests-no-loop", action="store_true",
+                          help="do not loop --requests-csv when --hours exceeds trace duration")
     workload.add_argument("--concurrency", type=int, default=8,
                           help="closed loop: requests (sessions for agentic) in flight per GPU (default 8)")
     workload.add_argument("--rate", type=float, help="Poisson arrivals per second per GPU instead of a closed loop")
@@ -203,13 +218,33 @@ def configure(args):
     params = json.loads(PARAMETERS.read_text())
     models = [load_model(name) for name in _list(args.model, name="model")]
     formats = _list(args.kv_format, name="format")
-    overrides = {"input": args.input_len, "output": args.output_len, "history": args.history, "calls": args.calls,
-                 "think_s": args.think_s, "prefix_groups": args.prefix_groups, "prefix_tokens": args.prefix_tokens,
-                 "prefix_share": args.prefix_share, "zipf": args.zipf, "retain_s": args.retain_s,
-                 "max_batch": args.max_batch, "concurrency": args.concurrency, "seed": args.seed}
-    if args.rate is not None:
-        overrides |= {"arrival": "poisson", "rate": args.rate}
-    workloads = [load_workload(name, **overrides) for name in _list(args.workload, name="workload")]
+    if args.requests_csv is not None:
+        load_kw = {"max_requests": args.requests_max}
+        if args.requests_format == "mooncake" or (
+            args.requests_format == "auto" and args.requests_csv.suffix.lower() in (".jsonl", ".ndjson")
+        ):
+            load_kw["prefix_mode"] = args.requests_prefix_mode
+        records = load_requests(args.requests_csv, fmt=args.requests_format, **load_kw)
+        req_retain = (args.requests_retain_s if args.requests_retain_s is not None
+                      else (args.retain_s if args.retain_s is not None else 0.0))
+        workloads = [workload_from_requests(
+            records,
+            name=args.requests_csv.stem,
+            prefix_tokens=args.prefix_tokens,
+            retain_s=req_retain,
+            max_batch=args.max_batch,
+            loop=not args.requests_no_loop,
+            seed=args.seed,
+            source=f"Request trace {args.requests_csv.name} ({len(records)} requests)",
+        )]
+    else:
+        overrides = {"input": args.input_len, "output": args.output_len, "history": args.history, "calls": args.calls,
+                     "think_s": args.think_s, "prefix_groups": args.prefix_groups, "prefix_tokens": args.prefix_tokens,
+                     "prefix_share": args.prefix_share, "zipf": args.zipf, "retain_s": args.retain_s,
+                     "max_batch": args.max_batch, "concurrency": args.concurrency, "seed": args.seed}
+        if args.rate is not None:
+            overrides |= {"arrival": "poisson", "rate": args.rate}
+        workloads = [load_workload(name, **overrides) for name in _list(args.workload, name="workload")]
     ppbs = _list(args.pages_per_block, int, "pages-per-block")
     xs = _list(args.rd_threshold, float, "rd-threshold")
     limits = _list(args.pe_limit, float, "pe-limit")
@@ -249,7 +284,8 @@ def configure(args):
     return {"models": models, "gpu": gpu_spec, "gpu_name": gpu_name, "formats": formats,
             "kv_spec": args.kv_spec,
             "mode": args.mode, "generation": generation, "policy": args.alloc, "partition": args.partition,
-            "workloads": workloads, "pages_per_block": ppbs, "x_values": xs, "pe_limits": limits,
+            "workloads": workloads, "requests_csv": str(args.requests_csv) if args.requests_csv else None,
+            "requests_format": args.requests_format, "pages_per_block": ppbs, "x_values": xs, "pe_limits": limits,
             "hot": args.rd_hot, "read_share": args.read_share,
             "retention_s": args.retention_h * 3600 if args.retention_h else 0.0,
             "prefix_reads": args.prefix_reads, "capacity_gib": args.capacity_gib, "stacks": args.stacks,
@@ -400,7 +436,7 @@ def _simulation_run(directory, config):
                                t_prog=config["t_prog"], t_bers=config["t_bers"], m5=config["m5"],
                                suspend_ns=config["suspend_ns"], block_unit=config["block_unit"],
                                stacks=config["stacks"], align=config["align"])[0]
-            except (ValueError, ZeroDivisionError):
+            except (ValueError, ZeroDivisionError, TypeError):
                 ref = {}
             key = {"model": model.name, "format": kv_format, "mode": config["mode"], "read_share": share}
             rows.append(key | sim.result | {name: ref.get(name[len("analytic_"):]) for name in

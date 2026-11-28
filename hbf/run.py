@@ -105,6 +105,12 @@ LIFETIME_KEY_MAP = {
     "trace.select_tokens": "select_tokens",
     "trace.count": "count",
     "trace.seed": "seed",
+    "trace.requests_csv": "requests_csv",
+    "trace.requests_format": "requests_format",
+    "trace.requests_retain_s": "requests_retain_s",
+    "trace.requests_prefix_mode": "requests_prefix_mode",
+    "trace.requests_max": "requests_max",
+    "trace.requests_no_loop": "requests_no_loop",
     # [placement]
     "placement.alloc": "alloc",
     "placement.partition": "partition",
@@ -407,6 +413,7 @@ def resolved_lifetime_config(config):
         "trace": {
             "mode": config["mode"],
             "generation": config["generation"],
+            "requests_csv": config.get("requests_csv"),
         },
         "placement": {
             "alloc": config["policy"],

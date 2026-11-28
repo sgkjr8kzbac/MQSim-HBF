@@ -11,7 +11,7 @@ class _OpsMixin:
     def _admit(self, req):
         """Start a request: prefix and session entries, prefill writes. False when space is short."""
         w = self.workload
-        pre_tokens = w.prefix_tokens if req.prefix >= 0 else 0
+        pre_tokens = (req.prefix_tokens or w.prefix_tokens) if req.prefix >= 0 else 0
         start = pre_tokens + req.history + req.input
         end = start + req.output
         sess = self.session_entry.get(req.session, -1) if req.session >= 0 else -1
@@ -93,7 +93,7 @@ class _OpsMixin:
             self.sl_dead[slot] = 0.0
         if self.writes_decode:
             self.e_stored[e] = self.sl_end[slot]
-            self.e_tokens[e] = self.sl_end[slot] - (self.workload.prefix_tokens if pre >= 0 else 0)
+            self.e_tokens[e] = self.sl_end[slot] - ((req.prefix_tokens or self.workload.prefix_tokens) if pre >= 0 else 0)
         self.sl_on[slot], self.sl_req[slot], self.sl_staged[slot], self.sl_dead[slot] = False, None, 0.0, 0.0
         self.free_slots.append(slot)
         self.n_running -= 1
@@ -189,7 +189,7 @@ class _OpsMixin:
             reqs.append(self.stream.closed_new(self.t))
         if not reqs:
             return
-        prompts = [(w.prefix_tokens if r.prefix >= 0 else 0) + r.history + r.input for r in reqs]
+        prompts = [((r.prefix_tokens or w.prefix_tokens) if r.prefix >= 0 else 0) + r.history + r.input for r in reqs]
         span = self._region_span(max(prompts))
         need = math.ceil(span / self.P - 1e-9)
         if self.free_count[0] < need:
