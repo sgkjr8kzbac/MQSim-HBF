@@ -17,6 +17,10 @@ snapshot step, and places them by one of these allocation policies:
   pages, in its own segments.
 * ``packed`` - one write frontier per partition: every prompt (aligned to a row of the
   partition) and every decode flush takes the next pages.
+
+With ``align="stagger"`` (default) the k-th prompt of a partition starts k * banks / n pages into
+its row (n requests per partition), so that the same layer of different requests starts on
+different banks; ``row`` starts every prompt at bank 0 of a row.
 * ``vllm_pool`` - vLLM-style: per-layer pools of fixed-size blocks of ``block_tokens`` tokens,
   allocated from a free queue (``fresh`` ascending or ``shuffled:<seed>``); one page per head
   and tensor (HND).
@@ -37,6 +41,7 @@ from .pages import place
 ALLOCATIONS = ("layer_major", "dedicated", "packed", "vllm_pool")
 PARTITIONS = ("none", "channel", "die")
 FLUSH_ORDERS = ("layer", "rotate")
+ALIGNS = ("stagger", "row")
 OCP_BANKS_PER_DIE = 16
 OCP_DIES_PER_HOST = 4
 
@@ -61,6 +66,7 @@ class BatchSpec:
     flush_order: str = "rotate"
     block_tokens: int | None = None
     free_order: str = "fresh"
+    align: str = "stagger"
 
     def __post_init__(self):
         if not self.requests or any(type(r.prompt) is not int or r.prompt <= 0 or type(r.generated) is not int
@@ -72,6 +78,8 @@ class BatchSpec:
             raise ValueError(f"flush_order must be one of {FLUSH_ORDERS} and intra a layout name")
         if self.partition != "none" and self.allocation not in ("dedicated", "packed"):
             raise ValueError("partition applies to the dedicated and packed allocations")
+        if self.align not in ALIGNS:
+            raise ValueError(f"align must be one of {ALIGNS}")
         if not (self.free_order == "fresh" or self.free_order.startswith("shuffled:")
                 and self.free_order[9:].isdigit()):
             raise ValueError("free_order must be fresh or shuffled:<seed>")
@@ -314,7 +322,7 @@ class Segments(Placer):
         self.parts, self.banks, self.to_lpa = partition_geometry(self.cfg, self.spec.partition)
         self.segment = self.banks * self.cfg.pages_per_block
         self.load = [0] * self.parts
-        self.owner, self.frontier, self.segments, self.used = {}, {}, {}, {}
+        self.owner, self.frontier, self.segments, self.used, self.admitted = {}, {}, {}, {}, {}
         self.next_segment = [0] * self.parts
         super().run(timeline)
 
@@ -339,14 +347,23 @@ class Segments(Placer):
         self.owner[r] = p
         intra = LAYOUTS[self.spec.intra](self.cfg, Shape(self.shape.layers, self.shape.kv_heads, self.shape.head_dim,
                                                          request.prompt), tensors=self.tensors)
-        if self.spec.allocation == "packed":  # prompts start on a row of the partition
+        # Every prompt starts on a row of the partition; with ``stagger`` the k-th request of the
+        # partition then skips k * banks / n pages (n requests per partition, written as padding), so
+        # that layer l of different requests does not start on the same banks.
+        index = self.admitted.get(p, 0)
+        self.admitted[p] = index + 1
+        share = -(-len(self.spec.requests) // self.parts)
+        offset = index * max(self.banks // share, 1) % self.banks if self.spec.align == "stagger" else 0
+        if self.spec.allocation == "packed":
             start = self.frontier.get(p, 0)
-            aligned = -(-start // self.banks) * self.banks
+            aligned = -(-start // self.banks) * self.banks + offset
             if aligned > start:
                 self.snapshot.write(self.to_lpa(p, np.arange(start, aligned, dtype=np.int64)), "padding")
             self.frontier[p] = aligned
         else:
             self.segments[r], self.used[r] = [], 0
+            if offset:
+                self.snapshot.write(self.to_lpa(p, self.local(r, offset)), "padding")
         self.load[p] += intra.span
         local = self.local(r, intra.span)
         lpa = self.to_lpa(p, local)

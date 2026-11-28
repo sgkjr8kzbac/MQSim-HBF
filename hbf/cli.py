@@ -191,6 +191,7 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                        "allocation": requests.allocation, "partition": requests.partition,
                                        "intra": requests.intra, "flush_order": requests.flush_order,
                                        "block_tokens": requests.block_tokens, "free_order": requests.free_order,
+                                       "align": requests.align,
                                        "requests": [[r.prompt, r.generated] for r in requests.requests],
                                        "write_check": write_check},
                                    "tensors": tensors_meta(layout),
@@ -384,6 +385,9 @@ def build_parser():
                             "full pages are flushed to HBF, the partial page stays in HBM")
     batch.add_argument("--flush-order", choices=("rotate", "layer"), default="rotate",
                        help="page order of a decode flush: start at layer (flush mod L) or always at layer 0")
+    batch.add_argument("--align", choices=("stagger", "row"), default="stagger",
+                       help="dedicated/packed: start the k-th request k * banks / n pages into its row (stagger) "
+                            "or at bank 0 of a row")
     batch.add_argument("--block-tokens", type=int, help="vllm_pool: tokens per vLLM block (default: largest "
                                                         "tokens per page)")
     batch.add_argument("--free-order", default="fresh", help="vllm_pool: fresh (ascending ids) or shuffled:<seed>")
@@ -412,7 +416,7 @@ def batch_spec(args, per_stack):
     prompts = values(args.contexts, "contexts") if args.contexts is not None else [args.context] * per_stack
     generated = values(args.generated, "generated")
     spec = BatchSpec(tuple(BatchRequest(p, g) for p, g in zip(prompts, generated)), args.alloc, args.partition,
-                     args.layout, args.flush_order, args.block_tokens, args.free_order)
+                     args.layout, args.flush_order, args.block_tokens, args.free_order, args.align)
     return None if spec.default and not args.check_writes else spec, max(prompts)
 
 

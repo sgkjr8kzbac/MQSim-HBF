@@ -38,7 +38,7 @@ def test_check_write_order_counts():
 def test_dedicated_superblocks_hold_one_request_each():
     # ppb 4: a superblock is 4,096 pages; a request of 2 layers x 8 heads x 2 tensors x 128 pages fills one.
     cfg = load("ocp", pages_per_block=4)
-    spec = batch("dedicated", [(2048, 0)] * 3, intra="layer_contiguous")
+    spec = batch("dedicated", [(2048, 0)] * 3, intra="layer_contiguous", align="row")
     layout = PageTableLayout(cfg, Shape(2, 8, 128, 1), spec)
     table = layout.snapshot.table
     for r in range(3):
@@ -203,3 +203,20 @@ def test_write_check_only_on_request(tmp_path):
     with pytest.raises(SystemExit):
         main(HBF_FLAGS + ["--layers", "1", "--context", "1024", "--batch", "2", "--alloc", "packed",
                           "--free-order", "shuffled:1", "--output", str(tmp_path / "x")])
+
+
+def test_stagger_spreads_short_requests():
+    # kivi2 at 2K: one request's layer is 96 HBF pages; with every prompt at bank 0 of a row all eight
+    # requests' layer l sit on the same banks (5.3x the minimum rounds); staggering spreads them.
+    from hbf.formats import parse_format
+    cfg = load("ocp")
+    rounds = {}
+    for align in ("row", "stagger"):
+        for allocation in ("packed", "dedicated"):
+            layout = PageTableLayout(cfg, Shape(4, 8, 128, 1), batch(allocation, [(2048, 0)] * 8, align=align),
+                                     tensors=parse_format("kivi2", 128).tensors)
+            (row, *_), _ = analyze_accesses(cfg, layout, list(generate_batch(cfg, layout, "dense")))
+            rounds[allocation, align] = row["rounds"] / row["min_rounds"]
+            assert check_write_order(cfg, layout.snapshot.written())["legal"]
+    assert rounds["packed", "row"] > 5 and rounds["packed", "stagger"] < 2
+    assert rounds["dedicated", "row"] > 5 and rounds["dedicated", "stagger"] < 2
