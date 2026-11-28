@@ -1,2 +1,2 @@
-group,step,planes,layers,pages,rounds,batch_rounds,min_rounds,channel_rounds,sensed_pages,useful_bytes,burst_bytes,utilization,balance_loss,sense_amplification
-1,0,1024,2,224,2,4,2,2,224,856064,856064,0.109375,1.0,1.0
+group,step,planes,layers,pages,rounds,batch_rounds,min_rounds,channel_rounds,sensed_pages,useful_bytes,burst_bytes,est_ns,est_batches_ns,bound_ns,t_balanced_ns,t_imbalance_ns,t_protocol_ns,t_channel_ns,t_overhead_ns,attended_tokens,attended_elements,hbf_elements,hbm_bytes,dequant_ops,utilization,balance_loss,sense_amplification,max_block_reads
+1,0,1024,2,224,2,4,2,2,224,856064,856064,,,8192,8192,0,0,0,,1672,428032,428032,0,0.0,0.109375,1.0,1.0,1

@@ -1,5 +1,5 @@
-step,layer,group,planes,pages,active_planes,rounds,min_rounds,channel_rounds,utilization,balance_loss,sensed_pages,sense_amplification,useful_bytes,page_bytes,burst_bytes,read_amplification,transfer_amplification,subbatches,batch_rounds,commands,credit_rounds,link_rounds,protocol_rounds,protocol_utilization
-0,0,1,1024,416,190,6,1,1,0.06770833333333333,6.0,416,1.0,1703936,1703936,1703936,1.0,1.0,1,6,26624,12,1,12,0.033854166666666664
-0,1,1,1024,416,195,4,1,1,0.1015625,4.0,416,1.0,1703936,1703936,1703936,1.0,1.0,1,4,26624,11,1,11,0.036931818181818184
-1,0,1,1024,416,191,4,1,1,0.1015625,4.0,416,1.0,1703936,1703936,1703936,1.0,1.0,1,4,26624,9,1,9,0.04513888888888889
-1,1,1,1024,416,192,4,1,1,0.1015625,4.0,416,1.0,1703936,1703936,1703936,1.0,1.0,1,4,26624,10,1,10,0.040625
+step,layer,group,planes,pages,active_planes,rounds,min_rounds,channel_rounds,utilization,balance_loss,sensed_pages,sense_amplification,useful_bytes,page_bytes,burst_bytes,read_amplification,transfer_amplification,subbatches,batch_rounds,commands,credit_rounds,link_rounds,protocol_rounds,protocol_utilization,est_ns,est_batches_ns,bound_ns,t_balanced_ns,t_imbalance_ns,t_protocol_ns,t_channel_ns,t_overhead_ns,bottleneck,attended_tokens,attended_elements,hbf_elements,hbm_bytes,dequant_ops,attn_dims
+0,0,1,1024,416,190,6,1,1,0.06770833333333333,6.0,416,1.0,1703936,1703936,1703936,1.0,1.0,1,6,26624,12,1,12,0.033854166666666664,53002,53002,49152,4096,20480,24576,0,3850,credit,3328,851968,851968,0,0.0,256
+0,1,1,1024,416,195,4,1,1,0.1015625,4.0,416,1.0,1703936,1703936,1703936,1.0,1.0,1,4,26624,11,1,11,0.036931818181818184,48596,48596,45056,4096,12288,28672,0,3540,credit,3328,851968,851968,0,0.0,256
+1,0,1,1024,416,191,4,1,1,0.1015625,4.0,416,1.0,1703936,1703936,1703936,1.0,1.0,1,4,26624,9,1,9,0.04513888888888889,39784,39784,36864,4096,12288,20480,0,2920,credit,3328,851968,851968,0,0.0,256
+1,1,1,1024,416,192,4,1,1,0.1015625,4.0,416,1.0,1703936,1703936,1703936,1.0,1.0,1,4,26624,10,1,10,0.040625,44190,44190,40960,4096,12288,24576,0,3230,credit,3328,851968,851968,0,0.0,256
