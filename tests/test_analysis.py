@@ -553,3 +553,17 @@ def test_core_channel_bound_follows_bandwidth():
         assert row["rounds"] == 8 and step["channel_rounds"] == row["channel_rounds"]
         bounds[grade] = row["channel_rounds"]
     assert bounds == {384: 22, 1024: 8, 1536: 6, 3072: 3}
+
+
+def test_topology_preset_may_override_device_fields(tmp_path, monkeypatch):
+    import json
+    from hbf import config as cfg_mod
+    params = json.loads(cfg_mod.PARAMETERS.read_text())
+    params["topologies"]["half"] = {"channels": 16, "chips": 2, "planes": 16, "address_map": "ocp",
+                                    "plane_rule": "independent", "aggregate_gb_s": 512}
+    custom = tmp_path / "parameters.json"
+    custom.write_text(json.dumps(params))
+    monkeypatch.setattr(cfg_mod, "PARAMETERS", custom)
+    cfg = cfg_mod.load("half")
+    assert cfg.aggregate_gb_s == 512 and cfg.width == 32 and cfg.host_channels == 8
+    assert cfg_mod.load("half", aggregate_gb_s=256).aggregate_gb_s == 256
