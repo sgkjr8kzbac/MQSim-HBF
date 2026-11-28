@@ -108,7 +108,7 @@ KV 大小 = 2（K、V）× 层数 × KV 头数 × head_dim × token 数 × 每�
 | T-C1 | M6 导出脚本（HF transformers，GPU） | 新目录 `frontends/` | — | 对一个小模型导出 `access.csv`，能被 `--access-csv` 读入 | ⏳ 可认领 |
 | T-C2 | KIVI、StreamingLLM 的确定性适配器 | 新文件 | — | 与 `--format kivi2`、`--mode sink_recent` 的结果一致 | ⏳ 可认领 |
 | T-3a | 量化参数与数据同页的布局 | 并入 T-K1 | — | — | ➡️ T-K1 |
-| T-K1 | 页格式：`TensorSpec` 加 `attn_dims`、`logical_dims`；预设 `mla[:split,indexer]`、`mla_fp8`，int/kivi 的 `fused=1[,pow2=1]` | `hbf/access.py`（TensorSpec）、`hbf/formats.py`、`hbf/pages.py`、`tests/test_formats.py` | — | 设计 §3 K1 的手算值；黄金文件和引擎对照不变 | 🔄 主代理 |
+| T-K1 | 页格式：`TensorSpec` 加 `attn_dims`、`logical_dims`；预设 `mla[:split,indexer]`、`mla_fp8`，int/kivi 的 `fused=1[,pow2=1]` | `hbf/access.py`（TensorSpec）、`hbf/formats.py`、`hbf/pages.py`、`tests/test_formats.py` | — | 设计 §3 K1 的手算值；黄金文件和引擎对照不变 | ✅ 主代理完成，待子代理审查 |
 | T-K2 | KV 分组：`hbf/kvspec.py`、`GroupedLayout`、`--kv-spec`（hybrid、ssm、cla、yoco、duo、pyramid）、无读层补零行 | `hbf/kvspec.py`（新）、`hbf/cli.py`、`tests/test_kvspec.py` | — | 设计 §3 K2 的手算值；不加 `--kv-spec` 时逐位不变 | ⏳ 可认领 |
 | T-K3 | 模型预设：MLA、混合注意力、MoE（只计线性层时间） | `hbf/model.py`、`hbf/system.py`、`hbf/configs/models.json` | T-K2 的 `from_model` 接口 | 参数总量与公开值相差 < 1%，出处写进 params.md；现有预设的 TPOT 不变 | ⏳ |
 | T-K5 | 选择的真实性：存储密度、静态选择、相邻步复用、GQA 并集 | `hbf/access.py`（generate）、`hbf/pages.py`、`hbf/controller.py`（拒绝） | T-K1 | 设计 §3 K5 的手算值 | ⏳ |

@@ -97,7 +97,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | [`hbf/analysis.py`](hbf/analysis.py) | 机制分析：不跑 MQSim，按层计算读轮数、最少轮数、plane 利用率、均衡损失和感测放大，支持独立 plane 与同偏移联动两种组织；纯 Python 参考实现与 numpy 引擎结果逐行相同 |
 | [`hbf/pages.py`](hbf/pages.py) | numpy 引擎的页集合：把访问记录直接变成每层去重后的页数组（有用字节、64 B 突发、连续段数）及其位置，HBM 层字节、被注意 token 数、反量化运算量 |
 | [`hbf/timing.py`](hbf/timing.py) | 读时间估计（`--timing`）：理想下界，以及按核心通道逐轮累加、与 MQSim 校准过的估算；每块读次数 |
-| [`hbf/formats.py`](hbf/formats.py) | 命名的 KV 存储格式（`--format`）：bf16、fp8、int4/int2、kivi4/kivi2、think、quest |
+| [`hbf/formats.py`](hbf/formats.py) | 命名的 KV 存储格式（`--format`）：bf16、fp8、int4/int2、kivi4/kivi2（可选 `fused=1` 量化参数同页）、think、quest、mla/mla_fp8（可选 DSA 索引器） |
 | [`hbf/model.py`](hbf/model.py)、[`hbf/system.py`](hbf/system.py) | 模型与 GPU 预设；系统级评估：线性层与注意力计算、HBF 读与计算的重叠、TPOT、KV 全放 HBM 的基线、HBM 容量 |
 | [`hbf/simulator.py`](hbf/simulator.py) | 校验源码散列、打补丁、编译 MQSim；GC 预算检查；写轨迹；运行并对回逐请求完成日志；聚合结果 |
 | [`hbf/config.py`](hbf/config.py) | 参数文件、三套 chip 当 plane 拓扑与 `ocp` 规范示例拓扑、设备与 workload XML 的生成和互相校验、CWDP 与 OCP 地址映射、主机通道、逻辑容量上界 |
@@ -123,7 +123,7 @@ ONFI 的逐 plane 地址周期按 SSD 设计，64 个 plane 时一条命令要 4
 | 协议约束 | 分析模式可选：每主机通道的命令额度（`--mocs`，规范 MOCS 寄存器取值 1 或 256–16,384）、是否支持读突发（`--read-burst`）、读整页还是只读需要的 64 B 段（`--read-unit`）、主机发送顺序（`--host-order fcfs` 一页命令一起排队，`trigger` 先发一条触发感测）、联动组的感测假设（`--group-sense arrived|whole`，默认 arrived 只感测命令已到的页；whole 在第一条命令到达时感测整组，规范和 HBF-EventLab 都没有规定）、主机链路档位（`--ucie-grade`，48/94/188 GB/s）。给出任一协议参数就启用协议约束；不给 `--mocs` 时不限额度。不支持读突发时每页要 64 条 64 B 读命令（规范 §5.3.1）；fcfs 主机下额度会限制同时在读的页数，trigger 主机下基本不会。机制取自 HBF-EventLab，并用它的实测结果核对 |
 | 容量 | 默认每 plane 512 块，物理容量 512 GiB，与规范表 3 的数字相同；但表 3 是"用户容量"，MQSim 按 SSD 习惯预留 7%（OP），用户可见的逻辑容量为 476 GiB。HBF 没有 GC，规范中主机看不到预留空间。1,024 plane 时 MQSim 峰值内存约 4.2 GB |
 | 布局对照 | `layer_contiguous`（同层的页轮转铺满全部单元）；`vllm_interleaved`（同层只落在 32 个单元上，作为布局与映射公式冲突的对照）；`striped_contiguous`（SPLASH 式条带：每层从相位 0 开始，各 (张量, 头) 区域之间留 P/(T·H) 页的间隔；区域长度是 P 的倍数时（如 32K BF16），头之间错开 P/(2H)，V 与 K 相隔 P/2，消除各头同一块落在同一 plane 的冲突）；`striped_staggered`（同上，间隔取奇数，相邻区域还落在不同的主机通道上，在 fcfs 额度限制下更均衡） |
-| 压缩后的存储格式 | 用 `TensorSpec` 声明，或用 `--format` 选预设（bf16、fp8、int4/int2、kivi4/kivi2、think、quest，见 [`hbf/formats.py`](hbf/formats.py)）。张量可以只存一段 token（`window`，如 KIVI 量化部分 `[0, -R]`）、放在 HBM（`tier: hbm`，如 KIVI 的全精度残差窗口）、或作为每步整体读取的选择元数据（`role: meta`，如 Quest 页摘要，按每 token 一行均摊）。每页 token 数和有用字节按各张量计算 |
+| 压缩后的存储格式 | 用 `TensorSpec` 声明，或用 `--format` 选预设（bf16、fp8、int4/int2、kivi4/kivi2、think、quest、mla、mla_fp8，见 [`hbf/formats.py`](hbf/formats.py)）。张量可以只存一段 token（`window`，如 KIVI 量化部分 `[0, -R]`）、放在 HBM（`tier: hbm`，如 KIVI 的全精度残差窗口）、或作为每步整体读取的选择元数据（`role: meta`，如 Quest 页摘要，按每 token 一行均摊）。每页 token 数和有用字节按各张量计算 |
 | 读时间估计 | `--timing`：每层的理想下界（有效轮数 × tR、最忙核心通道传输、最忙主机链路取大）和估算（按核心通道逐轮累加命令、感测、R/B、传输及 cache read 重叠）。估算在 HBF 命令模型下与第 8 轮保存的 MQSim 运行逐层对照，误差不超过 4.7%（[evidence/time-calibration.csv](evidence/time-calibration.csv)）。另给出时间分解、瓶颈和每块读次数 |
 | 系统级评估 | `--model`、`--gpu`：线性层和注意力按 roofline 计时，HBF 读与计算可串行、预取或理想重叠，得到 TPOT、tokens/s，并与 KV 全放 HBM 对比、检查 HBM 容量；`--batch`、`--stacks` 近似多请求批；`python3 -m hbf.system RUN_DIR` 可换模型、GPU 或重叠方式重新评估。效率系数等假设列在报告中 |
 | 选择类方法 | StreamingLLM、SnapKV、动态选页等：访问记录本身就能表达读哪些 token 区间，部分覆盖的页按整页读并统计读放大 |
@@ -292,7 +292,9 @@ step,layer,kv_head,kind,op,token_start,token_end,bits
 | `window` | 整个上下文 | 张量存的 token 区间 `[lo, hi]`，负数从上下文末尾数起，`null` 表示开头或末尾 |
 | `tier` | `hbf` | `hbm` 表示从 HBM 读，不占 HBF 页（如每步都变的残差窗口；HBF 块内只能顺序写，§5.4.1） |
 | `role` | `data` | `aux` 表示随选中 token 一起读、但不参与注意力的逐 token 数据（如量化参数）；`meta` 表示选择元数据（如 Quest 页摘要），每种生成模式每步都整体读取；两者都不计入注意力的计算量 |
-| `dequant_ops` | 0 | 每读一个元素的 GPU 反量化运算数（假设），用于系统级评估 |
+| `dequant_ops` | 0 | 每读一个元素的 GPU 反量化运算数（假设），用于系统级评估；元素数按 `logical_dims` 计 |
+| `attn_dims` | data 张量为 `dims`，其余为 0 | 一个查询头对每个存储 token 计算的元素数（QK 加 PV）。MLA 的 576 维潜向量按 1,088 计；DSA 索引器是 `meta` 张量，按索引头的计算量给出 |
+| `logical_dims` | `dims` | 每 token 存了多少个 BF16 等效元素，用于 `hbf_elements` 和反量化。一行打包多个字段时使用，如 `fused=1` 的 KIVI 行（`bits` 8、`dims` 为字节数、`logical_dims` 为 d_k + d_v） |
 
 
 - `layer_contiguous` 按 (层, 张量, 头) 依次预留连续区域，各张量的块数可以不同。

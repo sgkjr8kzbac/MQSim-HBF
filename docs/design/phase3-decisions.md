@@ -24,3 +24,12 @@ Spot checks of the design's numbers before accepting it: MLA row 576 × 2 B = 1,
 - K2 (KV groups; track B: new `hbf/kvspec.py`, `cli.py`, `tests/test_kvspec.py`): file-disjoint from K1 and can run in parallel. It only reads the new TensorSpec fields, which default to the old behaviour.
 - K3 and K5 after K1/K2; K4 and K7 after T-B1d merges; K6 last.
 - Every milestone keeps the phase A golden files, engine parity and the phase 2A summary rows unchanged for existing flags, and ends with a review by a subagent before the next one starts.
+
+## K1 notes (main agent, as implemented)
+
+- `TensorSpec.attended_dims` and `.logical` give the defaults; `pages.layer_pages` uses them for `attended_elements`, `hbf_elements` and `dequant_ops`. Existing presets are unchanged (golden files, engine parity and the system tests pass).
+- `tensors_meta` leaves `attn_dims` and `logical_dims` out while unset.
+- `parse_format(text, head_dim, q_heads=None)`: the CLI passes the model's q_heads / kv_heads. The indexer's `attn_dims` is index_heads x index_dims / q_heads and must be an integer.
+- `mla_fp8` dequantizes only the FP8 latent (`dequant_ops` scaled by lora / (lora + rope) on the single-tensor row).
+- Parameters are numeric (`parse_params`), so tier switches are flags: `indexer=1` (HBF) or `indexer_hbm=1`.
+- After T-B1d merges, `endurance.Geometry.demand` must use `attended_dims` and `logical` the same way (it still uses `dims`); until then MLA and fused formats are not valid in `hbf.endurance`.

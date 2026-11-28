@@ -188,3 +188,101 @@ def test_unvalidated_settings_are_flagged_and_rejected_early(tmp_path):
         with pytest.raises(SystemExit):
             main(HBF_FLAGS + extra + ["--context", "1024", "--output", str(tmp_path / str(index))])
         assert not (tmp_path / str(index)).exists()
+
+
+# ---------------------------------------------------------------------------------------------
+# T-K1 page formats (docs/design/phase3-kv-terms.md section 3, K1): hand-computed values on ocp.
+
+def dense_pages(name, context, mode="dense", heads=1, q_heads=None, **generation):
+    cfg = load("ocp")
+    fmt = parse_format(name, 128, q_heads)
+    layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, heads, 128, context), tensors=fmt.tensors)
+    accesses = list(generate(cfg, layout, mode, **generation))
+    (pages,) = iter_layer_pages(cfg, layout, accesses)
+    (row,), _ = analyze_accesses(cfg, layout, accesses)
+    return fmt, layout, pages, row
+
+
+def test_mla_latent_rows():
+    fmt, layout, pages, row = dense_pages("mla", 32768)
+    assert layout.tokens_per_page == (3,) and fmt.attn_dims == 1088
+    assert len(pages) == 10_923 and row["min_rounds"] == 11  # ceil(32,768 / 3), ceil(10,923 / 1,024)
+    assert pages.attended_elements == 32768 * 1088 and pages.hbf_elements == 32768 * 576
+    _, layout, pages, _ = dense_pages("mla:split=1", 32768)
+    assert layout.tokens_per_page == (4, 32) and len(pages) == 8192 + 1024  # 9,216 pages, 15.6% fewer
+    assert pages.attended_elements == 32768 * 1088
+    _, layout, pages, _ = dense_pages("mla_fp8", 32768)
+    assert layout.tokens_per_page == (6,) and len(pages) == 5462  # 656 B rows
+    assert pages.dequant_ops == pytest.approx(32768 * 512)  # only the FP8 latent is dequantized
+
+
+def test_dsa_indexer_is_read_whole_and_attended_by_its_heads():
+    with pytest.raises(ValueError, match="q_heads"):
+        parse_format("mla:indexer=1", 128)
+    context, fraction = 131072, 2048 / 131072
+    fmt, layout, pages, _ = dense_pages("mla:indexer=1", context, "uniform_tokens", q_heads=128,
+                                        fraction=fraction, select_tokens=1, seed=5)
+    index = layout.index["K_idx"]
+    assert layout.tokens_per_page[index] == 31 and fmt.tensors[1].attended_dims == 64 * 128 // 128
+    indexer = int((pages.tensor == index).sum())
+    assert indexer == -(-context // 31) == 4229
+    data = len(pages) - indexer  # 43,691 latent pages, each touched with probability 1 - (1 - f)^3
+    assert data == pytest.approx(43_691 * (1 - (1 - fraction) ** 3), rel=.03)
+    assert indexer / len(pages) > .6
+    assert pages.attended_elements == pages.tensor_tokens["C"] * 1088 + context * 64
+    _, layout, pages, _ = dense_pages("mla:indexer_hbm=1", 1024, q_heads=16)
+    assert pages.hbm_bytes == 1024 * 132 and pages.attended_elements == 1024 * (1088 + 512)
+
+
+def test_fused_quantization_rows():
+    _, layout, pages, _ = dense_pages("kivi2:residual=0", 4096)
+    assert len(pages) == 96 and layout.block_counts == (32, 16, 32, 16)
+    fmt, layout, fused, _ = dense_pages("kivi2:residual=0,fused=1", 4096)
+    assert layout.tokens_per_page == (42,) and len(fused) == 98  # one 96 B row per token
+    assert fused.dequant_ops == pages.dequant_ops and fused.hbf_elements == pages.hbf_elements == 4096 * 256
+    assert fused.attended_elements == pages.attended_elements
+    _, layout, padded, _ = dense_pages("kivi2:residual=0,fused=1,pow2=1", 4096)
+    assert layout.tokens_per_page == (32,) and len(padded) == 128
+    for text in ("kivi2:pow2=1", "int4:fused=2", "bf16:fused=1"):
+        with pytest.raises(ValueError):
+            parse_format(text, 128)
+    assert parse_format("kivi2:fused=1", 128).tensors[1].name == "K_res"  # the HBM residual stays apart
+
+
+@pytest.mark.parametrize("name,per_block", [("kivi2:residual=0", 4.0), ("kivi2:residual=0,fused=1,pow2=1", 1.0),
+                                            ("kivi2:residual=0,fused=1", 28 / 21)])
+def test_fused_rows_cut_pages_per_selected_block(name, per_block):
+    # Every 16-token block of a 336-token context (LCM of 16 and 42) selected alone, one per step.
+    cfg = load("ocp")
+    layout = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 336), tensors=parse_format(name, 128).tensors)
+    accesses = [Access(block, 0, 0, spec.name, "R", 16 * block, 16 * block + 16, spec.bits)
+                for block in range(21) for spec in layout.tensors]
+    pages = list(iter_layer_pages(cfg, layout, accesses))
+    assert sum(len(p) for p in pages) / 21 == pytest.approx(per_block)
+
+
+def test_attention_flops_use_attn_dims():
+    from hbf.model import ModelSpec, load_gpu
+    from hbf.system import SystemOptions, evaluate
+    fmt, layout, pages, _ = dense_pages("mla", 3)
+    model = ModelSpec("mla-tiny", layers=1, hidden=256, q_heads=16, kv_heads=1, head_dim=128, intermediate=512,
+                      vocab=1000)
+    row = {"step": 0, "layer": 0, "est_ns": 0, "bound_ns": 0, "burst_bytes": 0, "hbm_bytes": 0,
+           "attended_tokens": pages.attended_tokens, "dequant_ops": 0, "attended_elements": pages.attended_elements}
+    result = evaluate([row], model, load_gpu("b200"), SystemOptions(),
+                      {"batch": 1, "analysis_batch": 1, "selection": "static"})
+    assert result.layers[0]["attn_flops"] == 2 * 16 * 3 * 1088 == 104_448
+
+
+def test_new_tensor_fields_are_optional_in_meta():
+    from hbf.access import tensors_meta
+    cfg = load("ocp")
+    plain = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 64))
+    assert set(tensors_meta(plain)[0]) == {"name", "bits", "dims", "window", "tier", "role", "dequant_ops"}
+    mla = LAYOUTS["layer_contiguous"](cfg, Shape(1, 1, 128, 64), tensors=parse_format("mla", 128).tensors)
+    assert tensors_meta(mla)[0]["attn_dims"] == 1088 and "logical_dims" not in tensors_meta(mla)[0]
+    with pytest.raises(ValueError):
+        TensorSpec("K", 16, 128, attn_dims=-1)
+    with pytest.raises(ValueError):
+        TensorSpec("K", 16, 128, logical_dims=0)
+    assert parse_tensors('[{"name": "C", "bits": 16, "dims": 576, "attn_dims": 1088}]')[0].attended_dims == 1088

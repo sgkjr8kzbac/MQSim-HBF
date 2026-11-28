@@ -49,7 +49,14 @@ class TensorSpec:
       such as Quest's page summaries, read in full every step by every generator mode and not
       attended). Per-block metadata is amortized as a per-token row (e.g. min and max keys of
       16-token blocks: 2 x 128 / 16 = 16 elements per token).
-    * ``dequant_ops`` - GPU vector operations per stored element read (an assumption of the format).
+    * ``dequant_ops`` - GPU vector operations per stored element read (an assumption of the format);
+      the elements counted are ``logical_dims`` per token.
+    * ``attn_dims`` - elements one query head multiplies per stored token (QK^T plus PV). Unset means
+      ``dims`` for data tensors and 0 for aux and meta tensors. MLA's single 576-dim latent is attended
+      as 1,088 elements (QK over 576, PV over 512); a DSA indexer is a meta tensor with attn_dims > 0.
+    * ``logical_dims`` - BF16-equivalent elements stored per token (unset: ``dims``). It feeds
+      ``hbf_elements`` and ``dequant_ops`` when one row packs several fields, e.g. a fused row of
+      2-bit K and V plus their scales (``bits=8``, ``dims`` = bytes, ``logical_dims`` = d_k + d_v).
     """
     name: str
     bits: int
@@ -58,6 +65,8 @@ class TensorSpec:
     tier: str = "hbf"
     role: str = "data"
     dequant_ops: float = 0
+    attn_dims: int | None = None
+    logical_dims: int | None = None
 
     def __post_init__(self):
         if (not isinstance(self.name, str) or not self.name.isidentifier()
@@ -74,10 +83,26 @@ class TensorSpec:
             raise ValueError(f"Tensor {self.name}: tier must be one of {TIERS} and role one of {ROLES}")
         if isinstance(self.dequant_ops, bool) or not isinstance(self.dequant_ops, (int, float)) or self.dequant_ops < 0:
             raise ValueError(f"Tensor {self.name}: dequant_ops must be a nonnegative number")
+        if self.attn_dims is not None and (type(self.attn_dims) is not int or self.attn_dims < 0):
+            raise ValueError(f"Tensor {self.name}: attn_dims must be a nonnegative integer")
+        if self.logical_dims is not None and (type(self.logical_dims) is not int or self.logical_dims <= 0):
+            raise ValueError(f"Tensor {self.name}: logical_dims must be a positive integer")
 
     @property
     def token_bytes(self):
         return self.dims * self.bits // 8
+
+    @property
+    def attended_dims(self):
+        """Elements one query head multiplies per stored token (``attn_dims`` or the role default)."""
+        if self.attn_dims is not None:
+            return self.attn_dims
+        return self.dims if self.role == "data" else 0
+
+    @property
+    def logical(self):
+        """BF16-equivalent elements stored per token."""
+        return self.dims if self.logical_dims is None else self.logical_dims
 
     def tokens(self, context):
         """The window as absolute token indices [lo, hi) of a ``context``-token sequence."""
@@ -139,8 +164,12 @@ def write_access(path, accesses):
         writer.writerows(vars(access).values() for access in accesses)
 
 
+OPTIONAL_FIELDS = ("attn_dims", "logical_dims")  # left out of meta.json while unset, so older runs compare equal
+
+
 def tensors_meta(layout):
-    return [asdict(spec) for spec in layout.all_tensors]
+    return [{key: value for key, value in asdict(spec).items() if key not in OPTIONAL_FIELDS or value is not None}
+            for spec in layout.all_tensors]
 
 
 def read_access(path):

@@ -118,7 +118,8 @@ def layer_pages(cfg, layout, step, layer, rows):
     """Pages of one (step, layer) from an (n, 4) int64 array of (head, tensor, token_start, token_end),
     where tensor indexes ``layout.all_tensors``. HBM-tier rows become ``hbm_bytes``; every row counts
     towards the tokens read per tensor (``tensor_tokens``, for dequantization) and data rows towards
-    ``attended_tokens``."""
+    ``attended_tokens``. ``attended_elements`` sums tokens x ``attended_dims`` (data tensors and any
+    tensor with ``attn_dims``), ``hbf_elements`` tokens x ``logical`` of HBF data tensors."""
     specs = layout.all_tensors
     head, g, lo, hi = rows.T
     data = np.asarray([spec.role == "data" for spec in specs])[g]
@@ -126,9 +127,10 @@ def layer_pages(cfg, layout, step, layer, rows):
     tensor_tokens = per_tensor_tokens(head, g, lo, hi, layout.shape.context, len(specs))
     hbm = np.asarray([spec.tier == "hbm" for spec in specs])
     hbm_bytes = sum(tensor_tokens[i] * specs[i].token_bytes for i in np.flatnonzero(hbm).tolist())
-    dequant = sum(tensor_tokens[i] * specs[i].dims * specs[i].dequant_ops for i in range(len(specs)))
-    elements = sum(int(tensor_tokens[i]) * specs[i].dims for i in range(len(specs)) if specs[i].role == "data")
-    hbf_elements = sum(int(tensor_tokens[i]) * specs[i].dims for i in range(len(specs))
+    dequant = sum(tensor_tokens[i] * specs[i].logical * specs[i].dequant_ops for i in range(len(specs)))
+    elements = sum(int(tensor_tokens[i]) * specs[i].attended_dims for i in range(len(specs))
+                   if specs[i].attended_dims)
+    hbf_elements = sum(int(tensor_tokens[i]) * specs[i].logical for i in range(len(specs))
                        if specs[i].role == "data" and specs[i].tier == "hbf")
     hbf_index = np.asarray([layout.index.get(spec.name, -1) for spec in specs], dtype=np.int64)
     keep = ~hbm[g]

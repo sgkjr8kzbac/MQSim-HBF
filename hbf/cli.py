@@ -444,7 +444,7 @@ def configure(args):
     kv_format = None
     if args.kv_format is not None:
         from .formats import parse_format
-        kv_format = parse_format(args.kv_format, head_dim)
+        kv_format = parse_format(args.kv_format, head_dim, model.q_heads // model.kv_heads if model else None)
     tensors = kv_format.tensors if kv_format else parse_tensors(args.tensors)
     if type(args.batch) is not int or args.batch < 1 or type(args.stacks) is not int or args.stacks < 1:
         raise ValueError("--batch and --stacks must be positive")
