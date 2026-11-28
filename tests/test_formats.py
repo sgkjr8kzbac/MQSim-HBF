@@ -5,12 +5,13 @@ import json
 import pytest
 
 from hbf.access import LAYOUTS, Access, Shape, TensorSpec, generate, parse_tensors
-from hbf.analysis import analyze, analyze_accesses
+from hbf.analysis import analyze_accesses
 from hbf.cli import main
 from hbf.config import load
 from hbf.controller import schedule
 from hbf.formats import parse_format
 from hbf.pages import iter_layer_pages
+from tests.reference import analyze
 
 
 def kivi_layout(context=1000):
@@ -86,7 +87,7 @@ def test_engines_agree_on_windowed_formats(mode):
     for name in ("kivi2", "kivi4:residual=0", "quest"):
         layout = LAYOUTS["striped_contiguous"](cfg, Shape(2, 4, 128, 3000), tensors=parse_format(name, 128).tensors)
         accesses = list(generate(cfg, layout, mode, steps=2, fraction=.07, seed=3, count=40))
-        assert analyze_accesses(cfg, layout, accesses, (1, 16), engine="numpy") == analyze(
+        assert analyze_accesses(cfg, layout, accesses, (1, 16), timing=False) == analyze(
             cfg, schedule(cfg, layout, accesses), (1, 16))
 
 
@@ -144,7 +145,7 @@ def test_batched_trace_must_cover_every_request(tmp_path):
 def test_reevaluation_infers_the_analysed_batch(tmp_path):
     from hbf.system import main as system_main
     run = tmp_path / "r"
-    main(HBF_FLAGS + ["--timing", "--layers", "32", "--context", "1024", "--batch", "4", "--output", str(run)])
+    main(HBF_FLAGS + ["--layers", "32", "--context", "1024", "--batch", "4", "--output", str(run)])
     result = system_main([str(run), "--model", "llama-3.1-8b", "--gpu", "h100-sxm", "--batch", "4",
                           "--output", str(tmp_path / "ok")])
     assert result.steps[0]["tpot_hbf_bound_ns"] > 0
@@ -157,13 +158,13 @@ def test_step_without_hbf_pages_still_reports(tmp_path):
     trace = tmp_path / "trace.csv"
     trace.write_text("step,layer,kv_head,kind,op,token_start,token_end,bits\n0,0,0,K_res,R,128,256,16\n"
                      "0,0,0,V_res,R,128,256,16\n")
-    main(HBF_FLAGS + ["--timing", "--format", "kivi2", "--layers", "1", "--heads", "1", "--context", "256",
+    main(HBF_FLAGS + ["--format", "kivi2", "--layers", "1", "--heads", "1", "--context", "256",
                       "--access-csv", str(trace), "--output", str(tmp_path / "hbm")])
     report = (tmp_path / "hbm" / "report.md").read_text()
     assert "| 1 | 0 | 1 | 0 | 0 |" in report and "—" in report
     main(["--topology", "ocp", "--analysis-only", "--format", "kivi2", "--layers", "1", "--heads", "1",
           "--context", "256", "--access-csv", str(trace), "--output", str(tmp_path / "plain")])
-    assert not (tmp_path / "plain" / "analysis_layers.csv").exists()  # no HBF rows, as the reference engine
+    assert (tmp_path / "plain" / "analysis_layers.csv").is_file()  # timing is always computed (zero row kept)
 
 
 def test_attended_elements_skip_scales_and_metadata():
@@ -176,16 +177,16 @@ def test_attended_elements_skip_scales_and_metadata():
 
 
 def test_format_attention_dims_without_model(tmp_path):
-    main(HBF_FLAGS + ["--timing", "--format", "think", "--context", "1024", "--output", str(tmp_path / "t")])
+    main(HBF_FLAGS + ["--format", "think", "--context", "1024", "--output", str(tmp_path / "t")])
     (row, *_) = csv.DictReader((tmp_path / "t" / "analysis_layers.csv").open())
     assert row["attn_dims"] == "192"
     assert json.loads((tmp_path / "t" / "meta.json").read_text())["format"]["name"] == "think"
 
 
 def test_unvalidated_settings_are_flagged_and_rejected_early(tmp_path):
-    main(HBF_FLAGS + ["--timing", "--read-ns", "2000", "--context", "1024", "--output", str(tmp_path / "r")])
+    main(HBF_FLAGS + ["--read-ns", "2000", "--context", "1024", "--output", str(tmp_path / "r")])
     assert "未经验证" in (tmp_path / "r" / "report.md").read_text()
-    for index, extra in enumerate((["--timing", "--placement", "mqsim"], ["--gpu", "h100-sxm"],
+    for index, extra in enumerate((["--placement", "mqsim"], ["--gpu", "h100-sxm"],
                                    ["--overlap", "ideal"])):
         with pytest.raises(SystemExit):
             main(HBF_FLAGS + extra + ["--context", "1024", "--output", str(tmp_path / str(index))])
@@ -313,7 +314,7 @@ def test_engines_agree_on_non_64b_aligned_formats(name, q_heads, mode):
     accesses = list(generate(cfg, layout, mode, steps=1, fraction=.07, seed=3, count=40))
     for protocol in (None, Protocol(256, read_unit="wanted"), Protocol(256, read_burst=True, read_unit="wanted")):
         expected = analyze(cfg, schedule(cfg, layout, accesses), (1, 16), protocol=protocol)
-        actual = analyze_accesses(cfg, layout, accesses, (1, 16), protocol=protocol, engine="numpy")
+        actual = analyze_accesses(cfg, layout, accesses, (1, 16), protocol=protocol, timing=False)
         assert actual == expected
 
 

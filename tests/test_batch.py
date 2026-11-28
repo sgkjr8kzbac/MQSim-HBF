@@ -154,7 +154,7 @@ def test_placement_flags_in_the_pipeline(tmp_path):
 def test_default_batch_flags_keep_phase_a_outputs(tmp_path):
     for name, extra in (("plain", []), ("explicit", ["--alloc", "layer_major", "--generated", "0"])):
         main(HBF_FLAGS + ["--layers", "2", "--context", "2048", "--batch", "3", "--mode", "uniform_tokens",
-                          "--timing", "--output", str(tmp_path / name)] + extra)
+                          "--output", str(tmp_path / name)] + extra)
     for file in ("analysis_layers.csv", "analysis_steps.csv", "access.csv"):
         assert (tmp_path / "plain" / file).read_bytes() == (tmp_path / "explicit" / file).read_bytes()
 

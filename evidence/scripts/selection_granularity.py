@@ -1,3 +1,4 @@
+# 只在 tag baseline-pre-refactor 上使用（R2 后不再维护）。
 import csv, sys
 from statistics import mean
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[2]))

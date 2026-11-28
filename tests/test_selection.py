@@ -10,12 +10,13 @@ import numpy as np
 import pytest
 
 from hbf.access import LAYOUTS, Access, Shape, TensorSpec, generate, parse_density, parse_tensors, tensors_meta
-from hbf.analysis import analyze, analyze_accesses
+from hbf.analysis import analyze_accesses
 from hbf.cli import main
 from hbf.config import load
 from hbf.controller import schedule
 from hbf.formats import parse_format
 from hbf.pages import iter_layer_pages
+from tests.reference import analyze
 
 
 def test_density_validation_and_meta():
@@ -116,8 +117,6 @@ def test_schedule_rejects_density_less_than_one():
     accesses = list(generate(cfg, layout, "dense"))
     with pytest.raises(ValueError, match="density"):
         schedule(cfg, layout, accesses)
-    with pytest.raises(ValueError, match="density"):
-        analyze_accesses(cfg, layout, accesses, engine="python")
 
 
 @pytest.mark.parametrize("mode", ["uniform_tokens", "uniform_pages"])
@@ -168,7 +167,7 @@ def test_reuse_full_and_engine_parity():
     assert p1.attended_tokens == p0.attended_tokens
     # Reference and numpy engines agree when reuse > 0 (op="H" skipped by both for HBF pages).
     accesses = list(generate(cfg, layout, "uniform_tokens", steps=2, fraction=0.1, seed=3, reuse=0.8))
-    assert analyze_accesses(cfg, layout, accesses, (1, 16), engine="numpy") == analyze(
+    assert analyze_accesses(cfg, layout, accesses, (1, 16), timing=False) == analyze(
         cfg, schedule(cfg, layout, accesses), (1, 16))
 
 
@@ -245,7 +244,7 @@ def test_cli_round_trip_and_default_meta_unchanged(tmp_path):
 
     # --density 1/4 at ctx 32,768 -> 512 pages per (head, tensor).
     dense_q = tmp_path / "density"
-    main(HBF_FLAGS + ["--timing", "--layers", "1", "--heads", "8", "--context", "32768", "--density", "1/4",
+    main(HBF_FLAGS + ["--layers", "1", "--heads", "8", "--context", "32768", "--density", "1/4",
                       "--output", str(dense_q)])
     (row,) = csv.DictReader((dense_q / "analysis_layers.csv").open())
     assert int(row["pages"]) == 8 * 2 * 512
@@ -253,7 +252,7 @@ def test_cli_round_trip_and_default_meta_unchanged(tmp_path):
 
     # --select-static + --reuse 0.8 + --query-groups 4, plus access.csv round-trip.
     sel = tmp_path / "sel"
-    main(HBF_FLAGS + ["--timing", "--mode", "uniform_tokens", "--layers", "1", "--heads", "8", "--context", "8192",
+    main(HBF_FLAGS + ["--mode", "uniform_tokens", "--layers", "1", "--heads", "8", "--context", "8192",
                       "--steps", "2", "--fraction", "0.05", "--select-static", "--reuse", "0.8",
                       "--query-groups", "4", "--output", str(sel)])
     steps = list(csv.DictReader((sel / "analysis_steps.csv").open()))
@@ -266,7 +265,7 @@ def test_cli_round_trip_and_default_meta_unchanged(tmp_path):
     assert sel_meta["generator"]["query_groups"] == 4
     # Re-importing access.csv reproduces analysis_steps.csv identically.
     reimp = tmp_path / "reimp"
-    main(HBF_FLAGS + ["--timing", "--layers", "1", "--heads", "8", "--context", "8192",
+    main(HBF_FLAGS + ["--layers", "1", "--heads", "8", "--context", "8192",
                       "--access-csv", str(sel / "access.csv"), "--output", str(reimp)])
     assert (reimp / "analysis_steps.csv").read_text() == (sel / "analysis_steps.csv").read_text()
 
@@ -391,7 +390,7 @@ def test_channel_select_realism_options_and_parity(fmt_text):
                         query_groups=2, **extra))
     pages = list(iter_layer_pages(cfg, layout, acc))
     assert pages[0].hbm_bytes == 0 and pages[2].hbm_bytes > 0
-    assert analyze_accesses(cfg, layout, acc, (1, 16), engine="numpy") == analyze(
+    assert analyze_accesses(cfg, layout, acc, (1, 16), timing=False) == analyze(
         cfg, schedule(cfg, layout, acc), (1, 16))
 
 
@@ -415,7 +414,7 @@ def test_channel_select_validation():
 def test_channel_select_cli_end_to_end(tmp_path):
     # Loki end-to-end at ctx=32,768.
     loki_out = tmp_path / "loki"
-    main(HBF_FLAGS + ["--timing", "--format", "loki:rank=32", "--mode", "channel_select",
+    main(HBF_FLAGS + ["--format", "loki:rank=32", "--mode", "channel_select",
                       "--layers", "1", "--heads", "1", "--context", "32768", "--fraction", "0.1",
                       "--output", str(loki_out)])
     loki_meta = json.loads((loki_out / "meta.json").read_text())
@@ -426,14 +425,14 @@ def test_channel_select_cli_end_to_end(tmp_path):
 
     # SparQ end-to-end + access.csv round-trip.
     sparq_out = tmp_path / "sparq"
-    main(HBF_FLAGS + ["--timing", "--format", "sparq:channels=32,groups=8", "--mode", "channel_select",
+    main(HBF_FLAGS + ["--format", "sparq:channels=32,groups=8", "--mode", "channel_select",
                       "--layers", "1", "--heads", "2", "--context", "4096", "--fraction", "0.1",
                       "--output", str(sparq_out)])
     sparq_meta = json.loads((sparq_out / "meta.json").read_text())
     assert sparq_meta["generator"]["channels"] == 32
     assert len(sparq_meta["generator"]["channel_groups"]) == 8
     reimp = tmp_path / "sparq-reimp"
-    main(HBF_FLAGS + ["--timing", "--format", "sparq:channels=32,groups=8",
+    main(HBF_FLAGS + ["--format", "sparq:channels=32,groups=8",
                       "--layers", "1", "--heads", "2", "--context", "4096",
                       "--access-csv", str(sparq_out / "access.csv"), "--output", str(reimp)])
     assert (reimp / "analysis_steps.csv").read_text() == (sparq_out / "analysis_steps.csv").read_text()

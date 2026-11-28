@@ -64,7 +64,7 @@ def test_breakdown_with_credit_limits():
 
 
 def test_read_time_parameter_changes_channel_rounds(tmp_path):
-    main(["--topology", "ocp", "--layers", "1", "--context", "8192", "--analysis-only", "--timing",
+    main(["--topology", "ocp", "--layers", "1", "--context", "8192", "--analysis-only",
           "--read-ns", "8192", "--output", str(tmp_path / "r")])
     (row,) = csv.DictReader((tmp_path / "r" / "analysis_layers.csv").open())
     assert row["channel_rounds"] == "4"  # ceil(256 pages x 128 ns / 8,192 ns)
@@ -100,12 +100,13 @@ def test_block_reads_accumulate_over_the_layers_of_a_step():
     assert step["max_block_reads"] == 64
 
 
-def test_timing_needs_numpy_engine(tmp_path):
-    with pytest.raises(ValueError, match="numpy engine"):
-        pipeline(load("ocp"), Shape(1, 8, 128, 1024), "layer_contiguous", tmp_path / "x", None, engine="python",
-                 timing=True)
-    with pytest.raises(SystemExit):
-        main(["--topology", "ocp", "--analysis-only", "--timing", "--engine", "python"])
+def test_ocp_default_enables_hbf_command_model(tmp_path):
+    cfg = load()
+    assert (cfg.address_map, cfg.plane_rule, cfg.read_plane_ns, cfg.coalesce_ns, cfg.cache_read) == (
+        "ocp", "independent", 0, 1, True)
+    main(["--analysis-only", "--layers", "1", "--context", "8192", "--output", str(tmp_path / "def")])
+    (row,) = csv.DictReader((tmp_path / "def" / "analysis_layers.csv").open())
+    assert int(row["est_ns"]) > 0 and "未经验证" not in (tmp_path / "def" / "report.md").read_text()
 
 
 def test_calibration_evidence_within_five_percent():

@@ -431,14 +431,13 @@ def phase_a(directory, model, gpu, kv_format, batch, context, *, mode="dense", g
     from .cli import build_parser, configure, pipeline
     argv = HBF_FLAGS + ["--layout", "striped_contiguous", "--model", model, "--gpu", gpu,
                         "--format", kv_format or "bf16", "--mode", mode, "--context", str(context),
-                        "--batch", str(batch), "--analysis-only", "--timing", "--output", str(directory)]
+                        "--batch", str(batch), "--analysis-only", "--output", str(directory)]
     if kv_spec:
         argv += ["--kv-spec", kv_spec]
     for key, value in (generation or {}).items():
         argv += [f"--{key.replace('_', '-')}", str(value)]
     argv += list(device)
-    if alloc != "layer_major" or partition != "none":
-        argv += ["--alloc", alloc, "--partition", partition]
+    argv += ["--alloc", alloc, "--partition", partition]
     parser = build_parser()
     args = parser.parse_args(argv)
     run = configure(args)
@@ -482,7 +481,7 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
     batches = tuple(batches or calibration_batches(model, kv_format, context, kv_spec=kv_spec))
     inputs = {"model": model, "gpu": gpu, "format": kv_format, "mode": mode, "generation": generation or {},
               "context": context, "batches": list(batches), "device": list(device), "policy": policy,
-              "partition": partition, "snapshot_batch": snapshot_batch, "version": 3}
+              "partition": partition, "snapshot_batch": snapshot_batch, "version": 4}
     if kv_spec:
         inputs["kv_spec"] = kv_spec
     digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]

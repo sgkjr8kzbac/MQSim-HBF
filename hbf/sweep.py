@@ -115,7 +115,7 @@ class Tool:
 
 TOOLS = {
     "analysis": Tool("hbf.cli", build_parser, configure, _analysis_check, _analysis_execute, lambda: METRICS,
-                     ("--analysis-only", "--timing"), ("output", "help", "analysis_only", "timing")),
+                     ("--analysis-only",), ("output", "help", "analysis_only")),
     "endurance": Tool("hbf.endurance", lambda: _endurance().build_parser(), lambda args: _endurance().configure(args),
                       _endurance_check, _endurance_execute, lambda: _endurance().METRICS, (), ("output", "help")),
 }

@@ -1,3 +1,4 @@
+# 只在 tag baseline-pre-refactor 上使用（R2 后不再维护）。
 """Compare the analysis read-time estimate with MQSim, layer by layer, on kept MQSim run directories.
 
 usage: python evidence/scripts/time_calibration.py RUN_DIR... > evidence/time-calibration.csv

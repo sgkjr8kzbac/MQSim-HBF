@@ -1,3 +1,4 @@
+# 只在 tag baseline-pre-refactor 上使用（R2 后不再维护）。
 """Markdown tables of the phase A sweeps (evidence/phase2a/*.csv) used in REPORT.
 
 usage: python evidence/scripts/phase2a_tables.py [evidence/phase2a]

@@ -203,8 +203,9 @@ def test_cli_pads_missing_sparse_layers_under_timing(tmp_path):
 @pytest.mark.parametrize("intra", ["contiguous", "striped"])
 def test_grouped_layout_engine_parity(spec_text, intra):
     # L6: numpy and pure-Python reference engines must agree row-by-row on GroupedLayout.
-    from hbf.analysis import Protocol, analyze
+    from hbf.analysis import Protocol
     from hbf.controller import schedule
+    from tests.reference import analyze
     cfg = load("ocp")
     shape = Shape(6, 4, 128, 4096)
     spec = parse_kvspec(spec_text, shape.layers, shape.kv_heads, shape.context)
@@ -213,7 +214,7 @@ def test_grouped_layout_engine_parity(spec_text, intra):
     for mode in ("dense", "uniform_tokens", "sink_recent"):
         accesses = list(generate_grouped(cfg, layout, mode, fraction=.1, seed=2))
         expected = analyze(cfg, schedule(cfg, layout, accesses), (1, 16), protocol=protocol)
-        actual = analyze_accesses(cfg, layout, accesses, (1, 16), protocol=protocol, engine="numpy")
+        actual = analyze_accesses(cfg, layout, accesses, (1, 16), protocol=protocol, timing=False)
         assert actual == expected
 
 

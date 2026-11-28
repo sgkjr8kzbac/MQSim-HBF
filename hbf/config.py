@@ -283,7 +283,7 @@ def parse_topology(topology, named=None):
     return {"channels": channels, "chips": chips}
 
 
-def load(topology="64x16", **overrides):
+def load(topology="ocp", **overrides):
     params = json.loads(PARAMETERS.read_text())
     fields = parse_topology(topology, params.pop("topologies"))
     reference = params.pop("calibration_reference")

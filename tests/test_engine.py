@@ -4,11 +4,11 @@ import itertools
 import pytest
 
 from hbf.access import LAYOUTS, Shape, TensorSpec, generate
-from hbf.analysis import Protocol, analyze, analyze_accesses, locate
-from hbf.cli import pipeline
+from hbf.analysis import Protocol, analyze_accesses, locate
 from hbf.config import load
 from hbf.controller import schedule
 from hbf.pages import iter_layer_pages, place
+from tests.reference import analyze
 
 TWO_BIT = (TensorSpec("K", 2, 128), TensorSpec("V", 2, 128))
 KIVI_LIKE = (TensorSpec("K", 2, 128), TensorSpec("K_scale", 16, 8), TensorSpec("V", 2, 128), TensorSpec("V_scale", 16, 8))
@@ -65,7 +65,7 @@ def test_numpy_engine_rows_equal_reference(topology, mode, batch_pages):
         protocols = PROTOCOLS + ((Protocol(ucie_grade=1),) if cfg.host_channels <= 8 else ())
         for protocol in protocols:
             expected = analyze(cfg, schedule(cfg, layout, accesses), groups, protocol=protocol)
-            actual = analyze_accesses(cfg, layout, accesses, groups, protocol=protocol, engine="numpy")
+            actual = analyze_accesses(cfg, layout, accesses, groups, protocol=protocol, timing=False)
             for want, got in zip(expected, actual):
                 assert len(want) == len(got)
                 for row, other in zip(want, got):
@@ -73,19 +73,9 @@ def test_numpy_engine_rows_equal_reference(topology, mode, batch_pages):
                     assert all(row[k] == other[k] and type(row[k]) is type(other[k]) for k in row), (row, other)
 
 
-def test_engine_choice_keeps_files_identical(tmp_path):
-    cfg = load("ocp")
-    shape = Shape(2, 8, 128, 8192)
-    for engine in ("numpy", "python"):
-        pipeline(cfg, shape, "striped_contiguous", tmp_path / engine, None, mode="uniform_tokens",
-                 generation={"fraction": .05}, plane_groups=(1, 16), protocol=Protocol(256), engine=engine)
-    for name in ("analysis_layers.csv", "analysis_steps.csv", "report.md"):
-        assert (tmp_path / "numpy" / name).read_bytes() == (tmp_path / "python" / name).read_bytes()
-
-
-def test_numpy_engine_rejects_mqsim_placement():
-    cfg, layout, accesses = workload("ocp", "layer_contiguous", "dense", None)
-    with pytest.raises(ValueError, match="static placement"):
-        analyze_accesses(cfg, layout, accesses, mode="mqsim", engine="numpy")
-    assert analyze_accesses(cfg, layout, accesses, mode="mqsim") == analyze(
-        cfg, schedule(cfg, layout, accesses), mode="mqsim")
+def test_removed_cli_flags_are_rejected():
+    from hbf.cli import build_parser
+    parser = build_parser()
+    for flag in (["--engine", "python"], ["--timing"], ["--placement", "mqsim"], ["--dbsy-ns", "0"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(flag)

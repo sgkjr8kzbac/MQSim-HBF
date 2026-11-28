@@ -317,11 +317,28 @@ def test_multiplane_runs_reject_unwritten_reads(binary, tmp_path):
     cfg = load("2x1", planes=8, blocks_per_plane=16, plane_rule="independent", aggregate_gb_s=128)
     with pytest.raises(ValueError, match="never written"):
         pipeline(cfg, Shape(1, 2, 128, 256), "layer_contiguous", tmp_path / "no-prefill", binary,
-                 mode="uniform_pages")
+                 mode="uniform_pages", prefill_layout=False)
     one_plane = load("2x8", blocks_per_plane=16, aggregate_gb_s=128)
     _, _, _, stats = pipeline(one_plane, Shape(1, 2, 128, 256), "layer_contiguous", tmp_path / "chips", binary,
                               mode="uniform_pages")
     assert stats["unwritten_reads"] > 0  # allowed with one plane per chip, where the offset has no effect
+
+
+def test_default_cli_runs_compliant_ocp_with_auto_prefill(binary, tmp_path):
+    """R2 acceptance: running with no device/topology/prefill/timing flags gives compliant ocp results."""
+    import json
+    from hbf.cli import main
+    out_a = tmp_path / "default-analysis"
+    main(["--analysis-only", "--layers", "1", "--heads", "2", "--context", "256", "--output", str(out_a)])
+    assert (out_a / "analysis_layers.csv").is_file()
+    report_a = (out_a / "report.md").read_text()
+    assert "拓扑 `ocp`" in report_a and "T-CACHE 开" in report_a and "## 读时间估计" in report_a
+    out_m = tmp_path / "default-mqsim"
+    main(["--layers", "1", "--heads", "2", "--context", "256", "--blocks-per-plane", "32", "--output", str(out_m)])
+    meta = json.loads((out_m / "meta.json").read_text())
+    stats = json.loads((out_m / "statistics.json").read_text())
+    assert meta["prefill"] and stats["unwritten_reads"] == 0 and stats["Issued_Flash_Multiplane_Program_CMD"] > 0
+    assert (out_m / "layers.csv").is_file() and (out_m / "analysis_layers.csv").is_file()
 
 
 def test_independent_rule_does_not_combine_mismatched_page_writes(binary, evidence):

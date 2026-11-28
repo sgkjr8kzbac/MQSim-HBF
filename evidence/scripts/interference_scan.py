@@ -1,3 +1,4 @@
+# 只在 tag baseline-pre-refactor 上使用（R2 后不再维护）。
 """E5.6: how much decode flushes, refresh and erases stretch TPOT (hbf.interference), as a table.
 
 usage: python evidence/scripts/interference_scan.py OUTPUT_DIR [--jobs N]

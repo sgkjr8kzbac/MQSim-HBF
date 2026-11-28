@@ -85,7 +85,7 @@ def test_t9_dense_matrix(binary, evidence, topology, contiguous_baseline, interl
 @pytest.mark.scale
 @pytest.mark.parametrize("size", [1024, 4096, 8192, 16384, 32768])
 def test_t10_performance(binary, evidence, size):
-    cfg = load()
+    cfg = load("64x16")
     directory = evidence / f"t10-{size}"
     _, _, _, stats = simulate(cfg, [Batch(0, 0, 0, 0, tuple(Request(i) for i in range(size)))],
                               directory, binary)
@@ -96,7 +96,7 @@ def test_t10_performance(binary, evidence, size):
 
 @pytest.mark.scale
 def test_t10_64k_split_comparison(binary, evidence):
-    cfg = load()
+    cfg = load("64x16")
     pages = tuple(Request(i) for i in range(65536))
     unsplit = [Batch(0, 0, 0, 0, pages)]
     split = [Batch(0, 0, i // cfg.batch_pages, i // cfg.batch_pages * cfg.interval_ns,

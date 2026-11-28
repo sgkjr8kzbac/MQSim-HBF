@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from .access import (LAYOUTS, MODES, Shape, default_tensors, generate, parse_density, parse_tensors, read_access,
                      tensors_meta, write_access)
-from .analysis import (ENGINES, GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group,
+from .analysis import (GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group,
                        check_protocol, plane_geometry, summarize)
 from .config import MAX_BATCH_PAGES, load
 from .controller import schedule_run, unwritten_reads
@@ -176,15 +176,14 @@ def _pad_timing_rows(cfg, layer_rows, step_rows, plane_groups, layers, steps, pr
 
 
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
-             input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=False,
-             placement="static", protocol=None, engine="auto", timing=False, system=None, kv_format=None,
-             requests=None, check_writes=False, kv_spec=None):
-    """Schedule the accesses, write the mechanism analysis, and run MQSim unless binary is None.
+             input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=None,
+             protocol=None, system=None, kv_format=None, requests=None, check_writes=False, kv_spec=None):
+    """Schedule the accesses, write the mechanism analysis (with read-time estimates), and run
+    MQSim unless binary is None.
 
-    Without MQSim and with static placement the analysis needs no request schedule, so the numpy
-    engine works on the accesses directly; the rows are identical either way. ``requests`` is
-    (requests per stack, KV heads per request) of a ``--batch`` emulation: an imported trace must
-    use every request's heads.
+    Single-request multi-plane MQSim runs without an imported trace auto-prefill the layout when
+    ``prefill_layout`` is ``None`` (the default). ``requests`` is (requests per stack, KV heads per
+    request) of a ``--batch`` emulation: an imported trace must use every request's heads.
     """
     generation = {
         "steps": 1, "seed": 1, "fraction": .1, "count": 4, "unit": 0,
@@ -257,6 +256,11 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
             "kv_format": kv_format.name if kv_format else "tensors" if tensors else "bf16",
             "overlap": system["options"].overlap, "kv_consume": system["options"].kv_consume}
     fmt = kv_format
+    if prefill_layout is None:
+        prefill_layout = (binary is not None and cfg.planes > 1 and input_csv is None
+                          and not isinstance(requests, BatchSpec) and mode != "write_then_read")
+    if prefill_layout and any(access.op == "W" for access in accesses):
+        raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
     dump(directory / "meta.json", {"shape": asdict(shape), "layout": layout_name,
                                    "system": system_meta,
                                    "format": None if fmt is None else {"name": fmt.name, "params": fmt.params,
@@ -273,23 +277,18 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                    "input_csv": str(input_csv) if input_csv else None,
                                    "prefill": prefill_layout and
                                    f"every LPA in [{layout.base}, {layout.base + layout.span}) in order",
-                                   "placement": placement,
+                                   "placement": "static",
                                    "protocol": None if protocol is None else asdict(protocol),
                                    "argv": sys.argv} | ({} if kv_spec is None else {"kv_spec": spec_meta(kv_spec)}))
-    if prefill_layout and any(access.op == "W" for access in accesses):
-        raise ValueError("--prefill writes the whole layout; the accesses must not contain writes")
-    needs_schedule = (binary is not None or placement == "mqsim" or engine == "python" or prefill_layout
-                      or any(access.op == "W" for access in accesses))
+    needs_schedule = binary is not None or prefill_layout or any(access.op == "W" for access in accesses)
     batches = schedule_run(cfg, layout, accesses, prefill_layout) if needs_schedule else []
-    layer_rows, step_rows = analyze_accesses(cfg, layout, accesses, plane_groups, placement, protocol, engine,
-                                             batches=batches if needs_schedule else None, timing=timing)
-    if timing:
-        expected_steps = range(generation["steps"]) if input_csv is None else ()
-        layer_rows, step_rows = _pad_timing_rows(cfg, layer_rows, step_rows, plane_groups, shape.layers,
-                                                 expected_steps, protocol)
-        attn_dims = fmt.attn_dims if fmt else 2 * shape.head_dim
-        for row in layer_rows:
-            row["attn_dims"] = attn_dims
+    layer_rows, step_rows = analyze_accesses(cfg, layout, accesses, plane_groups, protocol, timing=True)
+    expected_steps = range(generation["steps"]) if input_csv is None else ()
+    layer_rows, step_rows = _pad_timing_rows(cfg, layer_rows, step_rows, plane_groups, shape.layers,
+                                             expected_steps, protocol)
+    attn_dims = fmt.attn_dims if fmt else 2 * shape.head_dim
+    for row in layer_rows:
+        row["attn_dims"] = attn_dims
     if layer_rows:
         write_table(directory / "analysis_layers.csv", layer_rows)
         write_table(directory / "analysis_steps.csv", step_rows)
@@ -304,16 +303,15 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
         switches.append("T-CACHE 开")
     report = ["# 本次运行", "", f"布局 `{layout_name}`，拓扑 `{topology_name(cfg)}`：{hierarchy}；"
               f"{'，'.join(switches)}。子批 {len(batches) if needs_schedule else subbatch_count(layer_rows, plane_groups)} 个。"
-              f"机制分析的页位置：{placement}。", ""]
-    if unwritten and (binary is not None or placement == "mqsim"):
+              "机制分析的页位置：static。", ""]
+    if unwritten and binary is not None:
         report += [f"有 {unwritten} 次读的页在本次运行中没有写过。OCP 规范对这种读返回错误 0x7（表 12）；"
                    "机制分析按静态位置计算时假定数据已在 HBF 中。需要 MQSim 按规范放置时请加 `--prefill`。", ""]
     if layer_rows:
         report += analysis_report(layer_rows, step_rows) + [""]
         if protocol is not None:
             report += protocol_report(step_rows, protocol) + [""]
-        if timing:
-            report += timing_report(cfg, step_rows, plane_groups, protocol) + [""]
+        report += timing_report(cfg, step_rows, plane_groups, protocol) + [""]
     if write_check is not None:
         report += write_check_report(cfg, requests, write_check) + [""]
     if system is not None:
@@ -349,8 +347,8 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--topology", default="64x16",
-                        help="ocp (16 host channels, Figure 4), ocp-8ch (8 host channels, grade 1), "
+    parser.add_argument("--topology", default="ocp",
+                        help="ocp (16 host channels, Figure 4; default), ocp-8ch (8 host channels, grade 1), "
                              "16x64, 64x16, 256x4 or any <channels>x<chips per channel>")
     parser.add_argument("--layout", choices=LAYOUTS, default="layer_contiguous")
     parser.add_argument("--mode", choices=MODES, default="dense")
@@ -402,12 +400,11 @@ def build_parser():
                              "(1 = independent planes, the default)")
     parser.add_argument("--prefill", action="store_true",
                         help="write every address of the layout (padding included) in order before the "
-                             "reads, as the OCP spec requires; needed for multi-plane MQSim runs")
+                             "reads, as the OCP spec requires (automatic for single-request multi-plane MQSim runs)")
     parser.add_argument("--plane-rule", choices=("independent", "lockstep"),
                         help="T-PLANE multi-plane rule; without it MQSim keeps its upstream same-page rule")
     parser.add_argument("--planes", type=int,
                         help="planes per MQSim die (with --topology Cx1 this gives the real die/plane hierarchy)")
-    parser.add_argument("--dbsy-ns", type=int, help="t_DBSY between planes of a multi-plane command (T-PLANE)")
     parser.add_argument("--read-plane-ns", type=int,
                         help="T-CMD: a read command for n planes costs the single-plane command plus (n-1) "
                              "times this step, instead of ONFI's 6*t_WC + t_DBSY per extra plane")
@@ -417,9 +414,6 @@ def build_parser():
     parser.add_argument("--coalesce-ns", type=int,
                         help="T-CMD: hold newly received transactions this long before dispatching, so that "
                              "a batch leaves as full multi-plane commands")
-    parser.add_argument("--placement", choices=("static", "mqsim"), default="static",
-                        help="page offsets for the mechanism analysis: static follows the OCP spec "
-                             "(address decides bank and page); mqsim follows MQSim's allocation order")
     parser.add_argument("--mocs", type=int,
                         help="analysis: outstanding commands per host channel (OCP MOCS: 1 or 256-16384, power "
                              "of two); enables the protocol-limited rounds. Any protocol flag enables them; "
@@ -436,9 +430,6 @@ def build_parser():
                              "whole senses the group's offset at the first command (an assumption)")
     parser.add_argument("--ucie-grade", type=int, choices=(1, 2, 3),
                         help="analysis: bound rounds by the host link (48/94/188 GB/s per channel)")
-    parser.add_argument("--engine", choices=ENGINES, default="auto",
-                        help="mechanism analysis engine: numpy (vectorised) or python (reference); auto picks numpy "
-                             "for static placement. Both give identical results")
     parser.add_argument("--analysis-only", action="store_true",
                         help="write the mechanism analysis without building or running MQSim")
     parser.add_argument("--output", type=Path)
@@ -449,10 +440,7 @@ def build_parser():
     device.add_argument("--erase-ns", type=int, help="block erase time (default 1000000)")
     device.add_argument("--pages-per-block", type=int, help="pages per erase block (default 256)")
     device.add_argument("--blocks-per-plane", type=int, help="blocks per plane (default 512)")
-    parser.add_argument("--timing", action="store_true",
-                        help="analysis: add read-time estimates (ideal bound and MQSim-calibrated estimate), "
-                             "their breakdown, demand columns and per-block read counts")
-    system = parser.add_argument_group("system model (decode TPOT; needs --model, implies --timing)")
+    system = parser.add_argument_group("system model (decode TPOT; needs --model)")
     system.add_argument("--model", help="model preset (hbf/configs/models.json) or JSON; sets --layers, --heads "
                                         "and --head-dim unless they are given")
     system.add_argument("--gpu", help="GPU preset (hbf/configs/gpus.json) or JSON (default b200)")
@@ -529,7 +517,7 @@ def batch_spec(args, per_stack):
 def configure(args):
     """Pipeline arguments from parsed command-line arguments (raises ValueError on bad input)."""
     given = {"aggregate_gb_s": args.aggregate_gb_s, "planes": args.planes, "plane_rule": args.plane_rule,
-             "dbsy_ns": args.dbsy_ns, "coalesce_ns": args.coalesce_ns, "read_plane_ns": args.read_plane_ns,
+             "coalesce_ns": args.coalesce_ns, "read_plane_ns": args.read_plane_ns,
              "cache_read": args.cache_read or None, "read_ns": args.read_ns, "program_ns": args.program_ns,
              "erase_ns": args.erase_ns, "pages_per_block": args.pages_per_block,
              "blocks_per_plane": args.blocks_per_plane}
@@ -605,8 +593,6 @@ def configure(args):
     if args.mode == "channel_select" and kv_format is not None and kv_format.channel_groups:
         generation["channel_groups"] = list(kv_format.channel_groups)
         generation["channels"] = kv_format.channel_select_channels
-    if args.placement != "static" and (args.timing or model is not None):
-        raise ValueError("--timing and --model need static placement (the numpy engine)")
     if model is None and (args.gpu is not None or args.overlap != "serial" or args.kv_consume != "stream"
                           or args.selection != "auto"):
         raise ValueError("--gpu, --overlap, --kv-consume and --selection need --model")
@@ -630,13 +616,9 @@ def configure(args):
         system = {"model": model, "gpu": load_gpu(args.gpu or "b200"), "options": options, "batch": args.batch,
                   "stacks": args.stacks, "analysis_batch": per_stack, "selection": selection,
                   "kv_format": kv_format, "heads": heads}
-    if (args.timing or system) and args.engine == "python":
-        raise ValueError("--timing needs the numpy engine")
     if tensors is not None and any(spec.density != 1 for spec in tensors):
-        if (args.engine == "python" or args.placement != "static" or args.prefill
-                or not args.analysis_only or args.mode == "write_then_read" or args.check_writes):
-            raise ValueError("Tensor density < 1 requires --analysis-only with the numpy engine, static placement, "
-                             "and no writes or --check-writes")
+        if args.prefill or not args.analysis_only or args.mode == "write_then_read" or args.check_writes:
+            raise ValueError("Tensor density < 1 requires --analysis-only with no writes or --check-writes")
     requests = (per_stack, heads)
     spec, context = batch_spec(args, per_stack)
     if context != shape.context:  # --contexts sets the stored context (equal prompts keep phase A's path)
@@ -661,9 +643,8 @@ def configure(args):
         requests = replace(spec, kv_spec=kv_spec) if kv_spec is not None else spec
     return {"cfg": cfg, "shape": shape, "layout_name": args.layout, "mode": args.mode, "generation": generation,
             "input_csv": args.access_csv, "physical": args.physical, "tensors": tensors,
-            "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": args.prefill,
-            "placement": args.placement, "protocol": protocol, "engine": args.engine,
-            "timing": args.timing or system is not None, "system": system, "kv_format": kv_format,
+            "plane_groups": tuple(args.plane_groups or (1,)), "prefill_layout": True if args.prefill else None,
+            "protocol": protocol, "system": system, "kv_format": kv_format,
             "requests": requests, "check_writes": args.check_writes, "kv_spec": kv_spec}
 
 

@@ -81,42 +81,6 @@ def check_group(cfg, group):
         raise ValueError(f"Lock-step group of {group} planes must divide {per_die} planes per die")
 
 
-def analyze_group(cfg, requests, group=1, offsets=None):
-    """Round metrics of the reads of one (step, layer), or of one sub-batch."""
-    check_group(cfg, group)
-    dies, per_die = plane_geometry(cfg)
-    reads = [req for req in requests if req.op == "R"]
-    if len({req.lpa for req in reads}) != len(reads):
-        raise ValueError("Requests of one layer must be deduplicated pages")
-    needed = defaultdict(set)
-    planes = set()
-    for req in reads:
-        die, plane, offset = locate(cfg, req.lpa, offsets)
-        planes.add((die, plane))
-        needed[die, plane // group].add(offset)
-    pages = len(reads)
-    total = dies * per_die
-    rounds = max(map(len, needed.values()), default=0)
-    # Core-die (MQSim) channel bound: a channel's bus moves one page per transfer_ns, so a round of
-    # tR carries at most read_ns / transfer_ns pages per channel (dense reads at 384 or 1,024 GB/s).
-    per_channel = Counter(cfg.device_lpa(req.lpa) % cfg.channels for req in reads)
-    channel_rounds = ceil(max(per_channel.values(), default=0) * cfg.transfer_ns / cfg.read_ns)
-    best = ceil(pages / total)
-    senses = group * sum(map(len, needed.values()))
-    useful = sum(req.useful_bytes for req in reads)
-    bursts = sum(req.burst_bytes for req in reads)
-    return {
-        "group": group, "planes": total, "pages": pages, "active_planes": len(planes),
-        "rounds": rounds, "min_rounds": best, "channel_rounds": channel_rounds,
-        "utilization": pages / (rounds * total) if rounds else None,
-        "balance_loss": rounds / best if rounds else None,
-        "sensed_pages": senses, "sense_amplification": senses / pages if pages else None,
-        "useful_bytes": useful, "page_bytes": pages * cfg.page_bytes, "burst_bytes": bursts,
-        "read_amplification": pages * cfg.page_bytes / useful if useful else None,
-        "transfer_amplification": bursts / useful if useful else None,
-    }
-
-
 BURST_BYTES = 64
 MOCS_VALUES = (1,) + tuple(2 ** k for k in range(8, 15))  # OCP register: 1 or 256 ... 16,384
 READ_UNITS = ("page", "wanted")
@@ -269,45 +233,6 @@ def protocol_rounds(cfg, reads, group, offsets, protocol):
     return rounds, credit, commands, link
 
 
-PLACEMENTS = ("static", "mqsim")
-
-
-def analyze(cfg, batches, groups=(1,), mode="static", protocol=None):
-    """Per-layer rows and per-step totals for each plane organization in ``groups``.
-
-    With a ``Protocol`` the rows also give the read commands, the rounds that the host channels'
-    command credits alone force, and the rounds under both bank and credit limits.
-    """
-    for group in groups:
-        check_group(cfg, group)
-    if mode not in PLACEMENTS:
-        raise ValueError(f"placement must be one of {PLACEMENTS}")
-    if protocol is not None:
-        check_protocol(cfg, protocol)
-    offsets = placement(cfg, batches) if mode == "mqsim" else None
-    parts = defaultdict(list)
-    for batch in batches:
-        part = [req for req in batch.requests if req.op == "R"]
-        if part:
-            parts[batch.step, batch.layer].append(part)
-    layers = []
-    for group in groups:
-        for (step, layer), chunks in sorted(parts.items()):
-            requests = [req for chunk in chunks for req in chunk]
-            row = {"step": step, "layer": layer, **analyze_group(cfg, requests, group, offsets)}
-            row["subbatches"] = len(chunks)
-            row["batch_rounds"] = sum(analyze_group(cfg, chunk, group, offsets)["rounds"] for chunk in chunks)
-            if protocol is not None:
-                limited = [protocol_rounds(cfg, chunk, group, offsets, protocol) for chunk in chunks]
-                row["commands"] = sum(item[2] for item in limited)
-                row["credit_rounds"] = sum(item[1] for item in limited)
-                row["link_rounds"] = sum(item[3] for item in limited)
-                row["protocol_rounds"] = sum(max(item[0], item[3]) for item in limited)
-                row["protocol_utilization"] = row["pages"] / (row["protocol_rounds"] * row["planes"])
-            layers.append(row)
-    return layers, summarize(layers, protocol)
-
-
 STEP_KEYS = ("pages", "rounds", "batch_rounds", "min_rounds", "channel_rounds", "sensed_pages", "useful_bytes",
              "burst_bytes")
 PROTOCOL_KEYS = ("commands", "credit_rounds", "link_rounds", "protocol_rounds")
@@ -342,9 +267,6 @@ def summarize(layers, protocol=None, timing=False):
             total["protocol_utilization"] = (total["pages"] / (total["protocol_rounds"] * total["planes"])
                                              if total["protocol_rounds"] else None)
     return steps
-
-
-ENGINES = ("auto", "numpy", "python")
 
 
 def _group_rounds(cfg, placed, group, part=slice(None)):
@@ -407,7 +329,7 @@ def _protocol_part(cfg, pages, placed, group, protocol, part):
     return rounds, credit, total, link
 
 
-def analyze_pages(cfg, pages, groups=(1,), protocol=None, timing=False):
+def analyze_pages(cfg, pages, groups=(1,), protocol=None, timing=True):
     """``analyze`` on ``LayerPages`` (numpy engine, static placement): identical rows and totals.
 
     A layer whose reads are all HBM-tier has no HBF pages and no row, as in ``analyze``; with
@@ -531,35 +453,10 @@ def _timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max
     }
 
 
-def analyze_accesses(cfg, layout, accesses, groups=(1,), mode="static", protocol=None, engine="auto", batches=None,
-                     timing=False):
-    """Mechanism analysis straight from logical accesses.
-
-    ``numpy`` (``auto`` when numpy is importable and the placement is static) vectorises the
-    page sets; ``python`` schedules ``Request`` objects and runs ``analyze``. Both give identical
-    rows. ``batches`` reuses an existing schedule for the python engine.
-    """
-    if engine not in ENGINES:
-        raise ValueError(f"engine must be one of {ENGINES}")
-    if mode not in PLACEMENTS:
-        raise ValueError(f"placement must be one of {PLACEMENTS}")
-    if engine == "auto":
-        try:
-            _numpy()
-            engine = "numpy" if mode == "static" else "python"
-        except ImportError:
-            engine = "python"
-    if timing and (engine == "python" or mode != "static"):
-        raise ValueError("Read-time estimates need the numpy engine and static placement")
-    if engine == "numpy":
-        if mode != "static":
-            raise ValueError("The numpy engine supports static placement only; use --engine python")
-        from .pages import iter_layer_pages
-        return analyze_pages(cfg, iter_layer_pages(cfg, layout, accesses), groups, protocol, timing)
-    if batches is None:
-        from .controller import schedule
-        batches = schedule(cfg, layout, accesses)
-    return analyze(cfg, batches, groups, mode, protocol)
+def analyze_accesses(cfg, layout, accesses, groups=(1,), protocol=None, timing=True):
+    """Mechanism analysis straight from logical accesses (numpy engine, OCP static placement)."""
+    from .pages import iter_layer_pages
+    return analyze_pages(cfg, iter_layer_pages(cfg, layout, accesses), groups, protocol, timing)
 
 
 def _numpy():

@@ -5,7 +5,8 @@ from collections import Counter
 import pytest
 
 from hbf.access import Access, LAYOUTS, Shape, TensorSpec, generate
-from hbf.analysis import analyze, analyze_group, locate, placement, plane_geometry
+from hbf.analysis import locate, placement, plane_geometry
+from tests.reference import analyze, analyze_group
 from hbf.cli import main, pipeline
 from hbf.config import load, parse_topology
 from hbf.controller import Batch, Request, burst_bytes, metrics, schedule
@@ -470,7 +471,7 @@ def test_link_bound_follows_ucie_grade():
     with pytest.raises(ValueError, match="at most 8 host channels"):
         analyze(cfg16, batches, protocol=grade1)
     with pytest.raises(ValueError, match="at most 8 host channels"):
-        analyze_accesses(cfg16, layout, accesses, protocol=grade1, engine="numpy")
+        analyze_accesses(cfg16, layout, accesses, protocol=grade1)
     layer = next(iter_layer_pages(cfg16, layout, accesses))
     with pytest.raises(ValueError, match="at most 8 host channels"):
         _protocol_part(cfg16, layer, place(cfg16, layer.lpa), 1, grade1, slice(None))

@@ -171,7 +171,7 @@ def test_t4_units(binary, evidence):
 
 
 def test_t5_bandwidth_and_t7_stats(binary, evidence):
-    cfg = load()
+    cfg = load("64x16")
     layout = LAYOUTS["layer_contiguous"](cfg, Shape(2, 8, 128, 8192))
     controls = {"base": cfg, "pcie-double": replace(cfg, pcie_lane_gb_s=512),
                 "fetch-check": replace(cfg, queue_fetch=32768),
@@ -289,7 +289,7 @@ def test_t8_uniform(binary, evidence, topology, fraction, pages_per_tensor):
 
 
 def test_t8_uniform_seed_and_complete_page_set():
-    cfg = load()
+    cfg = load("64x16")
     layout = LAYOUTS["layer_contiguous"](cfg, Shape(2, 2, 128, 535))
 
     def selected(seed, fraction):
@@ -381,7 +381,7 @@ def test_cancellation_stops_mqsim_process_group(evidence, termination):
                 "from hbf.config import load\n"
                 "from hbf.controller import Batch, Request\n"
                 "from hbf.simulator import simulate\n"
-                "cfg = load(channels=1, chips=4, aggregate_gb_s=64)\n"
+                "cfg = load('16x64', channels=1, chips=4, aggregate_gb_s=64)\n"
                 "simulate(cfg, [Batch(0, 0, 0, 0, (Request(0),))], "
                 "Path(sys.argv[1]), Path(sys.argv[2]), timeout=30)\n"
             )
@@ -418,7 +418,7 @@ def test_batch_limit_at_cli_and_config(monkeypatch, capsys):
 
 
 def test_schema_and_partial_page_union():
-    cfg = load()
+    cfg = load("64x16")
     shape = Shape(1, 1, 128, 32)
     layout = LAYOUTS["layer_contiguous"](cfg, shape)
     a = Access(0, 0, 0, "K", "R", 1, 9)
@@ -470,7 +470,7 @@ def test_gc_budget_guard(binary, evidence):
 
 
 def test_default_tensors_keep_legacy_lpas():
-    cfg = load()
+    cfg = load("64x16")
     shape = Shape(3, 2, 128, 535)  # 34 blocks, the last one partial
     blocks = 34
     contiguous = LAYOUTS["layer_contiguous"](cfg, shape, base=7)
@@ -491,7 +491,7 @@ KIVI_LIKE = (TensorSpec("K", 2, 128), TensorSpec("K_scale", 16, 2), TensorSpec("
 
 
 def test_tensor_specs_layout_and_useful_bytes():
-    cfg = load()
+    cfg = load("64x16")
     shape = Shape(2, 2, 128, 2000)
     layout = LAYOUTS["layer_contiguous"](cfg, shape, base=5, tensors=KIVI_LIKE)
     assert layout.tokens_per_page == (128, 1024, 32)
