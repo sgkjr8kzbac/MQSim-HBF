@@ -2,7 +2,7 @@
 
 本文件记录研究目标、阶段安排、各模块状态和可以认领的任务，供人和 agent 协作时使用。实验结果写在 [REPORT.md](REPORT.md)，用法写在 [README.md](README.md)。设计讨论的原始记录在 [docs/design/](docs/design/)，参数来源在 [docs/research/params.md](docs/research/params.md)。
 
-最后更新：第 2 阶段 B（一）的实验已在本地跑完并写入 REPORT；事件模拟（T-B1d）由子代理开发中（分支 `claude/hbf-kv-study`）。测试和实验在本地运行，见 [docs/local-runs.md](docs/local-runs.md)。
+最后更新：第 2 阶段 B（一）的实验已在本地跑完并写入 REPORT；事件模拟（T-B1d）由子代理开发中（分支 `claude/hbf-kv-study`）。第 3 阶段的设计已定，在分支 `claude/hbf-kv-terms` 上开发。测试和实验在本地运行，见 [docs/local-runs.md](docs/local-runs.md)。
 
 ---
 
@@ -29,7 +29,7 @@
 | 2A | 读路径：numpy 分析引擎（M7）、读时间估计（M0）、压缩格式（M3）、GPU 与系统模型（M1）、扫描脚本；第 1、2 项实验与第 5 项读路径 | ✅ 完成 |
 | 2B | 写路径与寿命：请求放置与写顺序检查（M2）、写入与刷新对读的干扰（M5）、寿命模型（M4）；第 3、4 项实验与第 5 项写路径 | 🔄 进行中 |
 | 2C | 真实访问轨迹：真实模型导出（M6）与方法适配器 | ⏳ 未开始（需要 GPU） |
-| 3 | 候选方向：HBF 感知的布局与压缩格式协同设计、权重放 HBF、多 stack 交织、MQSim 的擦除路径等 | 💡 待定 |
+| 3 | 按 KV 大小公式逐项压缩：页格式（MLA、DSA、量化参数同页）、按层/按头分组（混合注意力、跨层共享、DuoAttention、PyramidKV）、模型预设、token 淘汰与写入流、部分通道读、前缀共享；分支 `claude/hbf-kv-terms` | 🔄 设计已定，K1 开发中 |
 
 ### 第 2 阶段 B 的进度
 
@@ -67,7 +67,16 @@
 - **方法适配器**：KIVI、StreamingLLM、SnapKV、Quest、ThinK、Quest + 4 bit。其中 KIVI 和 StreamingLLM 的读位置是确定的，不需要 GPU 就能先生成。
 - **验收**：真实轨迹与对应合成模式（`uniform_tokens`、`sink_recent`）的轮数、读放大、每块读次数对比，并写进 REPORT。
 
-### 第 3 阶段：候选方向
+### 第 3 阶段：按 KV 大小的各项压缩（分支 `claude/hbf-kv-terms`）
+
+KV 大小 = 2（K、V）× 层数 × KV 头数 × head_dim × token 数 × 每元素字节 × batch。单纯按字节比例缩小的方法（fp8、int、KIVI、ThinK、裁剪 KV 头）已经支持；这一阶段补上对 HBF 的影响不止字节比例的方法。它们大多通过三种途径起作用：
+- 页粒度：一页装几行、选择单位、量化参数是否同页；
+- 地址别名与放置：按层、按头的不等大区域，共享区域，独立写前沿；
+- 只能顺序写的设备上的 token 流：淘汰或重写的 token 留下死页，而 HBF 没有 GC。
+
+设计见 [docs/design/phase3-kv-terms.md](docs/design/phase3-kv-terms.md)（各项方法、抽象、里程碑、手算验收值、实验矩阵），定案见 [docs/design/phase3-decisions.md](docs/design/phase3-decisions.md)。顺序：K1 与 K2 并行，然后 K3 与 K5，事件模拟合并后做 K4、K7，最后 K6。
+
+### 其他候选方向
 
 - **HBF 感知的布局与压缩格式协同设计**：第 2 项实验显示，16 token 的选择块遇上压缩后的大页，压缩反而更慢；量化参数单独成页，又让读页数翻倍。可以研究的方向：
   - 量化参数与数据同页；
@@ -98,7 +107,14 @@
 | T-B6 | 第 2 阶段 B 的审查（代码与报告） | 只读 | T-B1–T-B5 | 按严重程度排序的问题列表，附复现方法 | ⏳ |
 | T-C1 | M6 导出脚本（HF transformers，GPU） | 新目录 `frontends/` | — | 对一个小模型导出 `access.csv`，能被 `--access-csv` 读入 | ⏳ 可认领 |
 | T-C2 | KIVI、StreamingLLM 的确定性适配器 | 新文件 | — | 与 `--format kivi2`、`--mode sink_recent` 的结果一致 | ⏳ 可认领 |
-| T-3a | 量化参数与数据同页的布局 | `hbf/access.py`（布局）、`hbf/formats.py` | — | 黄金文件不变；kivi2 按 16 token 块选择时，读页数下降 | 💡 |
+| T-3a | 量化参数与数据同页的布局 | 并入 T-K1 | — | — | ➡️ T-K1 |
+| T-K1 | 页格式：`TensorSpec` 加 `attn_dims`、`logical_dims`；预设 `mla[:split,indexer]`、`mla_fp8`，int/kivi 的 `fused=1[,pow2=1]` | `hbf/access.py`（TensorSpec）、`hbf/formats.py`、`hbf/pages.py`、`tests/test_formats.py` | — | 设计 §3 K1 的手算值；黄金文件和引擎对照不变 | 🔄 主代理 |
+| T-K2 | KV 分组：`hbf/kvspec.py`、`GroupedLayout`、`--kv-spec`（hybrid、ssm、cla、yoco、duo、pyramid）、无读层补零行 | `hbf/kvspec.py`（新）、`hbf/cli.py`、`tests/test_kvspec.py` | — | 设计 §3 K2 的手算值；不加 `--kv-spec` 时逐位不变 | ⏳ 可认领 |
+| T-K3 | 模型预设：MLA、混合注意力、MoE（只计线性层时间） | `hbf/model.py`、`hbf/system.py`、`hbf/configs/models.json` | T-K2 的 `from_model` 接口 | 参数总量与公开值相差 < 1%，出处写进 params.md；现有预设的 TPOT 不变 | ⏳ |
+| T-K5 | 选择的真实性：存储密度、静态选择、相邻步复用、GQA 并集 | `hbf/access.py`（generate）、`hbf/pages.py`、`hbf/controller.py`（拒绝） | T-K1 | 设计 §3 K5 的手算值 | ⏳ |
+| T-K4 | token 流（写入、死亡、重写）与寿命模型接口 | `hbf/kvspec.py`；事件模拟合并后改 `hbf/endurance.py` | T-K2、T-B1d | 设计 §3 K4 的手算值；现有寿命结果不变 | ⏳ |
+| T-K6 | 部分通道读：`loki`、`sparq[:dual]`、`channel_select` | `hbf/formats.py`、`hbf/access.py` | T-K5 | 设计 §3 K6 的手算值 | ⏳ |
+| T-K7 | 分组放置、按类别分写前沿、前缀别名、滞留页统计 | `hbf/batch.py`、`tests/test_batch.py` | T-K2、T-K4 | 设计 §3 K7 的手算值 | ⏳ |
 
 ---
 
