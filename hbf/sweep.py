@@ -315,6 +315,8 @@ def run_one(task, tool_name="analysis"):
         return row, time.monotonic() - started
     saved, sys.argv = sys.argv, [tool.module, *argv]  # meta.json records the run's own arguments
     try:
+        if tool_name == "analysis" and (skip_access or not keep):
+            run = run | {"skip_trace_files": True}
         row |= tool.execute(directory, run)
     except ValueError as error:
         row["status"] = _status("infeasible", error)
@@ -326,7 +328,8 @@ def run_one(task, tool_name="analysis"):
         if not keep:
             shutil.rmtree(directory)
         elif skip_access:
-            (directory / "access.csv").unlink(missing_ok=True)
+            for fname in ("access.csv", "addr.npz", "layers.npz", "addr.json"):
+                (directory / fname).unlink(missing_ok=True)
     return row, time.monotonic() - started
 
 

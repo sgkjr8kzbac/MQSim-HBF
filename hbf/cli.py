@@ -8,10 +8,11 @@ from uuid import uuid4
 
 from .backends.mqsim.build import build
 from .backends.mqsim.run import simulate
-from .backends.mqsim.schedule import schedule_run, unwritten_reads
-from .backends.rounds.analysis import (GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_accesses, check_group,
-                                       check_protocol, plane_geometry, summarize)
+from .backends.mqsim.schedule import batches_from_trace, unwritten_reads
+from .backends.rounds.analysis import (GROUP_SENSES, HOST_ORDERS, READ_UNITS, Protocol, analyze_trace, check_group,
+                                       check_protocol, plane_geometry)
 from .device.config import MAX_BATCH_PAGES, load
+from .frontend.addrtrace import TraceValidator, iter_trace, write_trace
 from .frontend.kv.layouts import LAYOUTS
 from .frontend.kv.tensors import Shape, default_tensors, parse_density, parse_tensors, tensors_meta
 from .frontend.trace.synthetic import MODES, generate
@@ -143,45 +144,10 @@ def subbatch_count(layer_rows, plane_groups):
     return sum(row["subbatches"] for row in layer_rows if row["group"] == plane_groups[0])
 
 
-def _zero_timing_row(cfg, group, step, layer, protocol):
-    """Empty layer row matching ``analyze_pages(..., timing=True)`` when a layer has no reads."""
-    dies, per_die = plane_geometry(cfg)
-    row = {
-        "step": step, "layer": layer, "group": group, "planes": dies * per_die, "pages": 0,
-        "active_planes": 0, "rounds": 0, "min_rounds": 0, "channel_rounds": 0,
-        "utilization": None, "balance_loss": None, "sensed_pages": 0, "sense_amplification": None,
-        "useful_bytes": 0, "page_bytes": 0, "burst_bytes": 0, "read_amplification": None,
-        "transfer_amplification": None, "subbatches": 0, "batch_rounds": 0,
-    }
-    if protocol is not None:
-        row |= {"commands": 0, "credit_rounds": 0, "link_rounds": 0, "protocol_rounds": 0,
-                "protocol_utilization": None}
-    row |= {
-        "est_ns": 0, "est_batches_ns": 0, "bound_ns": 0, "t_balanced_ns": 0, "t_imbalance_ns": 0,
-        "t_protocol_ns": 0, "t_channel_ns": 0, "t_overhead_ns": 0, "bottleneck": "none",
-        "attended_tokens": 0, "attended_elements": 0, "hbf_elements": 0, "hbm_bytes": 0, "dequant_ops": 0.0,
-    }
-    return row
-
-
-def _pad_timing_rows(cfg, layer_rows, step_rows, plane_groups, layers, steps, protocol):
-    """Pad missing (step, layer) rows with zeros per plane group so every layer is present under ``timing``."""
-    by_key = {(row["group"], row["step"], row["layer"]): row for row in layer_rows}
-    step_list = sorted(set(steps) | {row["step"] for row in layer_rows})
-    if not step_list or len(by_key) == len(plane_groups) * len(step_list) * layers:
-        return layer_rows, step_rows
-    block_reads = {row["step"]: row["max_block_reads"] for row in step_rows}
-    padded = [by_key.get((group, step, layer)) or _zero_timing_row(cfg, group, step, layer, protocol)
-              for group in plane_groups for step in step_list for layer in range(layers)]
-    steps_out = summarize(padded, protocol, timing=True)
-    for total in steps_out:
-        total["max_block_reads"] = block_reads.get(total["step"], 0)
-    return padded, steps_out
-
-
 def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", generation=None,
              input_csv=None, physical=False, tensors=None, plane_groups=(1,), prefill_layout=None,
-             protocol=None, system=None, kv_format=None, requests=None, check_writes=False, kv_spec=None):
+             protocol=None, system=None, kv_format=None, requests=None, check_writes=False, kv_spec=None,
+             skip_trace_files=False):
     """Schedule the accesses, write the mechanism analysis (with read-time estimates), and run
     MQSim unless binary is None.
 
@@ -284,12 +250,33 @@ def pipeline(cfg, shape, layout_name, directory, binary, *, mode="dense", genera
                                    "placement": "static",
                                    "protocol": None if protocol is None else asdict(protocol),
                                    "argv": sys.argv} | ({} if kv_spec is None else {"kv_spec": spec_meta(kv_spec)}))
-    needs_schedule = binary is not None or prefill_layout or any(access.op == "W" for access in accesses)
-    batches = schedule_run(cfg, layout, accesses, prefill_layout) if needs_schedule else []
-    layer_rows, step_rows = analyze_accesses(cfg, layout, accesses, plane_groups, protocol, timing=True)
+    # Step 1 (frontend): convert logical accesses to a validated address trace.
     expected_steps = range(generation["steps"]) if input_csv is None else ()
-    layer_rows, step_rows = _pad_timing_rows(cfg, layer_rows, step_rows, plane_groups, shape.layers,
-                                             expected_steps, protocol)
+    trace_meta, chunk_stream = iter_trace(
+        cfg, layout, accesses, prefill=prefill_layout, expected_steps=expected_steps,
+        protocol=protocol, layout_name=layout_name,
+        config_meta={"mode": mode, **generation} if input_csv is None else {"input_csv": str(input_csv)},
+    )
+    validator = TraceValidator(cfg, trace_meta["resident"])
+    needs_schedule = binary is not None or prefill_layout or any(access.op == "W" for access in accesses)
+
+    if skip_trace_files and not needs_schedule:
+        def _validated_stream():
+            for chunk in chunk_stream:
+                validator.feed(chunk)
+                yield chunk
+        batches = []
+        layer_rows, step_rows = analyze_trace(cfg, _validated_stream(), plane_groups, protocol, timing=True)
+    else:
+        chunks = []
+        for chunk in chunk_stream:
+            validator.feed(chunk)
+            chunks.append(chunk)
+        if not skip_trace_files:
+            write_trace(directory, trace_meta, chunks)
+        batches = batches_from_trace(cfg, chunks) if needs_schedule else []
+        layer_rows, step_rows = analyze_trace(cfg, chunks, plane_groups, protocol, timing=True)
+
     attn_dims = fmt.attn_dims if fmt else 2 * shape.head_dim
     for row in layer_rows:
         row["attn_dims"] = attn_dims

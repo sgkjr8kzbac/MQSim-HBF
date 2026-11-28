@@ -132,6 +132,39 @@ def schedule_run(cfg, layout, accesses, prefill=False):
     return [replace(batch, arrival_ns=index * cfg.interval_ns) for index, batch in enumerate(batches)]
 
 
+def batches_from_trace(cfg, chunks):
+    """Convert an address trace's ``LayerChunk`` sequence into MQSim ``Batch`` objects.
+
+    Release records (``op == 'D'``) do not issue device commands and are skipped. Arrival
+    timestamps are assigned strictly increasing by ``cfg.interval_ns`` in ``(step, layer, subbatch)``
+    order.
+    """
+    batches = []
+    for chunk in chunks:
+        if not len(chunk):
+            continue
+        # Group non-release records by subbatch while preserving within-chunk order.
+        ops = chunk.op.tolist()
+        sbs = chunk.subbatch.tolist()
+        lpas = chunk.lpa.tolist()
+        useful = chunk.useful_bytes.tolist()
+        burst = chunk.burst_bytes.tolist()
+        runs = chunk.burst_runs.tolist()
+        grouped = {}
+        order = []
+        for sb, op, lpa, u, b, r in zip(sbs, ops, lpas, useful, burst, runs):
+            if op == "D":
+                continue
+            if sb not in grouped:
+                grouped[sb] = []
+                order.append(sb)
+            grouped[sb].append(Request(lpa, op, u, b, r))
+        for sb in order:
+            batches.append(Batch(chunk.step, chunk.layer, sb, len(batches) * cfg.interval_ns,
+                                 tuple(grouped[sb])))
+    return batches
+
+
 def unwritten_reads(cfg, batches):
     """Reads of LPAs that are not currently written; the OCP spec answers them with error 0x7
     (Table 12). Tracks written pages per (unit, block) and resets a block to {0} whenever its

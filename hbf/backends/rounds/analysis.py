@@ -452,6 +452,16 @@ def _timing_columns(cfg, layer, placed, group, protocol, parts, row, channel_max
     }
 
 
+def analyze_trace(cfg, chunks, groups=(1,), protocol=None, timing=True):
+    """Mechanism analysis directly from address-trace ``LayerChunk``s (step >= 0).
+
+    Every ``(step, layer)`` chunk with ``step >= 0`` produces a row, including layers with zero
+    HBF pages (carried by ``layers.npz``), so callers do not need post-hoc zero-row padding.
+    """
+    pages = (chunk.read_pages() for chunk in chunks if chunk.step >= 0)
+    return analyze_pages(cfg, pages, groups, protocol, timing)
+
+
 def analyze_accesses(cfg, layout, accesses, groups=(1,), protocol=None, timing=True):
     """Mechanism analysis straight from logical accesses (numpy engine, OCP static placement)."""
     from .pages import iter_layer_pages
