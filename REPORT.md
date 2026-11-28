@@ -846,6 +846,36 @@ MQSim 与 `interference.py` 的核对结论与差异来源：
 4. **块越大，读干扰越早触发。**刷新阈值折算的步数与每块页数成反比。agentic、X = 1e6 时，每块 192、256、512、1,024 页对应每天 34、43、80、150 次 P/E，1,024 页是 192 页的 4.5 倍。以 prefill 写入为主的负载不受块大小影响（`packed` 没有填充）。
 5. 这些都是理想磨损均衡下的平均值，最坏块和保持期刷新要靠事件模拟给出。
 
+#### R6：MQSim 缩小参数核对与全尺寸事件模拟外推
+
+由于真实参数下第一次读干扰刷新需等待 $X / (\text{ppb} \times \text{share})$ 步（$X=10^5$、$\text{ppb}=256$ 时为 390 步），且 MQSim 配置无物理 TPOT 时钟，R6 采用"时间线前端展开 → MQSim 缩小参数核对 → Python 全尺寸外推"的两步法（复现脚本 [scripts/r6_lifetime_verify.py](scripts/r6_lifetime_verify.py)）：
+
+1. **R6b 缩小参数 MQSim 核对（[evidence/r6-mqsim-verify.csv](evidence/r6-mqsim-verify.csv)）**：由 [hbf/frontend/timeline.py](hbf/frontend/timeline.py) 将请求流按页展开为合法地址轨迹（含 prefill、decode flush、释放 `D`、读干扰刷新搬移/重放与回收），在同一组缩小参数（16 bank、`ppb=8`、$X=256$ 即阈值 32 步；`long32k_scaled` 窗口 240 步、`agentic_scaled` 窗口 320 步）下分别跑 MQSim（`T-HBFW1`–`T-HBFW4`）与 Python 段级事件模拟器，由 [hbf/lifetime/counts.py](hbf/lifetime/counts.py) 从 MQSim 每块计数换算速率：
+
+| 场景 | MQSim vs 前端逐块 `(R, W, E)` | 完成请求（MQSim / Sim） | 读干扰刷新（MQSim / Sim） | 日均 P/E（MQSim 开段口径 / Sim，误差） | 刷新 ÷ KV 写入（MQSim / Sim，误差） |
+|---|---:|---:|---:|---:|---:|
+| `long32k_scaled`（`relocate`） | 逐块完全一致（130,912 / 5,824 / 608） | 20 / 20 | 16 / 16 | 207,000 / 211,500（**−2.13%**） | 0.4864 / 0.5068（**−4.04%**） |
+| `agentic_scaled`（`relocate`） | 逐块完全一致（179,232 / 6,256 / 528） | 36 / 36 | 35 / 33 | 79,699 / 81,325（**−2.00%**） | 1.1135 / 1.1459（**−2.83%**） |
+| `long32k_scaled_replay`（`replay`） | 逐块完全一致（131,120 / 6,608 / 704） | 20 / 20 | 23 / 23 | 234,000 / 234,000（**+0.00%**） | 0.8364 / 0.8364（**0.00%**） |
+
+说明：MQSim `T-HBFW4` 的 `erases` 只统计已写块的页 0 自动擦除（新块初始已擦除），而段级事件模拟器 `Simulator._open` 在无预热（`warmup_h=0`）时对首次开段也计 1 次 P/E 周期；按开段口径（`erases + 已写块数`）对齐后，三个场景的日均 P/E 与刷新写入比误差均在 **0.00%–4.04%**（严格满足 5% 验收阈值），且每块读/写/擦计数与时间线前端 **100% 逐块一致**。
+
+2. **R6c 全尺寸事件模拟外推（[evidence/r6-extrapolation.csv](evidence/r6-extrapolation.csv)）**：在 512 GiB 单 stack、1,024 bank、`ppb=256`、Llama-3.1-8B（BF16）、`packed`、并发 8、24 小时模拟（1 小时预热，`m5=gaps`）下，对比核心 `ReadTimeClock`（无 GPU 扩展，仅 HBF 读时间 + 常数计算项 0 ms / 5 ms）与 `ext/system` B200 TPOT 时钟及解析值：
+
+| 负载 | X | 时钟 | TPOT (ms) | 事件模拟 P/E 每天 | 解析 P/E 每天 | 事件模拟 刷新÷KV | 解析 刷新÷KV | 到 P/E 1e5（均值） |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| `long32k` | 1e5 / 1e6 | 核心 `ReadTimeClock` (0 ms) | 36.50 | 415.6 | 442.4 | 0.00 | 0.00 | 240.6 天 |
+| `long32k` | 1e5 / 1e6 | 核心 `ReadTimeClock` (5 ms) | 41.50 | 385.9 | 389.1 | 0.00 | 0.00 | 259.1 天 |
+| `long32k` | 1e5 / 1e6 | 扩展 `ext/system` (B200) | 38.85 | 403.9 | 415.7 | 0.00 | 0.00 | 247.6 天 |
+| `agentic` | 1e5 | 核心 `ReadTimeClock` (0 ms) | 52.38 | 349.0 | 370.9 | 22.35 | 22.99 | 286.6 天 |
+| `agentic` | 1e5 | 核心 `ReadTimeClock` (5 ms) | 58.51 | 335.2 | 349.0 | 22.33 | 22.99 | 298.3 天 |
+| `agentic` | 1e5 | 扩展 `ext/system` (B200) | 55.57 | 339.1 | 360.3 | 22.34 | 22.99 | 294.9 天 |
+| `agentic` | 1e6 | 核心 `ReadTimeClock` (0 ms) | 50.67 | 40.1 | 44.1 | 1.44 | 1.85 | 6.84 年 |
+| `agentic` | 1e6 | 核心 `ReadTimeClock` (5 ms) | 57.76 | 36.8 | 41.5 | 1.44 | 1.85 | 7.46 年 |
+| `agentic` | 1e6 | 扩展 `ext/system` (B200) | 54.11 | 38.5 | 42.8 | 1.44 | 1.85 | 7.13 年 |
+
+结论：核心 `ReadTimeClock`（0–5 ms 计算项）紧密包络 `ext/system` B200 TPOT 时钟结果；`long32k`（404 vs 解析 416 次/天）与 `agentic` $X=10^5$（339 vs 解析 360 次/天，刷新比 22.34 vs 22.99）高度一致；`agentic` $X=10^6$ 时事件模拟因 `packed` 合并刷新与离散释放比解析值略低约 10%（38.5 vs 42.8 次/天，到 1e5 为 7.13 年）。
+
 ### 第 4 项：压缩后的寿命收益
 
 8B，单 stack，并发 8，每块 256 页（[evidence/phase2b/endurance-formats.csv](evidence/phase2b/endurance-formats.csv)）：

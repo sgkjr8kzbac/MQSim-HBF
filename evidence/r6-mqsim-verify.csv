@@ -1,0 +1,4 @@
+case,steps,duration_s,segments,blocks_exact_match,mqsim_reads,mqsim_programs,mqsim_erases,mqsim_completed,sim_completed,mqsim_rd_refreshes,sim_rd_refreshes,mqsim_pec_opened_day,mqsim_pec_raw_day,sim_pec_day,pec_opened_rel_err,pec_raw_rel_err,mqsim_refresh_to_kv,sim_refresh_to_kv,refresh_to_kv_rel_err,program_gb_s_rel_err,mqsim_wall_s
+long32k_scaled,240,2.4,8,True,130912,5824,608,20,20,16,16,207000.0,171000.0,211500.0,-0.02128,-0.19149,0.4864,0.5068,-0.04036,-0.02413,0.264
+agentic_scaled,320,3.32,16,True,179232,6256,528,36,36,35,33,79698.8,53674.7,81325.3,-0.02,-0.34,1.1135,1.1459,-0.0283,-0.01511,0.315
+long32k_scaled_replay,240,2.4,8,True,131120,6608,704,20,20,23,23,234000.0,198000.0,234000.0,0.0,-0.15385,0.8364,0.8364,-0.0,-0.00242,0.264
