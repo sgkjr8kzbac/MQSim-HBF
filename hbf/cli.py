@@ -473,9 +473,9 @@ def build_run_parser(prog="python -m hbf run"):
     parser.add_argument("--write-order", choices=("read_first", "fifo"),
                         help="HBF write/read chip service order under T-HBFW2 (read_first default, or fifo)")
     batch = parser.add_argument_group("request placement (multi-request KV placement)")
-    batch.add_argument("--alloc", choices=("layer_major", "dedicated", "packed", "vllm_pool"), default="layer_major",
-                       help="how each request's KV is placed: layer_major (phase A's emulation), dedicated "
-                            "segments, a packed write frontier, or vLLM-style block pools; see hbf/batch.py")
+    batch.add_argument("--alloc", choices=("layer_major", "dedicated", "packed", "vllm_pool"), default=None,
+                       help="how each request's KV is placed: packed (default for multi-request batches), "
+                            "dedicated segments, layer_major (phase A emulation), or vLLM-style block pools")
     batch.add_argument("--partition", choices=("none", "channel", "die"), default="none",
                        help="dedicated/packed: stripe each request over all banks, or keep it in one host "
                             "channel (64 banks) or one die (16 banks)")
@@ -507,7 +507,7 @@ def build_run_parser(prog="python -m hbf run"):
     return parser
 
 
-def batch_spec(args, per_stack):
+def batch_spec(args, per_stack, *, default_alloc="layer_major"):
     """The BatchSpec of the placement flags, or None for phase A's plain --batch emulation."""
     from .frontend.kv.placement import BatchRequest, BatchSpec
 
@@ -521,11 +521,12 @@ def batch_spec(args, per_stack):
         if len(items) != per_stack:
             raise ValueError(f"--{name} lists {len(items)} values for {per_stack} requests per stack")
         return items
-    if args.alloc != "vllm_pool" and (args.block_tokens is not None or args.free_order != "fresh"):
+    alloc = args.alloc if args.alloc is not None else default_alloc
+    if alloc != "vllm_pool" and (args.block_tokens is not None or args.free_order != "fresh"):
         raise ValueError("--block-tokens and --free-order apply to --alloc vllm_pool")
     prompts = values(args.contexts, "contexts") if args.contexts is not None else [args.context] * per_stack
     generated = values(args.generated, "generated")
-    spec = BatchSpec(tuple(BatchRequest(p, g) for p, g in zip(prompts, generated)), args.alloc, args.partition,
+    spec = BatchSpec(tuple(BatchRequest(p, g) for p, g in zip(prompts, generated)), alloc, args.partition,
                      args.layout, args.flush_order, args.block_tokens, args.free_order, args.align,
                      args.frontiers, args.prefix_tokens, args.prefix_groups, args.prefix_reads)
     return None if spec.default and not args.check_writes else spec, max(prompts)
@@ -648,7 +649,24 @@ def configure(args):
         if args.prefill or not args.analysis_only or args.mode == "write_then_read" or args.check_writes:
             raise ValueError("Tensor density < 1 requires --analysis-only with no writes or --check-writes")
     requests = (per_stack, heads)
-    spec, context = batch_spec(args, per_stack)
+    has_sel_realism = bool(
+        generation.get("select_static") or generation.get("reuse", 0)
+        or generation.get("query_groups", 1) != 1 or generation.get("full_tensors")
+        or generation.get("channels") is not None or generation.get("channel_groups")
+        or args.mode == "channel_select"
+    )
+    not_placeable = (
+        args.access_csv is not None or args.prefill
+        or args.mode not in ("dense", "uniform_tokens", "sink_recent")
+        or has_sel_realism or density != 1
+    )
+    is_multi_or_placement = (
+        per_stack > 1 or args.contexts is not None or str(args.generated) != "0"
+        or args.partition != "none" or args.frontiers != "single"
+        or args.prefix_tokens > 0 or args.check_writes
+    )
+    default_alloc = "packed" if (is_multi_or_placement and not not_placeable) else "layer_major"
+    spec, context = batch_spec(args, per_stack, default_alloc=default_alloc)
     if context != shape.context:  # --contexts sets the stored context (equal prompts keep phase A's path)
         shape = Shape(shape.layers, shape.kv_heads, shape.head_dim, context)
     kv_spec = None

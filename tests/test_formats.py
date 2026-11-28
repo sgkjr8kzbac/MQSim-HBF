@@ -138,7 +138,8 @@ def test_batched_trace_must_cover_every_request(tmp_path):
         main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--context", "1024", "--batch", "8",
                           "--access-csv", str(tmp_path / "one" / "access.csv"), "--output", str(tmp_path / "eight")])
     assert not (tmp_path / "eight").exists()
-    main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--context", "1024", "--batch", "2", "--output", str(tmp_path / "two")])
+    main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--context", "1024", "--batch", "2", "--alloc", "layer_major",
+                      "--output", str(tmp_path / "two")])
     main(HBF_FLAGS + ["--model", "llama-3.1-8b", "--context", "1024", "--batch", "2",
                       "--access-csv", str(tmp_path / "two" / "access.csv"), "--output", str(tmp_path / "again")])
     assert (tmp_path / "again" / "analysis_steps.csv").read_text() == (tmp_path / "two" / "analysis_steps.csv").read_text()

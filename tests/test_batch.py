@@ -139,8 +139,13 @@ def test_placement_flags_in_the_pipeline(tmp_path):
     meta = json.loads((out / "meta.json").read_text())
     assert meta["batch"]["allocation"] == "packed" and meta["batch"]["requests"] == [[2048, 64], [1024, 64], [512, 64]]
     assert meta["batch"]["write_check"]["legal"] and "写入顺序检查" in (out / "report.md").read_text()
+    # Default multi-request placement is packed (legal write order); explicit layer_major is illegal.
     main(HBF_FLAGS + ["--layers", "2", "--context", "2048", "--batch", "3", "--check-writes",
-                      "--output", str(tmp_path / "static")])
+                      "--output", str(tmp_path / "default_packed")])
+    default_check = json.loads((tmp_path / "default_packed" / "meta.json").read_text())["batch"]
+    assert default_check["allocation"] == "packed" and default_check["write_check"]["legal"]
+    main(HBF_FLAGS + ["--layers", "2", "--context", "2048", "--batch", "3", "--alloc", "layer_major",
+                      "--check-writes", "--output", str(tmp_path / "static")])
     static = json.loads((tmp_path / "static" / "meta.json").read_text())["batch"]["write_check"]
     assert not static["legal"] and static["kinds"]["decode"] == 0
     for index, extra in enumerate((["--alloc", "packed", "--mode", "uniform_pages"],
@@ -152,8 +157,8 @@ def test_placement_flags_in_the_pipeline(tmp_path):
         assert not (tmp_path / str(index)).exists()
 
 
-def test_default_batch_flags_keep_phase_a_outputs(tmp_path):
-    for name, extra in (("plain", []), ("explicit", ["--alloc", "layer_major", "--generated", "0"])):
+def test_default_batch_flags_use_packed_placement(tmp_path):
+    for name, extra in (("plain", []), ("explicit", ["--alloc", "packed", "--generated", "0"])):
         main(HBF_FLAGS + ["--layers", "2", "--context", "2048", "--batch", "3", "--mode", "uniform_tokens",
                           "--output", str(tmp_path / name)] + extra)
     for file in ("analysis_layers.csv", "analysis_steps.csv", "access.csv"):
@@ -176,7 +181,7 @@ def test_windowed_tensors_flush_after_admission():
 def test_equal_contexts_set_the_stored_context(tmp_path):
     main(HBF_FLAGS + ["--layers", "1", "--batch", "2", "--contexts", "4096,4096", "--output", str(tmp_path / "e")])
     meta = json.loads((tmp_path / "e" / "meta.json").read_text())
-    assert meta["shape"]["context"] == 4096 and meta["batch"] is None
+    assert meta["shape"]["context"] == 4096 and meta["batch"]["allocation"] == "packed"
 
 
 def test_mixed_contexts_check_capacity_per_placed_table():

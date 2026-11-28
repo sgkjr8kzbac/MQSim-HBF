@@ -78,7 +78,7 @@ class BatchRequest:
 class BatchSpec:
     """B requests of one stack and how they are placed (see the module docstring)."""
     requests: tuple
-    allocation: str = "layer_major"
+    allocation: str = "packed"
     partition: str = "none"
     intra: str = "striped_contiguous"
     flush_order: str = "rotate"
