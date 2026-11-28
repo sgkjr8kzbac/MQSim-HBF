@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ...device.config import OCP_DIES_PER_HOST_CHANNEL
+from ...device.address import Placed, check_host_channels, device_lpas, place
 from ..mqsim.schedule import BURST_BYTES, schedule
 
 
@@ -43,57 +43,6 @@ class LayerPages:
 
     def __len__(self):
         return len(self.lpa)
-
-
-@dataclass
-class Placed:
-    """Location of each page: HBF die and plane (``analysis.locate``), static offset, MQSim channel
-    (``device_lpa % channels``), host channel and MQSim unit. ``host`` is ``lpa % host_channels``;
-    ``Config.host_channel`` also rejects cwdp channel counts that are not a multiple of 16, which
-    callers that use ``host`` must check (``check_host_channels``)."""
-    die: np.ndarray
-    plane: np.ndarray
-    offset: np.ndarray
-    channel: np.ndarray
-    host: np.ndarray
-    unit: np.ndarray
-
-
-def device_lpas(cfg, lpa):
-    """``Config.device_lpa`` for an array of LPAs."""
-    lpa = np.asarray(lpa, dtype=np.int64)
-    if cfg.address_map == "cwdp":
-        return lpa
-    hosts, banks = cfg.host_channels, cfg.planes
-    host, local = lpa % hosts, lpa // hosts
-    bank, die, offset = local % banks, local // banks % OCP_DIES_PER_HOST_CHANNEL, local // (
-        banks * OCP_DIES_PER_HOST_CHANNEL)
-    channel, chip = 2 * host + die % 2, die // 2
-    return channel + cfg.channels * (chip + cfg.chips * (bank + banks * offset))
-
-
-def place(cfg, lpa):
-    """Static locations of an array of LPAs (offset ``lpa // units``, as ``locate`` without offsets)."""
-    lpa = np.asarray(lpa, dtype=np.int64)
-    if len(lpa) and (lpa.min() < 0 or lpa.max() >= cfg.capacity_sectors // cfg.spp):
-        bad = lpa[(lpa < 0) | (lpa >= cfg.capacity_sectors // cfg.spp)][0]
-        raise ValueError(f"LPA {bad} exceeds logical capacity")
-    device = device_lpas(cfg, lpa)
-    channels, chips, dies, planes = cfg.geometry
-    channel, rest = device % channels, device // channels
-    chip, rest = rest % chips, rest // chips
-    die, rest = rest % dies, rest // dies
-    plane = rest % planes
-    if dies == planes == 1:
-        hbf_die, hbf_plane = channel, chip
-    else:
-        hbf_die, hbf_plane = (channel * chips + chip) * dies + die, plane
-    return Placed(hbf_die, hbf_plane, lpa // cfg.units, channel, lpa % cfg.host_channels, device % cfg.units)
-
-
-def check_host_channels(cfg):
-    if cfg.address_map == "cwdp" and cfg.channels % cfg.host_channels:
-        raise ValueError("Host channels need a channel count that is a multiple of 16")
 
 
 def _union(group, lo, hi, scale):

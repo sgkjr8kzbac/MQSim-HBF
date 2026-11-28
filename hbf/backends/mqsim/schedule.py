@@ -2,6 +2,8 @@
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 
+from ...device.address import block_page
+
 
 @dataclass(frozen=True)
 class Request:
@@ -141,14 +143,12 @@ def unwritten_reads(cfg, batches):
     for batch in batches:
         for req in batch.requests:
             if req.op == "R":
-                unit = cfg.unit(req.lpa)
-                block, page = divmod(req.lpa // cfg.units, cfg.pages_per_block)
+                unit, block, page = block_page(cfg, req.lpa)
                 if page not in written.get((unit, block), ()):
                     count += 1
         for req in batch.requests:
             if req.op == "W":
-                unit = cfg.unit(req.lpa)
-                block, page = divmod(req.lpa // cfg.units, cfg.pages_per_block)
+                unit, block, page = block_page(cfg, req.lpa)
                 if page == 0:
                     written[unit, block] = {0}
                 else:

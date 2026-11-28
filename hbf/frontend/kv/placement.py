@@ -48,7 +48,7 @@ from random import Random
 
 import numpy as np
 
-from ...backends.rounds.pages import place
+from ...device.address import block_and_page, place
 from ..trace.synthetic import share
 from ..trace.tokens import Access
 from .layouts import LAYOUTS, Layout
@@ -1216,8 +1216,7 @@ def check_write_order(cfg, lpas, *, dead_lpas=None, live_lpas=None, partition="n
     if not len(lpas):
         return empty
     placed = place(cfg, lpas)
-    block = placed.unit + cfg.units * (placed.offset // cfg.pages_per_block)
-    page = (placed.offset % cfg.pages_per_block).astype(np.int64)
+    block, page = block_and_page(cfg, placed)
     del placed
     order = np.argsort(block, kind="stable")  # time order kept within each block
     block, page = block[order], page[order]

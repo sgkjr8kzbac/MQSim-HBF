@@ -23,6 +23,7 @@ topologies (16x64 etc.) have no estimate: there every page is its own command.
 """
 import numpy as np
 
+from ...device.address import block_ids
 from ...device.config import DEFAULT_DBSY_NS
 
 HBF_COMMAND_MODEL = "--read-plane-ns 0 --coalesce-ns 1 --cache-read"
@@ -91,8 +92,3 @@ def estimate_ns(cfg, placed, group, part=slice(None)):
             span = int((t + x * n).sum())
         worst = max(worst, span)
     return (cfg.coalesce_ns or 0) + worst + cfg.host_ns
-
-
-def block_ids(cfg, placed):
-    """Erase-block id of each page: (MQSim unit, static offset // pages per block)."""
-    return placed.unit + cfg.units * (placed.offset // cfg.pages_per_block)

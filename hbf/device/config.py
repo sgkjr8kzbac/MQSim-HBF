@@ -5,6 +5,8 @@ from math import prod
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from .address import OCP_DIES_PER_HOST_CHANNEL, device_lpa as _device_lpa, host_lpa as _host_lpa
+
 PACKAGE = Path(__file__).resolve().parents[1]
 ROOT = PACKAGE.parent
 CONFIG_DIR = CONFIG = PACKAGE / "configs"
@@ -23,7 +25,6 @@ MAX_PLANES = 64
 # None keeps upstream multi-plane grouping (same page index); see hbf/patches/T-PLANE.patch.
 PLANE_RULES = (None, "independent", "lockstep")
 ADDRESS_MAPS = ("cwdp", "ocp")
-OCP_DIES_PER_HOST_CHANNEL = 4  # Figure 4: 2 core-die channels x 2 dies per host channel
 OCP_HOST_CHANNELS = 16  # section 4.1: "Support 16 host channels"
 
 
@@ -200,34 +201,12 @@ class Config:
         return min(self.channels, OCP_HOST_CHANNELS)
 
     def device_lpa(self, lpa):
-        """The LPA that MQSim sees, so that its CWDP placement realises ``address_map``.
-
-        ``cwdp`` is MQSim's own order (channel, chip, die, plane). ``ocp`` follows the OCP HBF spec:
-        host addresses are interleaved in 4 KiB units over the host channels (Figure 3, n = 6);
-        inside a host channel the low 4 bits of the 4 KiB unit select the bank and the next 2 bits
-        the die (section 4.6); Figure 4 puts dies 0 and 2 on core-die channel 0 and dies 1 and 3 on
-        core-die channel 1. The page offset inside a bank is ``lpa // units`` in both maps.
-        """
-        if self.address_map == "cwdp":
-            return lpa
-        hosts, banks = self.host_channels, self.planes
-        host, local = lpa % hosts, lpa // hosts
-        bank, die, offset = local % banks, local // banks % OCP_DIES_PER_HOST_CHANNEL, local // (
-            banks * OCP_DIES_PER_HOST_CHANNEL)
-        channel, chip = 2 * host + die % 2, die // 2
-        return channel + self.channels * (chip + self.chips * (bank + banks * offset))
+        """The LPA that MQSim sees, so that its CWDP placement realises ``address_map``."""
+        return _device_lpa(self, lpa)
 
     def host_lpa(self, device):
         """Inverse of ``device_lpa``."""
-        if self.address_map == "cwdp":
-            return device
-        hosts, banks = self.host_channels, self.planes
-        channel, rest = device % self.channels, device // self.channels
-        chip, rest = rest % self.chips, rest // self.chips
-        bank, offset = rest % banks, rest // banks
-        host, die = channel // 2, channel % 2 + 2 * chip
-        local = bank + banks * (die + OCP_DIES_PER_HOST_CHANNEL * offset)
-        return host + hosts * local
+        return _host_lpa(self, device)
 
     def host_channel(self, lpa):
         """Host (UCIe) channel of an LPA under the spec's 4 KiB interleave (Figure 3, n = 6).

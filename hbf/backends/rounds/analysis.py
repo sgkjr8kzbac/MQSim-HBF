@@ -339,8 +339,7 @@ def analyze_pages(cfg, pages, groups=(1,), protocol=None, timing=True):
     whole layer as one burst; ``est_batches_ns`` sums MQSim's sub-batches instead), the demand
     columns that the system model reads, and each step's largest per-block read count.
     """
-    from .pages import check_host_channels, place
-    from .timing import block_ids
+    from ...device.address import block_ids, check_host_channels, place
     np = _numpy()
     for group in groups:
         check_group(cfg, group)
