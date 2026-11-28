@@ -180,11 +180,11 @@ def test_endurance_tool_summary(tmp_path):
             assert number(row[key]) == pytest.approx(number(run[0][key]))
         assert number(row["days_to_limit_avg@1e4"]) * 10 == pytest.approx(number(row["days_to_limit_avg@1e5"]))
     meta = json.loads((tmp_path / "sweep" / "runs" / table[0]["run"] / "meta.json").read_text())
-    assert meta["tool"] == "endurance" and meta["argv"][0] == "hbf.endurance"
+    assert meta["tool"] == "endurance" and meta["argv"][0] == "hbf.lifetime.cli"
 
 
 def test_endurance_tool_checks(tmp_path):
-    with pytest.raises(ValueError, match="hbf.endurance long options"):
+    with pytest.raises(ValueError, match="hbf.lifetime.cli long options"):
         load_grid({"tool": "endurance", "base": {"layout": "striped_contiguous"}})
     with pytest.raises(ValueError, match="set by the sweep"):
         load_grid({"tool": "endurance", "base": {"output": "x"}})

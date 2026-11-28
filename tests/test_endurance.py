@@ -10,16 +10,16 @@ import math
 import numpy as np
 import pytest
 
-from hbf.endurance import (METRICS, Clock, ConstantClock, Device, analytic, build_parser, calibrate,
-                           calibration_batches, configure, erase_amp, geometry_for, layout_rounds, main, sci,
-                           summarize_run, threshold_steps)
+from hbf.lifetime.analytic import analytic
+from hbf.lifetime.cli import METRICS, build_parser, configure, main, summarize_run
+from hbf.lifetime.clock import Clock, ConstantClock, calibrate, calibration_batches, layout_rounds
+from hbf.lifetime.geometry import GIB, Device, Geometry, erase_amp, geometry_for, prefill_tok_s, sci, threshold_steps
+from hbf.lifetime.interference import interference
+from hbf.lifetime.sim import CAUSE, CapacityError, SimOptions, VllmTracker, simulate
 from hbf.models import load_gpu, load_model
-from hbf.frontend.trace.requests import Workload, load_workload, parse_length, presets
+from hbf.frontend.trace.requests import Stream, Workload, load_workload, parse_length, presets, scripted
 # Event simulation (design-B section 4, tests 10-15) and the seeded request stream.
 from hbf.frontend.kv.tensors import TensorSpec
-from hbf.endurance import (CAUSE, GIB, CapacityError, Geometry, SimOptions, VllmTracker, prefill_tok_s, simulate)
-from hbf.lifetime.interference import interference
-from hbf.frontend.trace.requests import Stream, scripted
 
 B200 = load_gpu("b200")
 LLAMA8 = load_model("llama-3.1-8b")
@@ -557,20 +557,20 @@ def test_m5_hook_per_quantum(monkeypatch):
     """interference() is called once per quantum with that quantum's programs and block erases per step;
     over the run the loads times the steps add up to every program and erase (no idle time here). Its
     extra delays the next quantum: TPOT' > TPOT, gaps hides part of fifo's delay, off adds nothing."""
-    from hbf import endurance
+    from hbf.lifetime.sim import engine as sim_engine
     geometry, _ = geometry_for(LLAMA8, "bf16")
     w = Workload(input="fixed:32768", output="fixed:338", concurrency=8)
     clock = ConstantClock(38.57e6, layers=32)
     extra = {}
     for mode in ("fifo", "gaps", "off"):
-        sim = endurance.Simulator(geometry, clock, w, Device(), SimOptions(hours=.25, warmup_h=.05, m5=mode,
+        sim = sim_engine.Simulator(geometry, clock, w, Device(), SimOptions(hours=.25, warmup_h=.05, m5=mode,
                                                                             retention_s=0))
         calls = []
 
         def spy(load, *args, **kwargs):
             calls.append((load["programs"], load["erases"], sim.acc["steps"]))
             return interference(load, *args, **kwargs)
-        monkeypatch.setattr(endurance, "interference", spy)
+        monkeypatch.setattr(sim_engine, "interference", spy)
         r = sim.run()
         extra[mode] = (r["tpot_m5_ms"] - r["mean_tpot_ms"]) * 1e6
         if mode == "off":
