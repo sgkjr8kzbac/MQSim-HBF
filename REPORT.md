@@ -729,7 +729,7 @@ MQSim 的每层时延约为（分析轮数 + 0.8 至 2.3 轮）× tR，多出的
 - 写入情景：只有 decode 写入；decode 加读干扰刷新（X = 1e6 或 1e5 时，按稠密读带宽 × 每块页数 / X 计算）；decode 加 prefill 写入 2.66 GB/s（8B、B=8、32K 请求持续到达时的写入速率）。
 - 模式：
   - `fifo`：写入排在读前面；
-  - `gaps`：写入只占用 bank 在两次读之间的空闲时间；
+  - `gaps`：按 die 阻塞；优先放进读间隙，放不下的拉长 TPOT；
   - `suspend`：读到来时暂停编程或擦除，暂停开销 5 µs 或 20 µs；
   - `random`：擦除随机落在各 die 上，与读的节奏不协调。
 - tPROG 取 75、100、200、350 µs，tBERS 取 1、3.5、10 ms（来源见 [docs/research/params.md](docs/research/params.md)）。
