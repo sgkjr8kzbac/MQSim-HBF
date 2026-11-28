@@ -1,18 +1,18 @@
-"""Step-time Clock interface and phase-A calibration."""
-import csv
+"""Step-time Clock interface and rounds-backend calibration."""
 import hashlib
 import json
 import math
 import os
-import sys
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from .geometry import F1, HBF_FLAGS, PARTITIONS, geometry_for
+from .geometry import F1, PARTITIONS, geometry_for
 from .interference import hbf_gaps
+
 
 @dataclass(frozen=True)
 class StepTime:
@@ -27,11 +27,111 @@ class StepTime:
     layer_rounds: tuple = ()
 
 
-class Clock:
-    """Simulated decode step time of a running set (per stack), from phase A's fitted estimate.
+class StepClock(ABC):
+    """Core clock interface for lifetime models: maps active request contexts to ``StepTime``."""
+
+    stacks: int = 1
+
+    @abstractmethod
+    def describe(self):
+        """Return a JSON-serialisable summary of clock parameters."""
+
+    @abstractmethod
+    def step(self, contexts, partitions=None, partition_banks=None, hbm_tokens=None):
+        """Return ``StepTime`` of one decode step, or ``None`` when ``contexts`` is empty."""
+
+
+class ReadTimeClock(StepClock):
+    """Core HBF clock: step time = HBF read time (rounds model) + constant compute term.
+
+    Depends only on HBF geometry and read-time parameters (no GPU roofline or ``hbf.system``).
+    Each layer's read time is ``layer_ns + round_ns * rounds`` when ``rounds > 0``, else ``0``.
+    The constant ``compute_ns`` is spread evenly across layer idle gaps so that
+    ``tpot_ns == sum(h) + compute_ns``.
+    """
+
+    def __init__(self, geometry, layers, *, read_ns=4096, banks=1024, stacks=1,
+                 layer_ns=F1["layer_ns"], round_ns=F1["round_ns"], balance=1.0,
+                 ratios=None, rounds_fn=None, compute_ns=0.0):
+        self.geometry = geometry
+        self.layers = layers
+        self.read_ns, self.banks, self.stacks = read_ns, banks, stacks
+        self.layer_ns, self.round_ns, self.balance = layer_ns, round_ns, balance
+        self.ratios = dict(ratios or {})
+        self.rounds_fn = rounds_fn
+        self.compute_ns = float(compute_ns)
+        self.cache = {}
+
+    def describe(self):
+        return {"clock": "read_time", "layer_ns": self.layer_ns, "round_ns": self.round_ns,
+                "balance": self.balance, "ratios": self.ratios, "read_ns": self.read_ns,
+                "banks": self.banks, "stacks": self.stacks, "compute_ns": self.compute_ns}
+
+    def _rounds_for(self, ctx, hbf_ctx, partitions, partition_banks):
+        geo = self.geometry
+        share = self.ratios.get("pages", 1.0)
+        if hasattr(geo, "layer_row_pages"):
+            per_req_layers = geo.per_request_layer_row_pages(hbf_ctx) * share
+            layer_pages = per_req_layers.sum(axis=1)
+            if partitions is not None and partition_banks:
+                parts = np.asarray(partitions, dtype=np.int64)
+                layer_rounds = tuple(
+                    math.ceil(self.balance * float(np.bincount(parts, weights=per_req_layers[l]).max())
+                              / partition_banks - 1e-9) if layer_pages[l] > 0 else 0
+                    for l in range(self.layers)
+                )
+            else:
+                layer_rounds = tuple(
+                    math.ceil(self.balance * float(layer_pages[l]) / self.banks - 1e-9) if layer_pages[l] > 0 else 0
+                    for l in range(self.layers)
+                )
+            return layer_rounds, float(layer_pages.mean())
+        per_req = geo.per_request_row_pages(hbf_ctx) * share
+        pages = float(per_req.sum())
+        if partitions is not None and partition_banks:
+            parts = np.asarray(partitions, dtype=np.int64)
+            max_load = float(np.bincount(parts, weights=per_req).max())
+            rounds = math.ceil(self.balance * max_load / partition_banks - 1e-9)
+        elif self.rounds_fn is not None and len(set(ctx.tolist())) == 1 and len(ctx) == len(hbf_ctx) and np.array_equal(ctx, hbf_ctx):
+            rounds = self.rounds_fn(len(ctx), int(ctx[0]))
+        else:
+            rounds = math.ceil(self.balance * pages / self.banks - 1e-9)
+        return (rounds,) * self.layers, pages
+
+    def step(self, contexts, partitions=None, partition_banks=None, hbm_tokens=None):
+        """StepTime of one decode step, or None when nothing runs."""
+        ctx = np.asarray(contexts, dtype=np.int64)
+        b = len(ctx)
+        if not b:
+            return None
+        hbf_ctx = ctx if hbm_tokens is None else ctx - np.asarray(hbm_tokens, dtype=np.int64)
+        layer_rounds, mean_pages = self._rounds_for(ctx, hbf_ctx, partitions, partition_banks)
+        hetero = hasattr(self.geometry, "layer_row_pages")
+        key = (b, layer_rounds, round(mean_pages, 6))
+        hit = self.cache.get(key)
+        if hit is not None:
+            return hit
+        h = [self.layer_ns + self.round_ns * r_l if r_l else 0.0 for r_l in layer_rounds]
+        read_total = sum(h)
+        tpot = read_total + self.compute_ns
+        gap = self.compute_ns / self.layers if self.layers else 0.0
+        gaps = (gap,) * self.layers
+        out = StepTime(
+            tpot, self.compute_ns, self.compute_ns,
+            read_total / self.layers if self.layers else 0.0,
+            gaps, mean_pages,
+            max(layer_rounds) if layer_rounds else 0, b,
+            layer_rounds if hetero else (),
+        )
+        self.cache[key] = out
+        return out
+
+
+class Clock(StepClock):
+    """Simulated decode step time of a running set (per stack), combining HBF reads with GPU TPOT.
 
     est per layer = layer_ns + round_ns x rounds, rounds = ceil(kappa x pages / banks) (or the
-    busiest partition), fed as identical layer rows into ``system.evaluate`` with compute batch
+    busiest partition), fed as layer rows into ``system.evaluate`` with compute batch
     b x stacks and analysis batch b. ``ratios`` scale the dense demand for a sparse mode
     (pages, attended tokens and elements, burst, HBM bytes, dequant), from ``calibrate``.
     ``rounds_fn(b, ctx)``, when given, returns exact rounds for b equal contexts (phase A layout).
@@ -144,7 +244,7 @@ class Clock:
         return out
 
 
-class ConstantClock:
+class ConstantClock(StepClock):
     """Fixed step time (tests and ablations): every step takes ``tpot_ns``, HBF idle half of it."""
 
     def __init__(self, tpot_ns, layers=1, idle_share=.5):
@@ -189,48 +289,118 @@ def layout_rounds(model, kv_format=None, layout="striped_contiguous", pages_per_
 
 
 # --------------------------------------------------------------------------------------------
-# Calibration against phase A
+# Calibration directly against frontend + rounds backend (no CLI or CSV files)
 
-def _csv(path):
-    if not path.is_file():
-        return []
-    with path.open(newline="") as stream:
-        rows = [row for row in csv.DictReader(stream) if row.get("group", "1") == "1"]
-    out = []
-    for row in rows:
-        parsed = {}
-        for key, value in row.items():
-            try:
-                parsed[key] = float(value) if value not in ("", None) else None
-            except ValueError:
-                parsed[key] = value
-        out.append(parsed)
-    return out
+_DEVICE_INT_FLAGS = {
+    "--read-ns": "read_ns",
+    "--program-ns": "program_ns",
+    "--erase-ns": "erase_ns",
+    "--aggregate-gb-s": "aggregate_gb_s",
+    "--pages-per-block": "pages_per_block",
+    "--blocks-per-plane": "blocks_per_plane",
+    "--planes": "planes",
+    "--read-plane-ns": "read_plane_ns",
+    "--coalesce-ns": "coalesce_ns",
+}
+
+
+def _parse_device_overrides(device):
+    """Parse ``device`` flag sequence or mapping into ``(topology, kwargs)`` for ``device.config.load``."""
+    topology = "ocp"
+    overrides = {}
+    if isinstance(device, dict):
+        overrides = dict(device)
+        topology = overrides.pop("topology", topology)
+        return topology, overrides
+    tokens = list(device or ())
+    i = 0
+    while i < len(tokens):
+        flag = tokens[i]
+        if flag == "--topology":
+            topology = tokens[i + 1]
+            i += 2
+        elif flag == "--plane-rule":
+            overrides["plane_rule"] = tokens[i + 1]
+            i += 2
+        elif flag == "--cache-read":
+            overrides["cache_read"] = True
+            i += 1
+        elif flag in _DEVICE_INT_FLAGS:
+            overrides[_DEVICE_INT_FLAGS[flag]] = int(tokens[i + 1])
+            i += 2
+        else:
+            raise ValueError(f"Unsupported device override flag for calibration: {flag!r}")
+    return topology, overrides
 
 
 def phase_a(directory, model, gpu, kv_format, batch, context, *, mode="dense", generation=None, device=(),
             alloc="layer_major", partition="none", kv_spec=None):
-    """Run one analysis-only phase A pipeline (``hbf.cli``) into ``directory``; returns its CSV rows."""
-    from ..cli import build_parser, configure, pipeline
-    argv = HBF_FLAGS + ["--layout", "striped_contiguous", "--model", model, "--gpu", gpu,
-                        "--format", kv_format or "bf16", "--mode", mode, "--context", str(context),
-                        "--batch", str(batch), "--analysis-only", "--output", str(directory)]
-    if kv_spec:
-        argv += ["--kv-spec", kv_spec]
-    for key, value in (generation or {}).items():
-        argv += [f"--{key.replace('_', '-')}", str(value)]
-    argv += list(device)
-    argv += ["--alloc", alloc, "--partition", partition]
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    run = configure(args)
-    saved, sys.argv = sys.argv, ["hbf.cli", *argv]
-    try:
-        pipeline(directory=directory, binary=None, **run)
-    finally:
-        sys.argv = saved
-    return {"layers": _csv(directory / "analysis_layers.csv"), "steps": _csv(directory / "analysis_steps.csv"),
-            "system": _csv(directory / "system_steps.csv")}
+    """Run frontend trace generation + rounds backend directly in memory (no ``hbf.cli`` or CSVs)."""
+    from ..backends.rounds.analysis import analyze_trace
+    from ..device.config import load
+    from ..frontend.addrtrace import iter_trace
+    from ..frontend.kv.layouts import LAYOUTS
+    from ..frontend.kv.placement import BatchRequest, BatchSpec, PageTableLayout, generate_batch
+    from ..frontend.kv.tensors import Shape, default_tensors
+    from ..frontend.trace.synthetic import generate
+    from ..kvspec import GroupedLayout, from_model, generate_grouped, parse_kvspec, resolve_format
+    from ..models import load_model
+
+    topology, overrides = _parse_device_overrides(device)
+    cfg = load(topology, **overrides)
+    model_spec = load_model(model)
+    fmt = resolve_format(model_spec, kv_format or "bf16")
+    tensors = fmt.tensors
+    shape = Shape(model_spec.layers, model_spec.kv_heads * batch, model_spec.head_dim, context)
+
+    kv_spec_obj = None
+    if kv_spec is not None:
+        kv_spec_obj = parse_kvspec(kv_spec, model_spec.layers, model_spec.kv_heads, context)
+    elif model_spec.layer_pattern:
+        kv_spec_obj = from_model(model_spec, fmt)
+
+    gen = {
+        "steps": 1, "seed": 1, "fraction": 0.1, "count": 4, "unit": 0,
+        "hot_fraction": 0.5, "hot_units": 1, "select_tokens": 16,
+    } | dict(generation or {})
+    if mode in ("uniform_tokens", "uniform_pages", "sink_recent", "channel_select") and fmt.full_tensors:
+        gen.setdefault("full_tensors", list(fmt.full_tensors))
+
+    if alloc != "layer_major" and kv_spec_obj is None:
+        spec = BatchSpec(tuple(BatchRequest(context, 0) for _ in range(batch)),
+                         alloc, partition, "striped_contiguous")
+        per_request = Shape(model_spec.layers, model_spec.kv_heads, model_spec.head_dim, context)
+        layout = PageTableLayout(cfg, per_request, spec, tensors=tensors)
+        accesses = list(generate_batch(cfg, layout, mode, **{key: gen[key] for key in (
+            "steps", "seed", "fraction", "count", "select_tokens")}))
+    elif kv_spec_obj is not None:
+        layout = GroupedLayout(cfg, shape, kv_spec_obj, tensors or default_tensors(shape),
+                               requests=batch, intra="striped")
+        accesses = list(generate_grouped(cfg, layout, mode, **{key: gen[key] for key in (
+            "steps", "seed", "fraction", "count", "select_tokens")}))
+    else:
+        layout = LAYOUTS["striped_contiguous"](cfg, shape, tensors=tensors)
+        accesses = list(generate(cfg, layout, mode, **gen))
+
+    _, chunk_stream = iter_trace(cfg, layout, accesses, prefill=False, expected_steps=(0,),
+                                 layout_name="striped_contiguous")
+    layer_rows, step_rows = analyze_trace(cfg, chunk_stream, (1,), None, timing=True)
+    attn_dims = fmt.attn_dims if fmt else 2 * shape.head_dim
+    for row in layer_rows:
+        row["attn_dims"] = attn_dims
+
+    read_ns = sum(row["est_ns"] for row in layer_rows if row.get("est_ns") is not None)
+    tpot_ns = None
+    if gpu is not None:
+        from ..models import load_gpu
+        from ..system import SystemOptions, evaluate
+        gpu_spec = load_gpu(gpu)
+        selection = "static" if mode in ("dense", "sink_recent") else "dynamic"
+        meta = {"model": model_spec.name, "gpu": gpu_spec.name, "batch": batch, "stacks": 1,
+                "analysis_batch": batch, "selection": selection, "kv_format": fmt.name,
+                "overlap": "serial", "kv_consume": "stream"}
+        tpot_ns = evaluate(layer_rows, model_spec, gpu_spec, SystemOptions(), meta).steps[0]["tpot_hbf_est_ns"]
+    return {"layers": layer_rows, "steps": step_rows, "read_ns": read_ns, "tpot_ns": tpot_ns}
 
 
 def calibration_batches(model, kv_format, context, rounds=(32, 128), limit=256, kv_spec=None):
@@ -249,7 +419,7 @@ def calibration_batches(model, kv_format, context, rounds=(32, 128), limit=256, 
 
 def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", generation=None, context=32768,
               batches=None, device=(), policy="packed", partition="none", snapshot_batch=None, kv_spec=None):
-    """Fit the Clock to at most three phase A analysis-only runs, cached by a hash of the inputs.
+    """Fit the Clock directly against the rounds backend, cached by a hash of the inputs.
 
     Two dense layer-major points (``batches``; default about 32 and 128 rounds per layer, see
     ``calibration_batches``) refit layer_ns and round_ns for the actual device flags (least squares
@@ -258,13 +428,13 @@ def calibrate(directory, model, gpu="b200", kv_format="bf16", *, mode="dense", g
     rounds at kappa 1 (ceil(pages / 1,024), or the busiest partition's), the demand ratios of
     the mode against dense at the same batch, and the per-step hot factor (max block reads over
     ppb x read share). Pages per block do not change rounds or est, so they are fixed at 256.
-    Returns the fields for ``Clock`` plus diagnostics. Safe for concurrent processes sharing
-    ``directory`` (an exclusive lock per digest).
+    Returns the fields for ``Clock`` / ``ReadTimeClock`` plus diagnostics. Safe for concurrent
+    processes sharing ``directory`` (an exclusive lock per digest).
     """
     batches = tuple(batches or calibration_batches(model, kv_format, context, kv_spec=kv_spec))
     inputs = {"model": model, "gpu": gpu, "format": kv_format, "mode": mode, "generation": generation or {},
               "context": context, "batches": list(batches), "device": list(device), "policy": policy,
-              "partition": partition, "snapshot_batch": snapshot_batch, "version": 4}
+              "partition": partition, "snapshot_batch": snapshot_batch, "version": 5}
     if kv_spec:
         inputs["kv_spec"] = kv_spec
     digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]
@@ -304,19 +474,12 @@ def _exclusive(path):
 
 def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, context, batches, device, policy,
                      partition, snapshot_batch, kv_spec=None):
-    """The phase A runs and fits of ``calibrate`` (called with the cache lock held)."""
-    import shutil
+    """The rounds-backend runs and fits of ``calibrate`` (called with the cache lock held)."""
     from ..models import load_model
-
-    def fresh(name):
-        target = root / name
-        if target.exists():
-            shutil.rmtree(target)
-        return target
 
     points, dense = [], {}
     for b in batches:
-        dense[b] = phase_a(fresh(f"dense-b{b}"), model, gpu, kv_format, b, context, device=device, kv_spec=kv_spec)
+        dense[b] = phase_a(root, model, gpu, kv_format, b, context, device=device, kv_spec=kv_spec)
         points += [(row["rounds"], row["est_ns"]) for row in dense[b]["layers"] if row["pages"]]
     rounds = np.array([point[0] for point in points], dtype=float)
     est = np.array([point[1] for point in points], dtype=float)
@@ -334,9 +497,8 @@ def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, cont
     if mode == "dense" and snap_policy == "layer_major" and b in dense:
         snapshot = dense[b]
     else:
-        snapshot = phase_a(fresh(f"snapshot-{mode}-{snap_policy}-{snap_part}-b{b}"), model, gpu, kv_format, b,
-                           context, mode=mode, generation=generation, device=device, alloc=snap_policy,
-                           partition=snap_part, kv_spec=kv_spec)
+        snapshot = phase_a(root, model, gpu, kv_format, b, context, mode=mode, generation=generation,
+                           device=device, alloc=snap_policy, partition=snap_part, kv_spec=kv_spec)
     kappas = []
     for row in snapshot["layers"]:
         if not row["pages"]:
@@ -347,8 +509,10 @@ def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, cont
             parts = 1024 // PARTITIONS[snap_part]
             ideal = math.ceil(math.ceil(b / parts) * row["pages"] / b / PARTITIONS[snap_part])
         kappas.append(row["rounds"] / ideal)
+
     def total(rows, key):
         return sum(row.get(key) or 0 for row in rows)
+
     ratios = {}
     if mode != "dense":
         for name, key in (("pages", "pages"), ("attended", "attended_tokens"), ("elements", "attended_elements"),
@@ -357,13 +521,16 @@ def _fit_calibration(root, inputs, model, gpu, kv_format, mode, generation, cont
             ratios[name] = total(snapshot["layers"], key) / base if base else 1.0
     share = ratios.get("pages", 1.0)
     max_reads = max((row.get("max_block_reads") or 0) for row in snapshot["steps"]) if snapshot["steps"] else 0
-    result = {"layer_ns": layer_ns, "round_ns": round_ns, "balance": float(np.mean(kappas)) if kappas else 1.0,
-              "ratios": ratios, "read_share": share, "hot_step": max_reads / (256 * share) if share else 1.0,
-              "max_block_reads": max_reads,
-              "batches": list(batches),
-              "phase_a_tpot_ns": {f"b{key}": value["system"][0]["tpot_hbf_est_ns"]
-                                  for key, value in dense.items() if value["system"]},
-              "snapshot": {"policy": snap_policy, "partition": snap_part, "batch": b,
-                           "tpot_ns": snapshot["system"][0]["tpot_hbf_est_ns"] if snapshot["system"] else None},
-              "inputs": inputs, "points": len(points)}
+    result = {
+        "layer_ns": layer_ns, "round_ns": round_ns, "balance": float(np.mean(kappas)) if kappas else 1.0,
+        "ratios": ratios, "read_share": share, "hot_step": max_reads / (256 * share) if share else 1.0,
+        "max_block_reads": max_reads,
+        "batches": list(batches),
+        "phase_a_read_ns": {f"b{key}": value["read_ns"] for key, value in dense.items()},
+        "phase_a_tpot_ns": {f"b{key}": value["tpot_ns"] for key, value in dense.items()
+                            if value["tpot_ns"] is not None},
+        "snapshot": {"policy": snap_policy, "partition": snap_part, "batch": b,
+                     "read_ns": snapshot["read_ns"], "tpot_ns": snapshot["tpot_ns"]},
+        "inputs": inputs, "points": len(points),
+    }
     return result

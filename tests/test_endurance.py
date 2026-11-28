@@ -1091,3 +1091,32 @@ def test_analytic_cli_honors_align_option(tmp_path):
     assert float(row_default["padding_gb_s"]) > 0
     assert float(row_none["padding_gb_s"]) == 0.0
     assert float(row_default["avg_pec_per_day"]) > float(row_none["avg_pec_per_day"])
+
+
+def test_read_time_clock_and_gpu_free_calibration(tmp_path):
+    """R3.5b: core ReadTimeClock works without GPU/system, and calibrate(..., gpu=None) uses rounds backend only."""
+    from hbf.lifetime.clock import ReadTimeClock, StepClock
+
+    geo, _ = geometry_for(LLAMA8, "bf16")
+    calib = calibrate(tmp_path, "llama-3.1-8b", gpu=None, kv_format="bf16", context=1024, batches=(8, 32),
+                      policy="packed", snapshot_batch=8)
+    assert calib["layer_ns"] > 0 and 4000 < calib["round_ns"] < 4800
+    assert calib["phase_a_tpot_ns"] == {}
+    assert calib["snapshot"]["tpot_ns"] is None
+    assert calib["phase_a_read_ns"]["b32"] > 0 and calib["snapshot"]["read_ns"] > 0
+
+    compute_ns = 2_000_000.0
+    clock = ReadTimeClock(geo, LLAMA8.layers, layer_ns=calib["layer_ns"], round_ns=calib["round_ns"],
+                          compute_ns=compute_ns)
+    assert isinstance(clock, StepClock)
+    assert clock.step([]) is None
+    step = clock.step([1024] * 32)
+    assert step.tpot_ns == pytest.approx(calib["phase_a_read_ns"]["b32"] + compute_ns, rel=5e-3)
+    assert sum(step.gaps_ns) == pytest.approx(compute_ns)
+    assert step.h_ns * LLAMA8.layers == pytest.approx(step.tpot_ns - compute_ns)
+
+    # ReadTimeClock plugs directly into analytic() and simulate().
+    w = load_workload("long32k", input="fixed:2048", output="fixed:64", concurrency=4, seed=1)
+    rows = analytic(geo, clock, w, x_values=(1e6,), **no_m5())
+    assert len(rows) == 1 and rows[0]["avg_pec_per_day"] > 0
+
