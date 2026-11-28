@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from hbf.access import Access, LAYOUTS, Shape, TensorSpec, generate, parse_tensors, read_access, write_access
+from hbf.access import (Access, LAYOUTS, Shape, TensorSpec, _tensor_meta, generate, parse_tensors, read_access,
+                        write_access)
 from hbf.cli import main, pipeline
 from hbf.config import CONFIG, PARAMETERS, ROOT, check_xml, load, workload_fields, xml_settings
 from hbf.controller import Batch, Request, metrics, schedule
@@ -522,7 +523,8 @@ def test_tensor_specs_layout_and_useful_bytes():
 
 def test_tensor_specs_pipeline_and_meta(binary, evidence):
     cfg = micro()
-    text = json.dumps([asdict(spec) for spec in KIVI_LIKE])
+    # meta.json leaves unset optional TensorSpec fields out (attn_dims, logical_dims, density 1)
+    text = json.dumps([_tensor_meta(spec) for spec in KIVI_LIKE])
     assert parse_tensors(text) == KIVI_LIKE
     directory = evidence / "tensor-specs"
     _, _, steps, stats = pipeline(cfg, Shape(1, 1, 128, 256), "layer_contiguous", directory, binary,
