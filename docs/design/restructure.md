@@ -4,6 +4,7 @@
 > 起点：分支 `claude/hbf-kv-terms`，提交 `bd3b91c` 之后的文档提交。第一版经子代理对照代码审查后修订（第七节）。
 > 本文件取代 PLAN.md 里所有尚未开始的功能任务。R0–R8 完成前，不再增加新的研究功能。
 > 进度：R0–R6 已在 `refactor/modular` 上完成（`6a977f2`，567 项通过、3 项 xfail）。云端已审查 R1–R3，R4–R6 待审查；R7、R8 未开始；R9（HBFSim 作为第二后端的评估）是新增项。
+> 剩余顺序：**R7 和 R9 并行，R8 最后**。R7 只改地址轨迹上游的输入，R9 只读地址轨迹，两者互不影响；R8 放在最后，README 才能一次写进 HBFSim 后端。
 
 ## 一、已经定下的决定
 
@@ -368,16 +369,23 @@ token 级 trace（access.csv）和请求级 trace（requests.csv）是前端的�
    - 数据集不进仓库，只提交下载脚本、校验和以及字段说明（含许可）。
 2. **token 级 trace**：沿用现有 `access.csv` 格式作为外部输入格式，写清字段说明。截取脚本（T-C1，HF transformers 的 hook）等用户有 GPU 后再做，放在 `frontend/trace/capture/`。
 3. 验收：一个公共数据集端到端跑通。请求 → 时间线 → 地址轨迹 → MQSim 和轮数估算 → 寿命外推，并和合成工作负载的结果对比。
+   - 如果 R9 已经完成，同一份地址轨迹也交给 HBFSim 跑一次。这一项可选。
+4. 合成的工作负载预设（`chat`、`long32k`、`agentic`、`reasoning`）和合成模式（`dense`、`uniform_tokens`、`sink_recent` 等）全部保留。导入的数据集只是又一种输入，两者可以组合：真实数据集的请求流加上合成的 token 选择。
+5. R7 不改变地址轨迹的格式。如果确实需要加字段，要同步更新 MQSim、轮数和 HBFSim 三个后端。
 
-### R8 文档
+### R8 文档（在 R7、R9 之后做）
 
-- README 按新结构重写：安装、快速开始（默认即规范行为）、配置文件、地址轨迹格式、扩展。
+- README 按新结构重写：安装、快速开始（默认即规范行为）、配置文件、地址轨迹格式、后端（MQSim、轮数估算，以及 R9 之后的 HBFSim，写明各自的用途和差异）、扩展、请求数据集的获取方式（R7）。
 - REPORT 开头加一段说明：`baseline-pre-refactor` 之前的数字来自旧默认，复现方式是检出该 tag。
 - PLAN.md 的阶段表和任务表按新结构更新；删除过时的 `docs/handoff.md` 内容。
 
 ### R9 HBFSim 作为第二后端（评估）
 
-[HBFSim](https://github.com/FlashLabAE/HBFSim)（MIT 许可，RACS '26）是另一个按 OCP HBF v0.7.0 建模的事件驱动模拟器，C++20 实现，同时建模 HBM4、多个 HBF stack、链路和主机 FTL。R9 与 R7、R8 互不依赖，可以并行做，但不能改变 MQSim 后端的任何结果。
+[HBFSim](https://github.com/FlashLabAE/HBFSim)（MIT 许可，RACS '26）是另一个按 OCP HBF v0.7.0 建模的事件驱动模拟器，C++20 实现，同时建模 HBM4、多个 HBF stack、链路和主机 FTL。
+
+- R9 与 R7 并行，在 R8 之前完成；
+- 它只依赖已完成的 R3（地址轨迹接口）和 R5、R6（对比用的结果）；
+- 不能改变 MQSim 后端的任何结果。
 
 **为什么不替换 MQSim**
 - R5、R6 已经在 MQSim 上实现并验证了 HBF 的写入规则和寿命核对。换后端要重新验证全部结果。
